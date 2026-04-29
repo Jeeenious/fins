@@ -1,0 +1,33 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "base-config",
+            "hidden": true,
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "debug",
+            "inherits": "base-config",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "release",
+            "inherits": "base-config",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        }
+    ],
+
+    "buildPresets": [
+        { "name": "debug", "configurePreset": "debug" },
+        { "name": "release", "configurePreset": "release" }
+    ]
+}
