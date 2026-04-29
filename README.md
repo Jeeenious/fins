@@ -1,4 +1,4 @@
-# FineVision-Runtime
+# FineVision-SDK
 
 Follow the instructions in https://iwin-fins.feishu.cn/wiki/MptPw6q7ciBWeTkAeoNcMVQCnRc for installation and usage.
 
