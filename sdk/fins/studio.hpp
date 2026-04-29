@@ -178,6 +178,22 @@ namespace fins {
       it->second->set_actor_topic(key, topic);
     }
 
+    void set_step_schedule(const std::string &step_id, const ScheduleInfo &schedule) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = steps_.find(step_id);
+      if (it == steps_.end()) {
+        FINS_LOG_ERROR("[Studio] Error: Step not found: {}", step_id);
+        return;
+      }
+
+      it->second->set_schedule(schedule);
+      FINS_LOG_DEBUG("[Studio] Set schedule for {}: priority={}, queue={}", step_id,
+                     (schedule.priority == SchedulePriority::Urgent) ? "Urgent" :
+                     (schedule.priority == SchedulePriority::High) ? "High" :
+                     (schedule.priority == SchedulePriority::Medium) ? "Medium" : "Low",
+                     (schedule.queue == ScheduleQueue::FCFS) ? "FCFS" : "LGFS");
+    }
+
     void run() {
       std::lock_guard<std::mutex> lock(mutex_);
       set_running_state(Running_State::RUN);

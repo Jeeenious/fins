@@ -265,7 +265,6 @@ namespace fins {
                                    {"memory_total_mb", system_stats.mem_total_mb},
                                    {"cpu_temperature_c", system_stats.cpu_temperature_c},
                                    {"queue_length", thread_metrics.total_queue_length},
-                                   {"avg_wait_time_ms", thread_metrics.avg_wait_time_ms},
                                    {"dropped_tasks_count", thread_metrics.dropped_tasks_count},
                                    {"thread_pool_utilization", thread_metrics.utilization}};
 

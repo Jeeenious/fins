@@ -14,7 +14,6 @@
 #include <deque>
 #include <functional>
 #include <iostream>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -34,9 +33,6 @@ namespace fins {
 
   using TaskType = std::function<void(size_t)>;
 
-  enum class Priority { Urgent = 0, High = 1, Medium = 2, Low = 3 };
-  enum class QueueStrategy { FCFS, LGFS };
-
   struct TaskWrapper {
     std::string step_id;
     std::string pipe_id;
@@ -51,16 +47,8 @@ namespace fins {
         enqueue_time(std::chrono::steady_clock::now()) {}
   };
 
-  struct PipeConfig {
-    Priority priority = Priority::Medium;
-    QueueStrategy strategy = QueueStrategy::FCFS;
-    size_t capacity = 64;
-  };
-
   struct ThreadMetrics {
     size_t total_queue_length = 0;
-    std::map<std::string, size_t> pipe_queue_lengths;
-    double avg_wait_time_ms = 0.0;
     size_t dropped_tasks_count = 0;
     double utilization = 0.0;
   };
@@ -77,16 +65,12 @@ namespace fins {
       std::deque<std::shared_ptr<TaskWrapper>> queue;
       std::atomic<bool> running{false};
       std::atomic<bool> stop_flag{false};
-
       size_t processed_count = 0;
     };
 
     std::vector<std::unique_ptr<Worker>> workers_;
     std::atomic<bool> stop_global_{false};
     std::atomic<size_t> dropped_tasks_count_{0};
-
-    std::map<std::string, PipeConfig> pipe_configs_;
-    std::mutex config_mutex_;
 
   public:
     static ThreadManager &get_instance() {
@@ -105,16 +89,6 @@ namespace fins {
 
     ~ThreadManager() { shutdown(); }
 
-    void set_urgent_threads(size_t) {}
-    void set_high_threads(size_t) {}
-    void set_medium_threads(size_t) {}
-    void set_low_threads(size_t) {}
-
-    void set_pipe_config(const std::string &pipe_id, Priority p, QueueStrategy s, size_t capacity = 64) {
-      std::lock_guard<std::mutex> lock(config_mutex_);
-      pipe_configs_[pipe_id] = {p, s, capacity};
-    }
-
     void start() {
       if (stop_global_)
         return;
@@ -130,7 +104,7 @@ namespace fins {
         w->thread = std::thread(&ThreadManager::worker_loop, this, w.get());
       }
 
-      FINS_LOG_INFO("[ThreadManager] Started fixed thread pool with {} threads.", K_THREAD_POOL_SIZE);
+      FINS_LOG_INFO("[ThreadManager] Started thread pool with {} threads.", K_THREAD_POOL_SIZE);
     }
 
     void shutdown() {
@@ -191,11 +165,7 @@ namespace fins {
       ThreadMetrics metrics;
       for (const auto &w: workers_) {
         std::lock_guard<std::mutex> lock(w->mtx);
-        size_t qs = w->queue.size();
-        metrics.total_queue_length += qs;
-        if (qs > 0 || w->running) {
-          metrics.pipe_queue_lengths["Thread_" + std::to_string(w->id)] = qs;
-        }
+        metrics.total_queue_length += w->queue.size();
       }
       metrics.dropped_tasks_count = dropped_tasks_count_;
       return metrics;
@@ -244,20 +214,11 @@ namespace fins {
         }
 
         if (task) {
-          double t_start = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
-
           try {
             task->task(0);
           } catch (const std::exception &e) {
             FINS_LOG_ERROR("[ThreadManager] Exception in step {}: {}", task->step_id, e.what());
           }
-
-          double t_end = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
-
-          int current_cpu = me->id;
-#ifdef __linux__
-          current_cpu = sched_getcpu();
-#endif
 
           me->processed_count++;
         }

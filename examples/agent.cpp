@@ -25,10 +25,6 @@ int main() {
 
   set_node_log_level(fins::NodeLogLevel::DEBUG);
 
-  FINS_THREAD_MANAGER.set_urgent_threads(2);
-  FINS_THREAD_MANAGER.set_high_threads(2);
-  FINS_THREAD_MANAGER.set_medium_threads(0);
-  FINS_THREAD_MANAGER.set_low_threads(0);
   FINS_THREAD_MANAGER.start();
 
   FINS_PERF_MONITOR.start();

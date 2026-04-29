@@ -57,11 +57,7 @@ int main(int argc, char **argv) {
   std::string agent_ip = "0.0.0.0";
   int agent_port = 9090;
 
-  struct option long_options[] = {{"threads-urgent", required_argument, 0, 'u'},
-                                  {"threads-high", required_argument, 0, 'H'},
-                                  {"threads-medium", required_argument, 0, 'm'},
-                                  {"threads-low", required_argument, 0, 'l'},
-                                  {"log-level", required_argument, 0, 'L'},
+  struct option long_options[] = {{"log-level", required_argument, 0, 'L'},
                                   {"plugin", required_argument, 0, 'p'},
                                   {"load-all", no_argument, 0, 'A'},
                                   {"webui", required_argument, 0, 'w'},
@@ -75,18 +71,6 @@ int main(int argc, char **argv) {
   int option_index = 0;
   while ((opt = getopt_long(argc, argv, "u:H:m:l:L:p:Aw:n:I:P:h", long_options, &option_index)) != -1) {
     switch (opt) {
-      case 'u':
-        urgent_threads = std::stoi(optarg);
-        break;
-      case 'H':
-        high_threads = std::stoi(optarg);
-        break;
-      case 'm':
-        medium_threads = std::stoi(optarg);
-        break;
-      case 'l':
-        low_threads = std::stoi(optarg);
-        break;
       case 'L':
         log_level = std::stoi(optarg);
         break;
@@ -124,11 +108,6 @@ int main(int argc, char **argv) {
     log_level = 4;
   fins::set_node_log_level(static_cast<fins::NodeLogLevel>(log_level));
 
-  // Set Thread Pool
-  FINS_THREAD_MANAGER.set_urgent_threads(urgent_threads);
-  FINS_THREAD_MANAGER.set_high_threads(high_threads);
-  FINS_THREAD_MANAGER.set_medium_threads(medium_threads);
-  FINS_THREAD_MANAGER.set_low_threads(low_threads);
   FINS_THREAD_MANAGER.start();
 
   FINS_PERF_MONITOR.start();
