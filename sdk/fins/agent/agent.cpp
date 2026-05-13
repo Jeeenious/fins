@@ -6,7 +6,7 @@
 
 // main.cpp
 
-#include <fins/agent/server.hpp>
+#include <fins/server/server.hpp>
 #include <fins/node_log.hpp>
 #include <fins/thread_manager.hpp>
 #include <fins/utils/performance_recorder.hpp>

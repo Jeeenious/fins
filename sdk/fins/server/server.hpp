@@ -21,7 +21,7 @@
 #include <fins/third_party/httplib.h>
 #include <fins/third_party/json.hpp>
 
-#include <fins/agent/parameter_server.hpp>
+#include <fins/server/parameter_server.hpp>
 #include <fins/analysis/system_monitor.hpp>
 #include <fins/nodelib.hpp>
 #include <fins/studio.hpp>
