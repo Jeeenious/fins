@@ -13,17 +13,17 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <pthread.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <pthread.h>
 
 #include <fins/third_party/httplib.h>
 #include <fins/third_party/json.hpp>
 
-#include <fins/server/parameter_server.hpp>
 #include <fins/analysis/system_monitor.hpp>
 #include <fins/nodelib.hpp>
+#include <fins/server/parameter_server.hpp>
 #include <fins/studio.hpp>
 #include <fins/thread_manager.hpp>
 #include <fins/utils/logger.hpp>
@@ -153,6 +153,20 @@ namespace fins {
       server_.Post("/reset", [&](const httplib::Request &, httplib::Response &res) {
         FINS_STUDIO.reset();
         res.set_content(json{{"status", "success"}, {"message", "Studio reset."}}.dump(), "application/json");
+      });
+
+      server_.Get("/get_params_template", [&](const httplib::Request &, httplib::Response &res) {
+        try {
+          json response;
+
+          response["template_yaml"] = fins::param_server().dump_template_yaml();
+          response["current_yaml"] = fins::param_server().dump_active_yaml();
+
+          res.set_content(response.dump(), "application/json");
+        } catch (const std::exception &e) {
+          res.status = 500;
+          res.set_content(json{{"status", "error"}, {"message", e.what()}}.dump(), "application/json");
+        }
       });
     }
 

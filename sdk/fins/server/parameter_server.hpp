@@ -21,8 +21,43 @@
 #include <filesystem>
 #include <fins/utils/logger.hpp>
 #include <fins/macros.hpp>
+#include <fins/type/type_register.hpp>
 
 namespace fins {
+
+  struct YamlNode {
+    std::map<std::string, YamlNode> children;
+    std::string value;
+    std::string type_info;
+    bool is_leaf = false;
+
+    void insert(const std::string &full_key, const std::string &val, const std::string &type = "") {
+      std::size_t pos = full_key.find('.');
+      if (pos == std::string::npos) {
+        children[full_key].value = val;
+        children[full_key].type_info = type;
+        children[full_key].is_leaf = true;
+      } else {
+        std::string head = full_key.substr(0, pos);
+        std::string tail = full_key.substr(pos + 1);
+        children[head].insert(tail, val, type);
+      }
+    }
+
+    void dump(std::stringstream &ss, int indent = 0) const {
+      for (auto const &[name, node]: children) {
+        ss << std::string(indent * 2, ' ') << name << ":";
+        if (node.is_leaf) {
+          ss << " " << node.value;
+          if (!node.type_info.empty()) ss << " # type: " << node.type_info;
+          ss << "\n";
+        } else {
+          ss << "\n";
+          node.dump(ss, indent + 1);
+        }
+      }
+    }
+  };
 
   class FINS_API ParameterServer {
   public:
@@ -50,9 +85,31 @@ namespace fins {
       return get_impl<std::string>(key, &def_val);
     }
 
+    std::string dump_active_yaml() const {
+      std::lock_guard<std::mutex> lock(mutex_);
+      YamlNode root;
+      for (auto const &[key, val]: params_) { root.insert(key, val); }
+      std::stringstream ss;
+      root.dump(ss);
+      return ss.str();
+    }
+
+    std::string dump_template_yaml() const {
+      std::lock_guard<std::mutex> lock(mutex_);
+      YamlNode root;
+      for (auto const &[key, req]: requested_entries_) { root.insert(key, req.default_val, req.type_name); }
+      std::stringstream ss;
+      root.dump(ss);
+      return ss.str();
+    }
+
   private:
     template<typename T>
     T get_impl(const std::string &key, const T *default_value_ptr) const {
+      if (default_value_ptr) {
+        record_requirement(key, *default_value_ptr);
+      }
+
       std::lock_guard<std::mutex> lock(mutex_);
 
       auto it = params_.find(key);
@@ -81,6 +138,30 @@ namespace fins {
         return T();
       }
       return convert<T>(it->second, key);
+    }
+
+    struct ParamRequirement {
+      std::string default_val;
+      std::string type_name;
+    };
+    mutable std::map<std::string, ParamRequirement> requested_entries_;
+
+    template<typename T>
+    void record_requirement(const std::string &key, const T &default_val) const {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (requested_entries_.find(key) == requested_entries_.end()) {
+        requested_entries_[key] = { to_raw_string(default_val), FINS_TYPE_REGISTER.get_name<T>() };
+      }
+    }
+
+    template<typename T>
+    std::string to_raw_string(const T &val) const {
+      if constexpr (std::is_same_v<T, std::string>) return val;
+      else if constexpr (std::is_same_v<T, bool>) return val ? "true" : "false";
+      else {
+        using namespace std;
+        return to_string(val);
+      }
     }
 
   private:
