@@ -39,8 +39,11 @@ namespace fins {
   using json = nlohmann::json;
 
   class NodeLib {
+  public:
+    enum class LoadState { IDLE, LOADING, COMPLETE, ERROR };
   private:
     std::function<void()> on_reloaded_callback_;
+    std::atomic<LoadState> load_state_{LoadState::IDLE};
 
   public:
     NodeLib() {
@@ -77,6 +80,9 @@ namespace fins {
       }
     }
 
+    void set_load_state(LoadState s) { load_state_ = s; }
+    LoadState get_load_state() const { return load_state_; }
+
     void load_from_executable_dir() {
       try {
         fs::path exe_path = fs::read_symlink("/proc/self/exe");
@@ -86,6 +92,8 @@ namespace fins {
     }
 
     void load_directory(const std::string &dir_path) {
+      load_state_ = LoadState::LOADING;
+
       std::string expanded_path = expand_user(dir_path);
       if (!fs::exists(expanded_path))
         return;
@@ -140,14 +148,19 @@ namespace fins {
         }
       }
       FINS_LOG_INFO("[NodeLib] Load complete: {} success, {} fail.", success_count, fail_count);
+
+      load_state_ = LoadState::COMPLETE;
     }
 
     bool load_plugin(const std::string &path) {
+      load_state_ = LoadState::LOADING;
       try {
         load(path);
+        load_state_ = LoadState::COMPLETE;
         return true;
       } catch (const std::exception &e) {
         FINS_LOG_ERROR("[NodeLib] Error: {}", e.what());
+        load_state_ = LoadState::ERROR;
         return false;
       }
     }

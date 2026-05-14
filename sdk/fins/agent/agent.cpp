@@ -114,6 +114,11 @@ int main(int argc, char **argv) {
 
   fins::NodeLib lib;
 
+  fins::AgentServer server(lib);
+
+  server.connect(webui_url);
+  server.start(agent_name, agent_ip, agent_port);
+
   // Load plugins
   if (load_all) {
     FINS_LOG_INFO("[Agent] Loading all plugins from ~/.fins/install/");
@@ -123,14 +128,6 @@ int main(int argc, char **argv) {
       lib.load_plugin(p);
     }
   }
-
-  fins::AgentServer server(lib);
-
-  FINS_LOG_INFO("[Agent] Connecting to WebUI: {}", webui_url);
-  server.connect(webui_url);
-
-  FINS_LOG_INFO("[Agent] Starting agent '{}' on {}:{}", agent_name, agent_ip, agent_port);
-  server.start(agent_name, agent_ip, agent_port);
 
   while (g_running) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));

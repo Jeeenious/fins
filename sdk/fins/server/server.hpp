@@ -168,6 +168,19 @@ namespace fins {
           res.set_content(json{{"status", "error"}, {"message", e.what()}}.dump(), "application/json");
         }
       });
+
+      server_.Get("/plugin_status", [&](const httplib::Request &, httplib::Response &res) {
+          auto state = node_lib_.get_load_state();
+          json j;
+          switch (state) {
+              case NodeLib::LoadState::IDLE: j["state"] = "IDLE"; break;
+              case NodeLib::LoadState::LOADING: j["state"] = "LOADING"; break;
+              case NodeLib::LoadState::COMPLETE: j["state"] = "COMPLETE"; break;
+              case NodeLib::LoadState::ERROR: j["state"] = "ERROR"; break;
+          }
+          res.set_content(j.dump(), "application/json");
+      });
+
     }
 
     void monitoringLoop() {
