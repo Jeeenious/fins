@@ -117,7 +117,6 @@ int main(int argc, char **argv) {
   fins::AgentServer server(lib);
 
   server.connect(webui_url);
-  server.start(agent_name, agent_ip, agent_port);
 
   // Load plugins
   if (load_all) {
@@ -128,6 +127,8 @@ int main(int argc, char **argv) {
       lib.load_plugin(p);
     }
   }
+  
+  server.start(agent_name, agent_ip, agent_port);
 
   while (g_running) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));

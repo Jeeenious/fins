@@ -39,7 +39,7 @@ namespace fins {
       node_lib_.set_on_reloaded([this]() {
         FINS_LOG_INFO("[AgentServer] Plugin reloaded. Re-registering with new capabilities...");
         httplib::Client client(orchestrator_server_);
-        registerAgent(client);
+        registered_ = registerAgent(client);
       });
     }
 
@@ -189,8 +189,6 @@ namespace fins {
       httplib::Client orchestrator_client(orchestrator_server_);
       orchestrator_client.set_connection_timeout(2, 0);
 
-      registerAgent(orchestrator_client);
-
       auto last_report_time = std::chrono::steady_clock::now();
 
 #ifdef FINS_ARM_ARCH
@@ -200,16 +198,25 @@ namespace fins {
 #endif
 
       while (!stop_monitoring_) {
+        if (!registered_) {
+          if (registerAgent(orchestrator_client)) {
+            registered_ = true;
+            FINS_LOG_INFO("[AgentServer] Successfully connected to orchestrator at {}", orchestrator_server_);
+          }
+        }
+
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= monitor_interval_s) {
-          reportTelemetry(orchestrator_client);
+        if (registered_ && std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= monitor_interval_s) {
+          if (!reportTelemetry(orchestrator_client)) {
+            registered_ = false;
+          }
           last_report_time = now;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
     }
 
-    void registerAgent(httplib::Client &client) {
+    bool registerAgent(httplib::Client &client) {
       json payload;
       payload["agent_id"] = agent_id_;
       payload["agent_ip"] = agent_ip_;
@@ -219,14 +226,16 @@ namespace fins {
       FINS_LOG_DEBUG("[AgentServer] Agent capabilities: {}", capabilites.dump());
 
       if (auto res = client.Post("/register_agent", payload.dump(), "application/json")) {
-        if (res->status != 200) {
+        if (res->status == 200) {
+          return true;
+        } else {
           FINS_LOG_ERROR("[AgentServer] Registration failed: {}", res->status);
+          return false;
         }
       } else {
-        FINS_LOG_ERROR("[AgentServer] Connection failed: {}", to_string(res.error()));
+        // Silent retry for connection failures
+        return false;
       }
-
-      FINS_LOG_INFO("[AgentServer] Registration completed.");
     }
 
     json get_node_metrics() {
@@ -275,7 +284,7 @@ namespace fins {
       return pipe_metrics_json;
     }
 
-    void reportTelemetry(httplib::Client &client) {
+    bool reportTelemetry(httplib::Client &client) {
       json payload;
       payload["agent_id"] = agent_id_;
       payload["agent_ip"] = agent_ip_;
@@ -304,8 +313,10 @@ namespace fins {
         if (res->status != 200) {
           FINS_LOG_ERROR("[AgentServer] Telemetry report failed: {}", res->status);
         }
+        return true;
       } else {
-        FINS_LOG_ERROR("[AgentServer] Telemetry connection failed.");
+        // Silent disconnect
+        return false;
       }
     }
 
@@ -320,6 +331,7 @@ namespace fins {
     std::thread monitoring_thread_;
     std::atomic<bool> is_running_{false};
     std::atomic<bool> stop_monitoring_{false};
+    std::atomic<bool> registered_{false};
   };
 
 } // namespace fins
