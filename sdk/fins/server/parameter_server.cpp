@@ -53,9 +53,9 @@ namespace fins {
 
   bool ParameterServer::load_string(const std::string &str) {
     std::lock_guard<std::mutex> lock(mutex_);
-    FINS_LOG_INFO("[ParameterServer] Loading parameters from string.");
-    FINS_LOG_INFO("[ParameterServer] Parameter string (first 50 chars): {}",
-                  str.substr(0, std::min<size_t>(50, str.size())));
+    FINS_LOG_INFO("[ParameterServer] Loading parameters.");
+    // FINS_LOG_INFO("[ParameterServer] Parameter string (first 50 chars): {}",
+    //               str.substr(0, std::min<size_t>(50, str.size())));
 
     std::istringstream stream(str);
 
