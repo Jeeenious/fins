@@ -37,6 +37,19 @@ namespace fins {
       return instance;
     }
 
+    void set_node_terminal_enabled(bool enabled) { 
+      if (enabled) setenv("FINS_NODE_TERMINAL_LOG", "1", 1);
+      else setenv("FINS_NODE_TERMINAL_LOG", "0", 1);
+    }
+
+    bool is_node_terminal_enabled() const { 
+      const char* env = getenv("FINS_NODE_TERMINAL_LOG");
+      if (env) {
+        return std::string(env) == "1";
+      }
+      return true; // 默认开启
+    }
+
     template<typename... Args>
     void log(LogLevel level, fmt::format_string<Args...> fmt, Args &&...args) {
       auto now = std::chrono::system_clock::now();
@@ -74,6 +87,7 @@ namespace fins {
       fmt::print(style, "[{}] ", level_tag);
       fmt::print(fmt, std::forward<Args>(args)...);
       fmt::print("\n");
+      fflush(stdout);
     }
 
   private:

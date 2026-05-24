@@ -19,6 +19,8 @@
 #include <source_location>
 #endif
 
+#include <fmt/chrono.h>
+#include <fmt/color.h>
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <fmt/printf.h>
@@ -67,9 +69,44 @@ namespace fins {
   public:
     NodeLogger() = default;
 
+  private:
+    void print_to_terminal(const std::string &level, const std::string &msg) {
+      if (!fins::Logger::get().is_node_terminal_enabled()) return;
+
+      auto now = std::chrono::system_clock::now();
+      fmt::text_style style;
+      const char *level_tag = "";
+
+      if (level == "DEBUG") {
+        style = fmt::fg(fmt::color::cyan);
+        level_tag = "DBG";
+      } else if (level == "INFO") {
+        style = fmt::fg(fmt::color::green);
+        level_tag = "INF";
+      } else if (level == "WARN") {
+        style = fmt::fg(fmt::color::yellow) | fmt::emphasis::bold;
+        level_tag = "WRN";
+      } else if (level == "ERROR") {
+        style = fmt::fg(fmt::color::red) | fmt::emphasis::bold;
+        level_tag = "ERR";
+      }
+
+      static std::mutex terminal_mutex;
+      std::lock_guard<std::mutex> lock(terminal_mutex);
+      auto tp = std::chrono::system_clock::to_time_t(now);
+      struct tm tm_info;
+      localtime_r(&tp, &tm_info);
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+      fmt::print(fmt::fg(fmt::color::gray), "[{:%H:%M:%S}.{:03d}] ", tm_info, ms.count());
+      fmt::print(style, "[{}] ", level_tag);
+      fmt::print("{}\n", msg);
+      fflush(stdout);
+    }
+
+  public:
 #if __cplusplus >= 202002L
     void log_impl(const std::string &level, const std::string &msg, const std::source_location &loc) {
-      // std::cout << "[" << level << "] " << msg << " (" << loc.file_name() << ":" << loc.line() << ")" << std::endl;
+      print_to_terminal(level, msg);
       auto now =
           std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
               .count() /
@@ -82,7 +119,7 @@ namespace fins {
     }
 #else
     void log_impl(const std::string &level, const std::string &msg, const char *file = "", uint32_t line = 0) {
-      // std::cout << "[" << level << "] " << msg << std::endl;
+      print_to_terminal(level, msg);
       auto now =
           std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
               .count() /

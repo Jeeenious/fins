@@ -38,6 +38,7 @@ void print_usage(const char *prog_name) {
             << "  --name <agent_name>     Set agent name (default: agent-any)\n"
             << "  --ip <agent_ip>         Set agent IP binding (default: 0.0.0.0)\n"
             << "  --port <agent_port>     Set agent listening port (default: 9090)\n"
+            << "  --terminal-log <on/off> Enable/disable terminal log printing (default: on)\n"
             << "  -h, --help              Show this help message\n";
 }
 
@@ -50,6 +51,7 @@ int main(int argc, char **argv) {
   int medium_threads = 0;
   int low_threads = 0;
   int log_level = 1; // INFO
+  bool terminal_log = true;
   bool load_all = false;
   std::vector<std::string> plugins;
   std::string webui_url = "http://localhost:8080";
@@ -64,16 +66,26 @@ int main(int argc, char **argv) {
                                   {"name", required_argument, 0, 'n'},
                                   {"ip", required_argument, 0, 'I'},
                                   {"port", required_argument, 0, 'P'},
+                                  {"terminal-log", required_argument, 0, 'T'},
                                   {"help", no_argument, 0, 'h'},
                                   {0, 0, 0, 0}};
 
   int opt;
   int option_index = 0;
-  while ((opt = getopt_long(argc, argv, "u:H:m:l:L:p:Aw:n:I:P:h", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, "u:H:m:l:L:p:Aw:n:I:P:T:h", long_options, &option_index)) != -1) {
     switch (opt) {
       case 'L':
         log_level = std::stoi(optarg);
         break;
+      case 'T': {
+        std::string val = optarg;
+        if (val == "off" || val == "0" || val == "false") {
+          terminal_log = false;
+        } else {
+          terminal_log = true;
+        }
+        break;
+      }
       case 'p':
         plugins.push_back(optarg);
         break;
@@ -107,6 +119,7 @@ int main(int argc, char **argv) {
   if (log_level > 4)
     log_level = 4;
   fins::set_node_log_level(static_cast<fins::NodeLogLevel>(log_level));
+  fins::Logger::get().set_node_terminal_enabled(terminal_log);
 
   FINS_THREAD_MANAGER.start();
 
