@@ -80,6 +80,9 @@ namespace fins {
       if (in_multiline_mode) {
         pending_multiline_value += " " + trimmed_line;
         if (trimmed_line.find(']') != std::string::npos) {
+          if (params_.find(pending_full_key) == params_.end()) {
+            params_order_.push_back(pending_full_key);
+          }
           params_[pending_full_key] = pending_multiline_value;
           in_multiline_mode = false;
           pending_multiline_value = "";
@@ -121,6 +124,9 @@ namespace fins {
         pending_full_key = full_key;
         pending_multiline_value = value;
       } else {
+        if (params_.find(full_key) == params_.end()) {
+          params_order_.push_back(full_key);
+        }
         params_[full_key] = value;
       }
     }

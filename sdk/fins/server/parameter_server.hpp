@@ -27,6 +27,7 @@ namespace fins {
 
   struct YamlNode {
     std::map<std::string, YamlNode> children;
+    std::vector<std::string> child_order;
     std::string value;
     std::string type_info;
     bool is_leaf = false;
@@ -34,18 +35,28 @@ namespace fins {
     void insert(const std::string &full_key, const std::string &val, const std::string &type = "") {
       std::size_t pos = full_key.find('.');
       if (pos == std::string::npos) {
+        if (children.find(full_key) == children.end()) {
+          child_order.push_back(full_key);
+        }
         children[full_key].value = val;
         children[full_key].type_info = type;
         children[full_key].is_leaf = true;
       } else {
         std::string head = full_key.substr(0, pos);
         std::string tail = full_key.substr(pos + 1);
+        if (children.find(head) == children.end()) {
+          child_order.push_back(head);
+        }
         children[head].insert(tail, val, type);
       }
     }
 
     void dump(std::stringstream &ss, int indent = 0) const {
-      for (auto const &[name, node]: children) {
+      for (const auto &name : child_order) {
+        auto it = children.find(name);
+        if (it == children.end()) continue;
+        const auto &node = it->second;
+        
         ss << std::string(indent * 2, ' ') << name << ":";
         if (node.is_leaf) {
           ss << " " << node.value;
@@ -88,7 +99,12 @@ namespace fins {
     std::string dump_active_yaml() const {
       std::lock_guard<std::mutex> lock(mutex_);
       YamlNode root;
-      for (auto const &[key, val]: params_) { root.insert(key, val); }
+      for (const auto &key : params_order_) {
+        auto it = params_.find(key);
+        if (it != params_.end()) {
+          root.insert(key, it->second);
+        }
+      }
       std::stringstream ss;
       root.dump(ss);
       return ss.str();
@@ -97,7 +113,12 @@ namespace fins {
     std::string dump_template_yaml() const {
       std::lock_guard<std::mutex> lock(mutex_);
       YamlNode root;
-      for (auto const &[key, req]: requested_entries_) { root.insert(key, req.default_val, req.type_name); }
+      for (const auto &key : requested_order_) {
+        auto it = requested_entries_.find(key);
+        if (it != requested_entries_.end()) {
+          root.insert(key, it->second.default_val, it->second.type_name);
+        }
+      }
       std::stringstream ss;
       root.dump(ss);
       return ss.str();
@@ -145,12 +166,14 @@ namespace fins {
       std::string type_name;
     };
     mutable std::map<std::string, ParamRequirement> requested_entries_;
+    mutable std::vector<std::string> requested_order_;
 
     template<typename T>
     void record_requirement(const std::string &key, const T &default_val) const {
       std::lock_guard<std::mutex> lock(mutex_);
       if (requested_entries_.find(key) == requested_entries_.end()) {
         requested_entries_[key] = { to_raw_string(default_val), FINS_TYPE_REGISTER.get_name<T>() };
+        requested_order_.push_back(key);
       }
     }
 
@@ -169,6 +192,7 @@ namespace fins {
     ~ParameterServer() = default;
 
     std::map<std::string, std::string> params_;
+    std::vector<std::string> params_order_;
     mutable std::mutex mutex_;
 
     static std::string trim(const std::string &str);
