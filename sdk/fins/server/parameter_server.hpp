@@ -181,7 +181,9 @@ namespace fins {
     std::string to_raw_string(const T &val) const {
       if constexpr (std::is_same_v<T, std::string>) return val;
       else if constexpr (std::is_same_v<T, bool>) return val ? "true" : "false";
-      else {
+      else if constexpr (std::is_floating_point_v<T>) {
+        return fmt::format("{:g}", val);
+      } else {
         using namespace std;
         return to_string(val);
       }
