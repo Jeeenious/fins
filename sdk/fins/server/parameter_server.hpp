@@ -30,9 +30,10 @@ namespace fins {
     std::vector<std::string> child_order;
     std::string value;
     std::string type_info;
+    std::string description;
     bool is_leaf = false;
 
-    void insert(const std::string &full_key, const std::string &val, const std::string &type = "") {
+    void insert(const std::string &full_key, const std::string &val, const std::string &type = "", const std::string &desc = "") {
       std::size_t pos = full_key.find('.');
       if (pos == std::string::npos) {
         if (children.find(full_key) == children.end()) {
@@ -40,6 +41,7 @@ namespace fins {
         }
         children[full_key].value = val;
         children[full_key].type_info = type;
+        children[full_key].description = desc;
         children[full_key].is_leaf = true;
       } else {
         std::string head = full_key.substr(0, pos);
@@ -47,7 +49,7 @@ namespace fins {
         if (children.find(head) == children.end()) {
           child_order.push_back(head);
         }
-        children[head].insert(tail, val, type);
+        children[head].insert(tail, val, type, desc);
       }
     }
 
@@ -60,7 +62,15 @@ namespace fins {
         ss << std::string(indent * 2, ' ') << name << ":";
         if (node.is_leaf) {
           ss << " " << node.value;
-          if (!node.type_info.empty()) ss << " # type: " << node.type_info;
+          bool has_info = !node.type_info.empty() || !node.description.empty();
+          if (has_info) {
+            ss << " #";
+            if (!node.type_info.empty()) ss << " type: " << node.type_info;
+            if (!node.description.empty()) {
+              if (!node.type_info.empty()) ss << ",";
+              ss << " description: " << node.description;
+            }
+          }
           ss << "\n";
         } else {
           ss << "\n";
@@ -68,6 +78,30 @@ namespace fins {
         }
       }
     }
+  };
+
+  template<typename T>
+  class ParamResult {
+  public:
+    ParamResult(const std::string &key, const T &val);
+
+    operator T() const { return value_; }
+
+    ParamResult &with_description(const std::string &desc);
+
+    ParamResult &within(const T &min_val, const T &max_val);
+
+    ParamResult &less_than(const T &max_val);
+
+    ParamResult &greater_than(const T &min_val);
+
+    ParamResult &one_of(const std::vector<T> &options);
+
+    ParamResult &is_integer();
+
+  private:
+    std::string key_;
+    T value_;
   };
 
   class FINS_API ParameterServer {
@@ -82,18 +116,61 @@ namespace fins {
     bool load_file(const std::string &path);
 
     template<typename T>
-    T get(const std::string &key) const {
-      return get_impl<T>(key, nullptr);
+    ParamResult<T> get(const std::string &key) const {
+      return ParamResult<T>(key, get_impl<T>(key, nullptr));
     }
 
     template<typename T>
-    T get(const std::string &key, const T &default_value) const {
-      return get_impl<T>(key, &default_value);
+    ParamResult<T> get(const std::string &key, const T &default_value) const {
+      return ParamResult<T>(key, get_impl<T>(key, &default_value));
     }
 
-    std::string get(const std::string &key, const char *default_value) const {
-      std::string def_val(default_value);
-      return get_impl<std::string>(key, &def_val);
+    ParamResult<std::string> get(const std::string &key, const char *default_value) const {
+      std::string def_val(default_value ? default_value : "");
+      return ParamResult<std::string>(key, get_impl<std::string>(key, &def_val));
+    }
+
+    void set_description(const std::string &key, const std::string &description) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (requested_entries_.find(key) != requested_entries_.end()) {
+        requested_entries_[key].description = description;
+      }
+    }
+
+    template<typename T>
+    void set_min(const std::string &key, const T &min_val) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (requested_entries_.find(key) != requested_entries_.end()) {
+        requested_entries_[key].min_val = to_raw_string(min_val);
+        requested_entries_[key].has_min = true;
+      }
+    }
+
+    template<typename T>
+    void set_max(const std::string &key, const T &max_val) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (requested_entries_.find(key) != requested_entries_.end()) {
+        requested_entries_[key].max_val = to_raw_string(max_val);
+        requested_entries_[key].has_max = true;
+      }
+    }
+
+    template<typename T>
+    void set_options(const std::string &key, const std::vector<T> &options) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (requested_entries_.find(key) != requested_entries_.end()) {
+        requested_entries_[key].options.clear();
+        for (const auto &opt : options) {
+          requested_entries_[key].options.push_back(to_raw_string(opt));
+        }
+      }
+    }
+
+    void set_is_integer(const std::string &key, bool is_int) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (requested_entries_.find(key) != requested_entries_.end()) {
+        requested_entries_[key].is_integer = is_int;
+      }
     }
 
     std::string dump_active_yaml() const {
@@ -116,13 +193,15 @@ namespace fins {
       for (const auto &key : requested_order_) {
         auto it = requested_entries_.find(key);
         if (it != requested_entries_.end()) {
-          root.insert(key, it->second.default_val, it->second.type_name);
+          root.insert(key, it->second.default_val, it->second.type_name, it->second.description);
         }
       }
       std::stringstream ss;
       root.dump(ss);
       return ss.str();
     }
+
+    std::string dump_template_json() const;
 
   private:
     template<typename T>
@@ -164,6 +243,13 @@ namespace fins {
     struct ParamRequirement {
       std::string default_val;
       std::string type_name;
+      std::string description;
+      std::string min_val;
+      std::string max_val;
+      std::vector<std::string> options;
+      bool has_min = false;
+      bool has_max = false;
+      bool is_integer = false;
     };
     mutable std::map<std::string, ParamRequirement> requested_entries_;
     mutable std::vector<std::string> requested_order_;
@@ -180,12 +266,12 @@ namespace fins {
     template<typename T>
     std::string to_raw_string(const T &val) const {
       if constexpr (std::is_same_v<T, std::string>) return val;
+      if constexpr (std::is_same_v<T, const char*>) return val ? std::string(val) : std::string("");
       else if constexpr (std::is_same_v<T, bool>) return val ? "true" : "false";
       else if constexpr (std::is_floating_point_v<T>) {
         return fmt::format("{:g}", val);
       } else {
-        using namespace std;
-        return to_string(val);
+        return fmt::format("{}", val);
       }
     }
 
@@ -362,6 +448,67 @@ namespace fins {
     return res;
   }
 
+  template<typename T>
+  ParamResult<T>::ParamResult(const std::string &key, const T &val) : key_(key), value_(val) {}
+
+  template<typename T>
+  ParamResult<T> &ParamResult<T>::with_description(const std::string &desc) {
+    ParameterServer::get_instance().set_description(key_, desc);
+    return *this;
+  }
+
+  template<typename T>
+  ParamResult<T> &ParamResult<T>::within(const T &min_val, const T &max_val) {
+    if (value_ < min_val || value_ > max_val) {
+      FINS_LOG_WARN("[ParameterServer] Parameter '{}' value {} is out of range [{}, {}]", key_, value_, min_val, max_val);
+    }
+    ParameterServer::get_instance().set_min(key_, min_val);
+    ParameterServer::get_instance().set_max(key_, max_val);
+    return *this;
+  }
+
+  template<typename T>
+  ParamResult<T> &ParamResult<T>::less_than(const T &max_val) {
+    if (value_ >= max_val) {
+      FINS_LOG_WARN("[ParameterServer] Parameter '{}' value {} is not less than {}", key_, value_, max_val);
+    }
+    ParameterServer::get_instance().set_max(key_, max_val);
+    return *this;
+  }
+
+  template<typename T>
+  ParamResult<T> &ParamResult<T>::greater_than(const T &min_val) {
+    if (value_ <= min_val) {
+      FINS_LOG_WARN("[ParameterServer] Parameter '{}' value {} is not greater than {}", key_, value_, min_val);
+    }
+    ParameterServer::get_instance().set_min(key_, min_val);
+    return *this;
+  }
+
+  template<typename T>
+  ParamResult<T> &ParamResult<T>::one_of(const std::vector<T> &options) {
+    if (std::find(options.begin(), options.end(), value_) == options.end()) {
+      std::stringstream ss;
+      ss << "[";
+      for (size_t i = 0; i < options.size(); ++i) {
+        ss << options[i] << (i == options.size() - 1 ? "" : ", ");
+      }
+      ss << "]";
+      FINS_LOG_WARN("[ParameterServer] Parameter '{}' value {} is not one of {}", key_, value_, ss.str());
+    }
+    ParameterServer::get_instance().set_options(key_, options);
+    return *this;
+  }
+
+  template<typename T>
+  ParamResult<T> &ParamResult<T>::is_integer() {
+    if constexpr (!std::is_integral_v<T>) {
+      FINS_LOG_WARN("[ParameterServer] Parameter '{}' is checked for is_integer() but its type is not integral", key_);
+    }
+    ParameterServer::get_instance().set_is_integer(key_, true);
+    return *this;
+  }
+
   inline ParameterServer &param_server() { return ParameterServer::get_instance(); }
 
   class ParamLoader {
@@ -373,22 +520,22 @@ namespace fins {
     }
 
     template<typename T>
-    T get(const std::string &key, const T &default_val) const {
+    ParamResult<T> get(const std::string &key, const T &default_val) const {
       return param_server().get<T>(prefix_ + key, default_val);
     }
 
-    std::string get(const std::string &key, const char *default_val) const {
-      return param_server().get<std::string>(prefix_ + key, std::string(default_val));
+    ParamResult<std::string> get(const std::string &key, const char *default_val) const {
+      return param_server().get(prefix_ + key, default_val);
     }
 
     // Same as get but named load
     template<typename T>
-    T load(const std::string &key, const T &default_val) const {
+    ParamResult<T> load(const std::string &key, const T &default_val) const {
       return param_server().get<T>(prefix_ + key, default_val);
     }
 
-    std::string load(const std::string &key, const char *default_val) const {
-      return param_server().get<std::string>(prefix_ + key, std::string(default_val));
+    ParamResult<std::string> load(const std::string &key, const char *default_val) const {
+      return param_server().get(prefix_ + key, default_val);
     }
 
     template<typename T>

@@ -160,6 +160,7 @@ namespace fins {
           json response;
 
           response["template_yaml"] = fins::param_server().dump_template_yaml();
+          response["template_json"] = json::parse(fins::param_server().dump_template_json());
           response["current_yaml"] = fins::param_server().dump_active_yaml();
 
           res.set_content(response.dump(), "application/json");

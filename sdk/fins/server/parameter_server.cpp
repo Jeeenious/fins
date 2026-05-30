@@ -8,8 +8,11 @@
 
 #include "parameter_server.hpp"
 #include <sstream>
+#include <fins/third_party/json.hpp>
 
 namespace fins {
+
+  using json = nlohmann::ordered_json;
 
   ParameterServer &ParameterServer::get_instance() {
     static ParameterServer instance;
@@ -133,6 +136,49 @@ namespace fins {
 
     FINS_LOG_INFO("[ParameterServer] Loaded {} parameters.", params_.size());
     return true;
+  }
+
+  std::string ParameterServer::dump_template_json() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    json root = json::object();
+
+    for (const auto &key : requested_order_) {
+      auto it = requested_entries_.find(key);
+      if (it == requested_entries_.end()) continue;
+
+      const auto &req = it->second;
+      
+      // Navigate to the correct nested object
+      json *current = &root;
+      std::stringstream ss(key);
+      std::string segment;
+      std::vector<std::string> segments;
+      while (std::getline(ss, segment, '.')) {
+        segments.push_back(segment);
+      }
+
+      for (size_t i = 0; i < segments.size() - 1; ++i) {
+        if (!current->contains(segments[i])) {
+          (*current)[segments[i]] = json::object();
+        }
+        current = &((*current)[segments[i]]);
+      }
+
+      // Add parameter info
+      json info = {
+        {"default", req.default_val},
+        {"type", req.type_name}
+      };
+      if (!req.description.empty()) info["description"] = req.description;
+      if (req.has_min) info["min"] = req.min_val;
+      if (req.has_max) info["max"] = req.max_val;
+      if (!req.options.empty()) info["options"] = req.options;
+      if (req.is_integer) info["is_integer"] = true;
+
+      (*current)[segments.back()] = info;
+    }
+
+    return root.dump();
   }
 
 } // namespace fins
