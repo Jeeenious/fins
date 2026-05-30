@@ -24,6 +24,7 @@
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <fmt/printf.h>
+#include <fins/utils/logger.hpp>
 
 namespace fins {
 
