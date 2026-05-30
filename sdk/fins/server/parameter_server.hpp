@@ -104,6 +104,11 @@ namespace fins {
     T value_;
   };
 
+  template<typename T>
+  struct is_vector : std::false_type {};
+  template<typename T, typename A>
+  struct is_vector<std::vector<T, A>> : std::true_type {};
+
   class FINS_API ParameterServer {
   public:
     static ParameterServer &get_instance();
@@ -268,6 +273,10 @@ namespace fins {
       if constexpr (std::is_same_v<T, std::string>) return val;
       if constexpr (std::is_same_v<T, const char*>) return val ? std::string(val) : std::string("");
       else if constexpr (std::is_same_v<T, bool>) return val ? "true" : "false";
+      else if constexpr (is_vector<T>::value) {
+        using namespace std; 
+        return to_string(val);
+      }
       else if constexpr (std::is_floating_point_v<T>) {
         return fmt::format("{:g}", val);
       } else {
