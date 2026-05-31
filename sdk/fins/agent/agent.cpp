@@ -32,6 +32,7 @@ void print_usage(const char *prog_name) {
             << "  --threads-medium <n>    Set medium priority thread pool size (default: 4)\n"
             << "  --threads-low <n>       Set low priority thread pool size (default: 4)\n"
             << "  --log-level <level>     Set node log level (0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=OFF) (default: 1)\n"
+            << "  --perf                  Enable performance monitor (default: off)\n"
             << "  --plugin <file>         Load specified .so plugin file (can be repeated)\n"
             << "  --load-all              Load all plugins from ~/.fins/install/ (ignores --plugin)\n"
             << "  --webui <url>           Connect to WebUI URL (e.g. http://localhost:8080)\n"
@@ -52,6 +53,7 @@ int main(int argc, char **argv) {
   int low_threads = 0;
   int log_level = 1; // INFO
   bool terminal_log = true;
+  bool enable_perf = false;
   bool load_all = false;
   std::vector<std::string> plugins;
   std::string webui_url = "http://localhost:8080";
@@ -60,6 +62,7 @@ int main(int argc, char **argv) {
   int agent_port = 9090;
 
   struct option long_options[] = {{"log-level", required_argument, 0, 'L'},
+                                  {"perf", no_argument, 0, 'f'},
                                   {"plugin", required_argument, 0, 'p'},
                                   {"load-all", no_argument, 0, 'A'},
                                   {"webui", required_argument, 0, 'w'},
@@ -72,10 +75,13 @@ int main(int argc, char **argv) {
 
   int opt;
   int option_index = 0;
-  while ((opt = getopt_long(argc, argv, "u:H:m:l:L:p:Aw:n:I:P:T:h", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, "u:H:m:l:L:f:p:Aw:n:I:P:T:h", long_options, &option_index)) != -1) {
     switch (opt) {
       case 'L':
         log_level = std::stoi(optarg);
+        break;
+      case 'f':
+        enable_perf = true;
         break;
       case 'T': {
         std::string val = optarg;
@@ -123,7 +129,9 @@ int main(int argc, char **argv) {
 
   FINS_THREAD_MANAGER.start();
 
-  FINS_PERF_MONITOR.start();
+  if (enable_perf) {
+    FINS_PERF_MONITOR.start();
+  }
 
   fins::NodeLib lib;
 

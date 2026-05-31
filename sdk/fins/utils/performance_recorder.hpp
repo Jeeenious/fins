@@ -37,6 +37,7 @@ public:
     }
 
     void push_record(MsgPerfRecord&& record) {
+        if (!running_) return;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             queue_.push_back(std::move(record));
