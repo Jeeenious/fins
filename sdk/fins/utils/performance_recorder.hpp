@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <fins/utils/time.hpp>
+#include <fins/utils/logger.hpp>
 #include <fins/third_party/json.hpp>
 
 namespace fins {
@@ -73,9 +74,13 @@ public:
     }
 
     void stop() {
+        if (!running_) return;
         running_ = false;
         cv_.notify_all();
-        if (worker_thread_.joinable()) worker_thread_.join();
+        if (worker_thread_.joinable()) {
+            worker_thread_.join();
+            FINS_LOG_INFO("[Perf] Performance data saved to: {}", filename_);
+        }
     }
 
 private:
