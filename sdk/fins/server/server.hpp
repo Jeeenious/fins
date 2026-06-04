@@ -110,6 +110,20 @@ namespace fins {
         }
       });
 
+      server_.Get("/get_dataflow", [&](const httplib::Request &, httplib::Response &res) {
+        try {
+          std::string df_json = node_lib_.get_dataflow_json();
+          if (df_json.empty()) {
+            res.set_content(json{{"status", "error"}, {"message", "No dataflow loaded."}}.dump(), "application/json");
+          } else {
+            res.set_content(df_json, "application/json");
+          }
+        } catch (const std::exception &e) {
+          res.status = 500;
+          res.set_content(json{{"status", "error"}, {"message", e.what()}}.dump(), "application/json");
+        }
+      });
+
       server_.Post("/apply_parameters", [&](const httplib::Request &req, httplib::Response &res) {
         try {
           json params = json::parse(req.body);

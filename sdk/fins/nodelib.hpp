@@ -237,6 +237,9 @@ namespace fins {
 #else
     json get_capabilities() const { return FINS_NODE_FACTORY.get_capabilities(); }
 #endif
+
+    std::string get_dataflow_json() const { return last_dataflow_json_; }
+
     void print_capabilities() const {
       json caps = get_capabilities();
       if (caps.is_null() || caps.empty()) {
@@ -295,6 +298,7 @@ namespace fins {
 
     void load_json(const std::string &json_str) {
       FINS_LOG_INFO("[NodeLib] Received new dataflow. Clearing previous execution graph...");
+      last_dataflow_json_ = json_str;
       FINS_STUDIO.clear();
 
       json root = json::parse(json_str);
@@ -686,6 +690,8 @@ namespace fins {
     std::map<std::string, std::shared_ptr<PluginContext>> registry_;
 
     json capabilities_cache_;
+
+    std::string last_dataflow_json_;
 
     std::string watch_dir_;
     std::thread monitor_thread_;
