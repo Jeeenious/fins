@@ -478,8 +478,8 @@ namespace fins {
 
   template<typename T>
   ParamResult<T> &ParamResult<T>::less_than(const T &max_val) {
-    if (value_ >= max_val) {
-      FINS_LOG_WARN("[ParameterServer] Parameter '{}' value {} is not less than {}", key_, value_, max_val);
+    if (value_ > max_val) {
+      FINS_LOG_WARN("[ParameterServer] Parameter '{}' value {} is greater than {}", key_, value_, max_val);
     }
     ParameterServer::get_instance().set_max(key_, max_val);
     return *this;
@@ -487,8 +487,8 @@ namespace fins {
 
   template<typename T>
   ParamResult<T> &ParamResult<T>::greater_than(const T &min_val) {
-    if (value_ <= min_val) {
-      FINS_LOG_WARN("[ParameterServer] Parameter '{}' value {} is not greater than {}", key_, value_, min_val);
+    if (value_ < min_val) {
+      FINS_LOG_WARN("[ParameterServer] Parameter '{}' value {} is less than {}", key_, value_, min_val);
     }
     ParameterServer::get_instance().set_min(key_, min_val);
     return *this;
