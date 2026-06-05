@@ -8,7 +8,7 @@
 
 #define FINS_LOG_LEVEL 1
 
-#include <fins/agent/server.hpp>
+#include <fins/server/server.hpp>
 #include <fins/utils/performance_recorder.hpp>
 #include <csignal>
 
