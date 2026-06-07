@@ -236,11 +236,14 @@ namespace fins {
             }
           }
         }
+        
         if (default_value_ptr) {
           FINS_LOG_WARN("[ParameterServer] Parameter not found: {}. Using default value.", key);
           return *default_value_ptr;
+        } else {
+          FINS_LOG_WARN("[ParameterServer] Parameter not found: {}. No default value provided! Returning default constructed value.", key);
+          return T();
         }
-        return T();
       }
       return convert<T>(it->second, key);
     }
@@ -529,6 +532,11 @@ namespace fins {
     }
 
     template<typename T>
+    ParamResult<T> get(const std::string &key) const {
+      return param_server().get<T>(prefix_ + key);
+    }
+
+    template<typename T>
     ParamResult<T> get(const std::string &key, const T &default_val) const {
       return param_server().get<T>(prefix_ + key, default_val);
     }
@@ -537,7 +545,11 @@ namespace fins {
       return param_server().get(prefix_ + key, default_val);
     }
 
-    // Same as get but named load
+    template<typename T>
+    ParamResult<T> load(const std::string &key) const {
+      return param_server().get<T>(prefix_ + key);
+    }
+
     template<typename T>
     ParamResult<T> load(const std::string &key, const T &default_val) const {
       return param_server().get<T>(prefix_ + key, default_val);
