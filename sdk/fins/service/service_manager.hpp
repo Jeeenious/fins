@@ -9,16 +9,11 @@
 #pragma once
 
 #include <any>
-#include <atomic>
-#include <condition_variable>
-#include <deque>
 #include <functional>
 #include <future>
 #include <map>
-#include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <typeindex>
 #include <vector>
 
@@ -43,7 +38,7 @@ namespace fins {
 
   private:
     ServiceManager();
-    ~ServiceManager();
+    ~ServiceManager() = default;
 
     struct ServiceEntry {
       ServiceCallback callback;
@@ -51,26 +46,9 @@ namespace fins {
       std::type_index output_type_id = std::type_index(typeid(void));
     };
 
-    struct Task {
-      std::string topic;
-      std::vector<std::any> args;
-      std::shared_ptr<std::promise<std::any>> promise;
-      std::type_index input_check = std::type_index(typeid(void));
-      std::type_index output_check = std::type_index(typeid(void));
-    };
-
-    void worker_loop();
-
   private:
     std::map<std::string, ServiceEntry> services_;
-    std::mutex map_mutex_;
-
-    std::deque<Task> tasks_;
-    std::mutex queue_mutex_;
-    std::condition_variable cv_;
-
-    std::thread worker_thread_;
-    std::atomic<bool> stop_;
+    mutable std::mutex map_mutex_;
   };
 
 } // namespace fins
