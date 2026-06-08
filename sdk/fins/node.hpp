@@ -630,18 +630,51 @@ namespace fins {
       meta_.clients.push_back({name, req_str, res_str});
 
       return [this, name](auto &&...args) -> RetType {
+        constexpr size_t ArgCount = sizeof...(args);
+        constexpr size_t ExpectedCount = std::tuple_size_v<InTuple>;
+        static_assert(ArgCount == ExpectedCount, "Client argument count mismatch");
+
+        static std::atomic<const ServiceManager::ServiceEntry*> cached_entry{nullptr};
+        const ServiceManager::ServiceEntry* entry = cached_entry.load(std::memory_order_relaxed);
+
+        if (!entry) {
+          std::string current_topic = name;
+          if (client_remaps_.count(name)) {
+            current_topic = client_remaps_[name];
+          }
+          entry = FINS_SERVICE_MANAGER.get_service_entry(current_topic);
+          if (entry) {
+            cached_entry.store(entry, std::memory_order_release);
+          }
+        }
+
+        if (entry) {
+          if (entry->input_type_id != std::type_index(typeid(InTuple)) || 
+              entry->output_type_id != std::type_index(typeid(OutTuple))) {
+            throw std::runtime_error("[Service Error] Type mismatch on fast-path call for: " + name);
+          }
+
+          std::vector<std::any> type_erased_args;
+          type_erased_args.reserve(ArgCount);
+          (type_erased_args.push_back(std::any(std::forward<decltype(args)>(args))), ...);
+
+          std::any res_any = entry->callback(type_erased_args);
+
+          if constexpr (std::is_void_v<RetType>) {
+            return;
+          } else {
+            return std::any_cast<RetType>(res_any);
+          }
+        }
+
         std::string current_topic = name;
         if (client_remaps_.count(name)) {
           current_topic = client_remaps_[name];
         }
 
-        constexpr size_t ArgCount = sizeof...(args);
-        constexpr size_t ExpectedCount = std::tuple_size_v<InTuple>;
-        static_assert(ArgCount == ExpectedCount, "Client argument count mismatch");
-
         std::vector<std::any> type_erased_args;
         type_erased_args.reserve(ArgCount);
-        (type_erased_args.push_back(std::any(args)), ...);
+        (type_erased_args.push_back(std::any(std::forward<decltype(args)>(args))), ...);
 
         auto future =
             FINS_SERVICE_MANAGER.call_service(current_topic, std::move(type_erased_args),
