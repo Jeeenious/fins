@@ -18,6 +18,7 @@ namespace fins {
   }
 
   ServiceManager::ServiceManager() {}
+  ServiceManager::~ServiceManager() {}
 
   void ServiceManager::register_service(const std::string &topic, ServiceCallback cb, std::type_index inputs_id,
                                         std::type_index outputs_id) {
