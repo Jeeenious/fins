@@ -26,6 +26,12 @@
 
 namespace fins {
 
+  class ServiceHandler {
+  public:
+    virtual ~ServiceHandler() = default;
+    virtual std::any invoke(const std::any* args, size_t count) = 0;
+  };
+
   class FINS_API ServiceManager {
   public:
     using ServiceCallback = std::function<std::any(const std::vector<std::any> &)>;
@@ -34,6 +40,7 @@ namespace fins {
       ServiceCallback callback;
       std::type_index input_type_id = std::type_index(typeid(void));
       std::type_index output_type_id = std::type_index(typeid(void));
+      std::unique_ptr<ServiceHandler> handler;
     };
 
     static ServiceManager &get_instance();
@@ -44,6 +51,9 @@ namespace fins {
     void register_service(const std::string &topic, ServiceCallback cb, std::type_index inputs_id,
                           std::type_index outputs_id);
 
+    void register_service_handler(const std::string &topic, std::unique_ptr<ServiceHandler> handler,
+                                  std::type_index inputs_id, std::type_index outputs_id);
+
     std::future<std::any> call_service(const std::string &topic, std::vector<std::any> args,
                                        std::type_index req_inputs_id, std::type_index req_outputs_id);
 
@@ -52,6 +62,15 @@ namespace fins {
       auto it = services_.find(topic);
       if (it != services_.end()) {
         return &it->second;
+      }
+      return nullptr;
+    }
+
+    ServiceHandler* get_service_handler(const std::string &topic) {
+      std::lock_guard<std::mutex> lock(map_mutex_);
+      auto it = services_.find(topic);
+      if (it != services_.end()) {
+        return it->second.handler.get();
       }
       return nullptr;
     }

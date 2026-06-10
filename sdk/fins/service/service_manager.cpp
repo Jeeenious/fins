@@ -26,7 +26,16 @@ namespace fins {
     if (services_.find(topic) != services_.end()) {
       FINS_LOG_WARN("[ServiceManager] Overwriting existing service on topic: {}", topic);
     }
-    services_[topic] = {cb, inputs_id, outputs_id};
+    services_[topic] = {cb, inputs_id, outputs_id, nullptr};
+  }
+
+  void ServiceManager::register_service_handler(const std::string &topic, std::unique_ptr<ServiceHandler> handler,
+                                                std::type_index inputs_id, std::type_index outputs_id) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    if (services_.find(topic) != services_.end()) {
+      FINS_LOG_WARN("[ServiceManager] Overwriting existing service on topic: {}", topic);
+    }
+    services_[topic] = {nullptr, inputs_id, outputs_id, std::move(handler)};
   }
 
   std::future<std::any> ServiceManager::call_service(const std::string &topic, std::vector<std::any> args,
@@ -34,24 +43,15 @@ namespace fins {
     auto promise = std::make_shared<std::promise<std::any>>();
     std::future<std::any> future = promise->get_future();
 
-    ServiceEntry entry;
-    bool found = false;
-
-    {
-      std::lock_guard<std::mutex> lock(map_mutex_);
-      auto it = services_.find(topic);
-      if (it != services_.end()) {
-        entry = it->second;
-        found = true;
-      }
-    }
-
-    if (!found) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    auto it = services_.find(topic);
+    if (it == services_.end()) {
       FINS_LOG_ERROR("[ServiceManager] Service not found: {}", topic);
       promise->set_exception(std::make_exception_ptr(std::runtime_error("Service not found: " + topic)));
       return future;
     }
 
+    const auto &entry = it->second;
     if (entry.input_type_id != req_inputs_id || entry.output_type_id != req_outputs_id) {
       FINS_LOG_ERROR("[ServiceManager] Type mismatch for service: {}. Check client/server signatures.", topic);
       promise->set_exception(std::make_exception_ptr(std::runtime_error("Service type mismatch for " + topic)));
@@ -59,7 +59,14 @@ namespace fins {
     }
 
     try {
-      std::any result = entry.callback(args);
+      std::any result;
+      if (entry.handler) {
+        result = entry.handler->invoke(args.data(), args.size());
+      } else if (entry.callback) {
+        result = entry.callback(args);
+      } else {
+        throw std::runtime_error("Service entry has no handler or callback: " + topic);
+      }
       promise->set_value(result);
       FINS_LOG_INFO("[ServiceManager] Service {} executed successfully", topic);
     } catch (const std::exception &e) {

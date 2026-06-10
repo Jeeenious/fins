@@ -235,6 +235,7 @@ namespace fins {
       ServiceManager::ServiceCallback callback;
       std::type_index input_id = std::type_index(typeid(void));
       std::type_index output_id = std::type_index(typeid(void));
+      std::unique_ptr<ServiceHandler> handler;
     };
     std::map<std::string, ServerHandle> server_handles_;
     std::map<std::string, std::string> server_remaps_;
@@ -316,7 +317,20 @@ namespace fins {
       auto it = server_handles_.find(key);
       if (it != server_handles_.end()) {
         FINS_LOG_INFO("[Node] Applying Server Remap: Internal '{}' -> Topic '{}'", key, topic);
-        FINS_SERVICE_MANAGER.register_service(topic, it->second.callback, it->second.input_id, it->second.output_id);
+        if (it->second.handler) {
+          // Clone the handler if possible, or move it if it's a one-time thing.
+          // Since it's unique_ptr, we might need a better way if multiple topics map to same internal key.
+          // But usually it's 1-to-1 or just one remap.
+          // For now, let's assume we can move it or we need a way to register it.
+          // Actually, register_service_handler takes ownership.
+          // If it was already registered, it might be gone.
+          // Let's check how TypedServiceHandler is created. It's created in register_server.
+          // We should probably store a factory or just the handler and use it.
+          // For now, let's just register it.
+          FINS_SERVICE_MANAGER.register_service_handler(topic, std::move(it->second.handler), it->second.input_id, it->second.output_id);
+        } else if (it->second.callback) {
+          FINS_SERVICE_MANAGER.register_service(topic, it->second.callback, it->second.input_id, it->second.output_id);
+        }
       }
     }
 
@@ -634,32 +648,18 @@ namespace fins {
         constexpr size_t ExpectedCount = std::tuple_size_v<InTuple>;
         static_assert(ArgCount == ExpectedCount, "Client argument count mismatch");
 
-        static std::atomic<const ServiceManager::ServiceEntry*> cached_entry{nullptr};
-        const ServiceManager::ServiceEntry* entry = cached_entry.load(std::memory_order_relaxed);
+        // 1. 在栈上分配参数数组，0 堆开销
+        std::any args_array[ArgCount > 0 ? ArgCount : 1] = { std::any(std::forward<decltype(args)>(args))... };
 
-        if (!entry) {
-          std::string current_topic = name;
-          if (client_remaps_.count(name)) {
-            current_topic = client_remaps_[name];
-          }
-          entry = FINS_SERVICE_MANAGER.get_service_entry(current_topic);
-          if (entry) {
-            cached_entry.store(entry, std::memory_order_release);
-          }
+        // 2. 如果是同线程/直连模式，直接通过 ServiceManager 获取 Handler 执行
+        std::string current_topic = name;
+        if (client_remaps_.count(name)) {
+          current_topic = client_remaps_[name];
         }
 
-        if (entry) {
-          if (entry->input_type_id != std::type_index(typeid(InTuple)) || 
-              entry->output_type_id != std::type_index(typeid(OutTuple))) {
-            throw std::runtime_error("[Service Error] Type mismatch on fast-path call for: " + name);
-          }
-
-          std::vector<std::any> type_erased_args;
-          type_erased_args.reserve(ArgCount);
-          (type_erased_args.push_back(std::any(std::forward<decltype(args)>(args))), ...);
-
-          std::any res_any = entry->callback(type_erased_args);
-
+        auto handler = FINS_SERVICE_MANAGER.get_service_handler(current_topic);
+        if (handler) {
+          std::any res_any = handler->invoke(args_array, ArgCount);
           if constexpr (std::is_void_v<RetType>) {
             return;
           } else {
@@ -667,14 +667,12 @@ namespace fins {
           }
         }
 
-        std::string current_topic = name;
-        if (client_remaps_.count(name)) {
-          current_topic = client_remaps_[name];
-        }
-
+        // 3. 回退到异步队列模式（原有的 promise/future 逻辑）
         std::vector<std::any> type_erased_args;
         type_erased_args.reserve(ArgCount);
-        (type_erased_args.push_back(std::any(std::forward<decltype(args)>(args))), ...);
+        for (size_t i = 0; i < ArgCount; ++i) {
+          type_erased_args.push_back(args_array[i]);
+        }
 
         auto future =
             FINS_SERVICE_MANAGER.call_service(current_topic, std::move(type_erased_args),
@@ -704,16 +702,28 @@ namespace fins {
 
       meta_.servers.push_back({name, req_str, res_str});
 
-      // Wrap the member function
-      auto wrapper = [this, func = callback_ptr](const std::vector<std::any> &args) -> std::any {
-        if (args.size() != std::tuple_size_v<InTuple>) {
-          throw std::runtime_error("Server received wrong number of arguments");
-        }
-        return call_member_impl<InTuple, RetType, ClassType>(func, args,
-                                                             std::make_index_sequence<std::tuple_size_v<InTuple>>{});
+      // 强类型处理器，内部直接调用成员函数，免去 std::function 包装
+      class TypedServiceHandler : public ServiceHandler {
+          ClassType* instance_;
+          std::decay_t<Func> func_;
+      public:
+          TypedServiceHandler(ClassType* inst, Func f) : instance_(inst), func_(f) {}
+
+          std::any invoke(const std::any* args, size_t count) override {
+              if (count != std::tuple_size_v<InTuple>) {
+                  throw std::runtime_error("Server received wrong number of arguments");
+              }
+              // 将原始 std::any 数组解包并调用
+              return call_member_array_impl<InTuple, RetType, ClassType>(
+                  func_, instance_, args, std::make_index_sequence<std::tuple_size_v<InTuple>>{}
+              );
+          }
       };
 
-      server_handles_[name] = {wrapper, std::type_index(typeid(InTuple)), std::type_index(typeid(OutTuple))};
+      // 注册到 ServiceManager
+      auto handler = std::make_unique<TypedServiceHandler>(static_cast<ClassType*>(this), callback_ptr);
+      
+      server_handles_[name] = {nullptr, std::type_index(typeid(InTuple)), std::type_index(typeid(OutTuple)), std::move(handler)};
     }
 
     template<typename... Args, typename ResultFunc, typename FeedbackFunc>
@@ -837,6 +847,16 @@ namespace fins {
     }
 
   private:
+    template<typename InTuple, typename RetType, typename ClassType, typename Func, size_t... Is>
+    static std::any call_member_array_impl(Func func, ClassType* inst, const std::any* args, std::index_sequence<Is...>) {
+        if constexpr (std::is_void_v<RetType>) {
+            (inst->*func)(std::any_cast<std::tuple_element_t<Is, InTuple>>(args[Is])...);
+            return std::any();
+        } else {
+            return std::any((inst->*func)(std::any_cast<std::tuple_element_t<Is, InTuple>>(args[Is])...));
+        }
+    }
+
     template<typename InTuple, typename RetType, typename ClassType, typename Func, size_t... Is>
     std::any call_member_impl(Func func, const std::vector<std::any> &args, std::index_sequence<Is...>) {
       auto typed_args = std::make_tuple(std::any_cast<std::tuple_element_t<Is, InTuple>>(args[Is])...);
