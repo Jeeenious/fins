@@ -10,6 +10,7 @@
 
 #include <any>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -179,7 +180,9 @@ namespace fins {
       }
       return nullptr;
     }
-    
+
+    // void record_service_call(const std::string &topic, int64_t duration_ns);  // 性能统计已禁用
+
     template<typename Ret, typename... Args>
     void register_typed_service(const std::string &topic, FastDelegate<Ret, Args...> delegate) {
       std::lock_guard<std::mutex> lock(map_mutex_);
@@ -215,9 +218,18 @@ namespace fins {
     void worker_loop();
 
   private:
+    // struct ServiceCallStats {  // 性能统计已禁用
+    //   uint64_t call_count = 0;
+    //   int64_t total_duration_ns = 0;
+    // };
+
     std::map<std::string, ServiceEntry> services_;
     std::map<std::string, std::any> typed_services_; // 强类型直连通道
     std::mutex map_mutex_;
+
+    // mutable std::map<std::string, ServiceCallStats> service_stats_;  // 性能统计已禁用
+    // mutable std::mutex stats_mutex_;
+    // mutable std::chrono::steady_clock::time_point last_stats_report_{};
 
     std::deque<Task> tasks_;
     std::mutex queue_mutex_;
@@ -291,16 +303,25 @@ namespace fins {
       return *this;
     }
 
-    template<typename... ClickArgs>
-    Ret operator()(ClickArgs&&... args) const {
+    Ret operator()(Args... args) const {
       if (resolved_.load(std::memory_order_acquire)) [[likely]] {
-        return bound_func_(std::forward<ClickArgs>(args)...);
+        // auto t1 = std::chrono::steady_clock::now();  // 性能统计已禁用
+        Ret r = bound_func_(std::move(args)...);
+        // auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        //     std::chrono::steady_clock::now() - t1).count();
+        // FINS_SERVICE_MANAGER.record_service_call(topic_, ns);
+        return r;
       }
       resolve();
       if (!bound_func_) [[unlikely]] {
         throw std::runtime_error("[ServiceClient] Service not found on topic: " + topic_);
       }
-      return bound_func_(std::forward<ClickArgs>(args)...);
+      // auto t1 = std::chrono::steady_clock::now();  // 性能统计已禁用
+      Ret r = bound_func_(std::move(args)...);
+      // auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      //     std::chrono::steady_clock::now() - t1).count();
+      // FINS_SERVICE_MANAGER.record_service_call(topic_, ns);
+      return r;
     }
   };
 
