@@ -215,6 +215,27 @@ namespace fins {
     using class_type = C;
   };
 
+  template<typename InTuple, typename Ret>
+  struct ClientGenerator;
+
+  template<typename... InArgs, typename Ret>
+  struct ClientGenerator<std::tuple<InArgs...>, Ret> {
+    static auto generate(const std::string& name) {
+      return ServiceClient<Ret, InArgs...>(name);
+    }
+  };
+
+  template<typename Tuple, typename Ret, typename Class, typename Func>
+  struct TypedServerBinder;
+
+  template<typename... InArgs, typename Ret, typename Class, typename Func>
+  struct TypedServerBinder<std::tuple<InArgs...>, Ret, Class, Func> {
+    static void bind(const std::string& topic, Class* instance, Func func) {
+      auto delegate = FastDelegate<Ret, InArgs...>::template from_member<Class>(instance, func);
+      FINS_SERVICE_MANAGER.register_typed_service<Ret, InArgs...>(topic, std::move(delegate));
+    }
+  };
+
 
   class Node : public INode {
   protected:
@@ -643,49 +664,12 @@ namespace fins {
 
       meta_.clients.push_back({name, req_str, res_str});
 
-      return [this, name](auto &&...args) -> RetType {
-        constexpr size_t ArgCount = sizeof...(args);
-        constexpr size_t ExpectedCount = std::tuple_size_v<InTuple>;
-        static_assert(ArgCount == ExpectedCount, "Client argument count mismatch");
+      std::string actual_topic = name;
+      if (client_remaps_.count(name)) {
+        actual_topic = client_remaps_[name];
+      }
 
-        // 1. 在栈上分配参数数组，0 堆开销
-        std::any args_array[ArgCount > 0 ? ArgCount : 1] = { std::any(std::forward<decltype(args)>(args))... };
-
-        // 2. 如果是同线程/直连模式，直接通过 ServiceManager 获取 Handler 执行
-        std::string current_topic = name;
-        if (client_remaps_.count(name)) {
-          current_topic = client_remaps_[name];
-        }
-
-        auto handler = FINS_SERVICE_MANAGER.get_service_handler(current_topic);
-        if (handler) {
-          std::any res_any = handler->invoke(args_array, ArgCount);
-          if constexpr (std::is_void_v<RetType>) {
-            return;
-          } else {
-            return std::any_cast<RetType>(res_any);
-          }
-        }
-
-        // 3. 回退到异步队列模式（原有的 promise/future 逻辑）
-        std::vector<std::any> type_erased_args;
-        type_erased_args.reserve(ArgCount);
-        for (size_t i = 0; i < ArgCount; ++i) {
-          type_erased_args.push_back(args_array[i]);
-        }
-
-        auto future =
-            FINS_SERVICE_MANAGER.call_service(current_topic, std::move(type_erased_args),
-                                              std::type_index(typeid(InTuple)), std::type_index(typeid(OutTuple)));
-
-        std::any res_any = future.get();
-
-        if constexpr (std::is_void_v<RetType>) {
-          return;
-        } else {
-          return std::any_cast<RetType>(res_any);
-        }
-      };
+      return ClientGenerator<InTuple, RetType>::generate(actual_topic);
     }
 
     template<typename... Args, typename Func>
@@ -702,7 +686,15 @@ namespace fins {
 
       meta_.servers.push_back({name, req_str, res_str});
 
-      // 强类型处理器，内部直接调用成员函数，免去 std::function 包装
+      std::string actual_topic = name;
+      if (server_remaps_.count(name)) {
+        actual_topic = server_remaps_[name];
+      }
+
+      TypedServerBinder<InTuple, RetType, ClassType, std::decay_t<Func>>::bind(
+          actual_topic, static_cast<ClassType*>(this), callback_ptr
+      );
+
       class TypedServiceHandler : public ServiceHandler {
           ClassType* instance_;
           std::decay_t<Func> func_;
@@ -713,16 +705,13 @@ namespace fins {
               if (count != std::tuple_size_v<InTuple>) {
                   throw std::runtime_error("Server received wrong number of arguments");
               }
-              // 将原始 std::any 数组解包并调用
               return call_member_array_impl<InTuple, RetType, ClassType>(
                   func_, instance_, args, std::make_index_sequence<std::tuple_size_v<InTuple>>{}
               );
           }
       };
 
-      // 注册到 ServiceManager
       auto handler = std::make_unique<TypedServiceHandler>(static_cast<ClassType*>(this), callback_ptr);
-      
       server_handles_[name] = {nullptr, std::type_index(typeid(InTuple)), std::type_index(typeid(OutTuple)), std::move(handler)};
     }
 

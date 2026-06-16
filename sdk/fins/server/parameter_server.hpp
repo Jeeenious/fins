@@ -266,7 +266,7 @@ namespace fins {
     void record_requirement(const std::string &key, const T &default_val) const {
       std::lock_guard<std::mutex> lock(mutex_);
       if (requested_entries_.find(key) == requested_entries_.end()) {
-        requested_entries_[key] = { to_raw_string(default_val), FINS_TYPE_REGISTER.get_name<T>() };
+        requested_entries_[key] = { to_raw_string(default_val), FINS_TYPE_REGISTER.get_name<T>(), "", "", "", {}};
         requested_order_.push_back(key);
       }
     }
