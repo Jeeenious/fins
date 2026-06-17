@@ -24,7 +24,8 @@ namespace fins {
                                         std::type_index outputs_id) {
     std::lock_guard<std::mutex> lock(map_mutex_);
     if (services_.find(topic) != services_.end()) {
-      FINS_LOG_WARN("[ServiceManager] Overwriting existing service on topic: {}", topic);
+      FINS_LOG_ERROR("[ServiceManager] Duplicate service name detected: '{}'. "
+                     "The second registration will overwrite the first.", topic);
     }
     services_[topic] = {cb, inputs_id, outputs_id, nullptr};
   }
@@ -33,7 +34,8 @@ namespace fins {
                                                 std::type_index inputs_id, std::type_index outputs_id) {
     std::lock_guard<std::mutex> lock(map_mutex_);
     if (services_.find(topic) != services_.end()) {
-      FINS_LOG_WARN("[ServiceManager] Overwriting existing service on topic: {}", topic);
+      FINS_LOG_ERROR("[ServiceManager] Duplicate service handler name detected: '{}'. "
+                     "The second registration will overwrite the first.", topic);
     }
     services_[topic] = {nullptr, inputs_id, outputs_id, std::move(handler)};
   }

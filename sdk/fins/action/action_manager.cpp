@@ -31,15 +31,21 @@ namespace fins {
                                          std::type_index feedback_type_id, ResultCallback result_cb,
                                          FeedbackCallback feedback_cb) {
     std::lock_guard<std::mutex> lock(map_mutex_);
+    if (commanders_.find(action_name) != commanders_.end()) {
+      FINS_LOG_ERROR("[ActionManager] Duplicate commander name detected: '{}'. "
+                     "The second registration will overwrite the first.", action_name);
+    }
     commanders_[action_name] = {result_cb, feedback_cb, goal_type_id, feedback_type_id};
-    // FINS_LOG_INFO("[ActionManager] Registered Commander: {}", action_name);
   }
 
   void ActionManager::register_actor(const std::string &action_name, std::type_index goal_type_id,
                                      std::type_index feedback_type_id, GoalCallback goal_cb) {
     std::lock_guard<std::mutex> lock(map_mutex_);
+    if (actors_.find(action_name) != actors_.end()) {
+      FINS_LOG_ERROR("[ActionManager] Duplicate actor name detected: '{}'. "
+                     "The second registration will overwrite the first.", action_name);
+    }
     actors_[action_name] = {goal_cb, goal_type_id, feedback_type_id, false};
-    // FINS_LOG_INFO("[ActionManager] Registered Actor: {}", action_name);
   }
 
   std::shared_ptr<ActionSessionBase> ActionManager::create_action_session(const std::string &action_name,

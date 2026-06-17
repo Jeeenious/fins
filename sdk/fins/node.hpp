@@ -888,9 +888,11 @@ namespace fins {
       
       auto it = creators_.find(unique_name);
       if (it != creators_.end()) {
+        FINS_LOG_ERROR("[NodeFactory] Duplicate node name detected in package '{}': '{}' (version: {}). "
+                       "The second registration will overwrite the first.",
+                       meta.source, meta.name, meta.version);
         creators_[unique_name] = creator;
         metas_[unique_name] = meta;
-        FINS_LOG_DEBUG("[NodeFactory] Updated logic for existing node: {}", unique_name);
       } else {
         creators_[unique_name] = creator;
         metas_[unique_name] = meta;
