@@ -178,6 +178,22 @@ namespace fins {
       it->second->set_actor_topic(key, topic);
     }
 
+    void set_step_schedule(const std::string &step_id, const ScheduleInfo &schedule) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = steps_.find(step_id);
+      if (it == steps_.end()) {
+        FINS_LOG_ERROR("[Studio] Error: Step not found: {}", step_id);
+        return;
+      }
+
+      it->second->set_schedule(schedule);
+      FINS_LOG_DEBUG("[Studio] Set schedule for {}: priority={}, queue={}", step_id,
+                     (schedule.priority == SchedulePriority::Urgent) ? "Urgent" :
+                     (schedule.priority == SchedulePriority::High) ? "High" :
+                     (schedule.priority == SchedulePriority::Medium) ? "Medium" : "Low",
+                     (schedule.queue == ScheduleQueue::FCFS) ? "FCFS" : "LGFS");
+    }
+
     void run() {
       std::lock_guard<std::mutex> lock(mutex_);
       set_running_state(Running_State::RUN);
@@ -241,7 +257,7 @@ namespace fins {
         std::lock_guard<std::mutex> lock(mutex_);
         set_running_state(Running_State::PAUSE);
 
-        FINS_LOG_INFO("[Studio] Stopping all nodes in reverse topological order...");
+        // FINS_LOG_INFO("[Studio] Stopping all nodes in reverse topological order...");
 
         FINS_PIPE_FACTORY.stop_all();
 
@@ -264,7 +280,7 @@ namespace fins {
           }
         }
 
-        FINS_LOG_INFO("[Studio] All nodes stopped. Moving steps for safe destruction...");
+        // FINS_LOG_INFO("[Studio] All nodes stopped. Moving steps for safe destruction...");
 
         steps_to_destroy = std::move(steps_);
         steps_.clear();
@@ -272,7 +288,7 @@ namespace fins {
       }
 
       if (!steps_to_destroy.empty()) {
-        FINS_LOG_INFO("[Studio] Executing destructors of {} nodes...", steps_to_destroy.size());
+        // FINS_LOG_INFO("[Studio] Executing destructors of {} nodes...", steps_to_destroy.size());
         for (auto it = steps_to_destroy.begin(); it != steps_to_destroy.end(); ) {
           FINS_LOG_INFO("[Studio] Destroying node: {}...", it->first);
           it = steps_to_destroy.erase(it);
@@ -280,7 +296,7 @@ namespace fins {
       }
 
       FINS_PIPE_FACTORY.clear();
-      FINS_LOG_INFO("[Studio] Studio cleanup complete.");
+      // FINS_LOG_INFO("[Studio] Studio cleanup complete.");
     }
 
   private:

@@ -13,17 +13,17 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <pthread.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <pthread.h>
 
 #include <fins/third_party/httplib.h>
 #include <fins/third_party/json.hpp>
 
-#include <fins/agent/parameter_server.hpp>
 #include <fins/analysis/system_monitor.hpp>
 #include <fins/nodelib.hpp>
+#include <fins/server/parameter_server.hpp>
 #include <fins/studio.hpp>
 #include <fins/thread_manager.hpp>
 #include <fins/utils/logger.hpp>
@@ -39,7 +39,7 @@ namespace fins {
       node_lib_.set_on_reloaded([this]() {
         FINS_LOG_INFO("[AgentServer] Plugin reloaded. Re-registering with new capabilities...");
         httplib::Client client(orchestrator_server_);
-        registerAgent(client);
+        registered_ = registerAgent(client);
       });
     }
 
@@ -110,6 +110,20 @@ namespace fins {
         }
       });
 
+      server_.Get("/get_dataflow", [&](const httplib::Request &, httplib::Response &res) {
+        try {
+          std::string df_json = node_lib_.get_dataflow_json();
+          if (df_json.empty()) {
+            res.set_content(json{{"status", "error"}, {"message", "No dataflow loaded."}}.dump(), "application/json");
+          } else {
+            res.set_content(df_json, "application/json");
+          }
+        } catch (const std::exception &e) {
+          res.status = 500;
+          res.set_content(json{{"status", "error"}, {"message", e.what()}}.dump(), "application/json");
+        }
+      });
+
       server_.Post("/apply_parameters", [&](const httplib::Request &req, httplib::Response &res) {
         try {
           json params = json::parse(req.body);
@@ -154,6 +168,34 @@ namespace fins {
         FINS_STUDIO.reset();
         res.set_content(json{{"status", "success"}, {"message", "Studio reset."}}.dump(), "application/json");
       });
+
+      server_.Get("/get_params_template", [&](const httplib::Request &, httplib::Response &res) {
+        try {
+          json response;
+
+          response["template_yaml"] = fins::param_server().dump_template_yaml();
+          response["template_json"] = json::parse(fins::param_server().dump_template_json());
+          response["current_yaml"] = fins::param_server().dump_active_yaml();
+
+          res.set_content(response.dump(), "application/json");
+        } catch (const std::exception &e) {
+          res.status = 500;
+          res.set_content(json{{"status", "error"}, {"message", e.what()}}.dump(), "application/json");
+        }
+      });
+
+      server_.Get("/plugin_status", [&](const httplib::Request &, httplib::Response &res) {
+          auto state = node_lib_.get_load_state();
+          json j;
+          switch (state) {
+              case NodeLib::LoadState::IDLE: j["state"] = "IDLE"; break;
+              case NodeLib::LoadState::LOADING: j["state"] = "LOADING"; break;
+              case NodeLib::LoadState::COMPLETE: j["state"] = "COMPLETE"; break;
+              case NodeLib::LoadState::ERROR: j["state"] = "ERROR"; break;
+          }
+          res.set_content(j.dump(), "application/json");
+      });
+
     }
 
     void monitoringLoop() {
@@ -161,8 +203,6 @@ namespace fins {
 
       httplib::Client orchestrator_client(orchestrator_server_);
       orchestrator_client.set_connection_timeout(2, 0);
-
-      registerAgent(orchestrator_client);
 
       auto last_report_time = std::chrono::steady_clock::now();
 
@@ -173,16 +213,25 @@ namespace fins {
 #endif
 
       while (!stop_monitoring_) {
+        if (!registered_) {
+          if (registerAgent(orchestrator_client)) {
+            registered_ = true;
+            FINS_LOG_INFO("[AgentServer] Successfully connected to orchestrator at {}", orchestrator_server_);
+          }
+        }
+
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= monitor_interval_s) {
-          reportTelemetry(orchestrator_client);
+        if (registered_ && std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= monitor_interval_s) {
+          if (!reportTelemetry(orchestrator_client)) {
+            registered_ = false;
+          }
           last_report_time = now;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
     }
 
-    void registerAgent(httplib::Client &client) {
+    bool registerAgent(httplib::Client &client) {
       json payload;
       payload["agent_id"] = agent_id_;
       payload["agent_ip"] = agent_ip_;
@@ -192,14 +241,16 @@ namespace fins {
       FINS_LOG_DEBUG("[AgentServer] Agent capabilities: {}", capabilites.dump());
 
       if (auto res = client.Post("/register_agent", payload.dump(), "application/json")) {
-        if (res->status != 200) {
+        if (res->status == 200) {
+          return true;
+        } else {
           FINS_LOG_ERROR("[AgentServer] Registration failed: {}", res->status);
+          return false;
         }
       } else {
-        FINS_LOG_ERROR("[AgentServer] Connection failed: {}", to_string(res.error()));
+        // Silent retry for connection failures
+        return false;
       }
-
-      FINS_LOG_INFO("[AgentServer] Registration completed.");
     }
 
     json get_node_metrics() {
@@ -248,7 +299,7 @@ namespace fins {
       return pipe_metrics_json;
     }
 
-    void reportTelemetry(httplib::Client &client) {
+    bool reportTelemetry(httplib::Client &client) {
       json payload;
       payload["agent_id"] = agent_id_;
       payload["agent_ip"] = agent_ip_;
@@ -265,7 +316,6 @@ namespace fins {
                                    {"memory_total_mb", system_stats.mem_total_mb},
                                    {"cpu_temperature_c", system_stats.cpu_temperature_c},
                                    {"queue_length", thread_metrics.total_queue_length},
-                                   {"avg_wait_time_ms", thread_metrics.avg_wait_time_ms},
                                    {"dropped_tasks_count", thread_metrics.dropped_tasks_count},
                                    {"thread_pool_utilization", thread_metrics.utilization}};
 
@@ -278,8 +328,10 @@ namespace fins {
         if (res->status != 200) {
           FINS_LOG_ERROR("[AgentServer] Telemetry report failed: {}", res->status);
         }
+        return true;
       } else {
-        FINS_LOG_ERROR("[AgentServer] Telemetry connection failed.");
+        // Silent disconnect
+        return false;
       }
     }
 
@@ -294,6 +346,7 @@ namespace fins {
     std::thread monitoring_thread_;
     std::atomic<bool> is_running_{false};
     std::atomic<bool> stop_monitoring_{false};
+    std::atomic<bool> registered_{false};
   };
 
 } // namespace fins

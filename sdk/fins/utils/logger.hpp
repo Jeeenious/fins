@@ -37,6 +37,19 @@ namespace fins {
       return instance;
     }
 
+    void set_node_terminal_enabled(bool enabled) { 
+      if (enabled) setenv("FINS_NODE_TERMINAL_LOG", "1", 1);
+      else setenv("FINS_NODE_TERMINAL_LOG", "0", 1);
+    }
+
+    bool is_node_terminal_enabled() const { 
+      const char* env = getenv("FINS_NODE_TERMINAL_LOG");
+      if (env) {
+        return std::string(env) == "1";
+      }
+      return true; // 默认开启
+    }
+
     template<typename... Args>
     void log(LogLevel level, fmt::format_string<Args...> fmt, Args &&...args) {
       auto now = std::chrono::system_clock::now();
@@ -46,20 +59,20 @@ namespace fins {
 
       switch (level) {
         case LogLevel::DEBUG:
-          style = fmt::fg(fmt::color::cyan);
-          level_tag = "DBG";
+          style = fmt::bg(fmt::color::cyan) | fmt::fg(fmt::color::white);
+          level_tag = " DEBUG ";
           break;
         case LogLevel::INFO:
-          style = fmt::fg(fmt::color::green);
-          level_tag = "INF";
+          style = fmt::bg(fmt::color::green) | fmt::fg(fmt::color::white);
+          level_tag = " INFO  ";
           break;
         case LogLevel::WARN:
-          style = fmt::fg(fmt::color::yellow) | fmt::emphasis::bold;
-          level_tag = "WRN";
+          style = fmt::bg(fmt::color::yellow) | fmt::fg(fmt::color::black);
+          level_tag = " WARN  ";
           break;
         case LogLevel::ERROR:
-          style = fmt::fg(fmt::color::red) | fmt::emphasis::bold;
-          level_tag = "ERR";
+          style = fmt::bg(fmt::color::red) | fmt::fg(fmt::color::white);
+          level_tag = " ERROR ";
           break;
         default:
           break;
@@ -71,9 +84,11 @@ namespace fins {
       localtime_r(&tp, &tm_info);
       auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
       fmt::print(fmt::fg(fmt::color::gray), "[{:%H:%M:%S}.{:03d}] ", tm_info, ms.count());
-      fmt::print(style, "[{}] ", level_tag);
+      fmt::print(style, "{}", level_tag);
+      fmt::print(" ");
       fmt::print(fmt, std::forward<Args>(args)...);
       fmt::print("\n");
+      fflush(stdout);
     }
 
   private:

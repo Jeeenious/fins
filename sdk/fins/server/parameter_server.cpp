@@ -8,8 +8,11 @@
 
 #include "parameter_server.hpp"
 #include <sstream>
+#include <fins/third_party/json.hpp>
 
 namespace fins {
+
+  using json = nlohmann::ordered_json;
 
   ParameterServer &ParameterServer::get_instance() {
     static ParameterServer instance;
@@ -53,9 +56,9 @@ namespace fins {
 
   bool ParameterServer::load_string(const std::string &str) {
     std::lock_guard<std::mutex> lock(mutex_);
-    FINS_LOG_INFO("[ParameterServer] Loading parameters from string.");
-    FINS_LOG_INFO("[ParameterServer] Parameter string (first 50 chars): {}",
-                  str.substr(0, std::min<size_t>(50, str.size())));
+    FINS_LOG_INFO("[ParameterServer] Loading parameters.");
+    // FINS_LOG_INFO("[ParameterServer] Parameter string (first 50 chars): {}",
+    //               str.substr(0, std::min<size_t>(50, str.size())));
 
     std::istringstream stream(str);
 
@@ -80,6 +83,9 @@ namespace fins {
       if (in_multiline_mode) {
         pending_multiline_value += " " + trimmed_line;
         if (trimmed_line.find(']') != std::string::npos) {
+          if (params_.find(pending_full_key) == params_.end()) {
+            params_order_.push_back(pending_full_key);
+          }
           params_[pending_full_key] = pending_multiline_value;
           in_multiline_mode = false;
           pending_multiline_value = "";
@@ -121,12 +127,58 @@ namespace fins {
         pending_full_key = full_key;
         pending_multiline_value = value;
       } else {
+        if (params_.find(full_key) == params_.end()) {
+          params_order_.push_back(full_key);
+        }
         params_[full_key] = value;
       }
     }
 
     FINS_LOG_INFO("[ParameterServer] Loaded {} parameters.", params_.size());
     return true;
+  }
+
+  std::string ParameterServer::dump_template_json() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    json root = json::object();
+
+    for (const auto &key : requested_order_) {
+      auto it = requested_entries_.find(key);
+      if (it == requested_entries_.end()) continue;
+
+      const auto &req = it->second;
+      
+      // Navigate to the correct nested object
+      json *current = &root;
+      std::stringstream ss(key);
+      std::string segment;
+      std::vector<std::string> segments;
+      while (std::getline(ss, segment, '.')) {
+        segments.push_back(segment);
+      }
+
+      for (size_t i = 0; i < segments.size() - 1; ++i) {
+        if (!current->contains(segments[i])) {
+          (*current)[segments[i]] = json::object();
+        }
+        current = &((*current)[segments[i]]);
+      }
+
+      // Add parameter info
+      json info = {
+        {"default", req.default_val},
+        {"type", req.type_name}
+      };
+      if (!req.description.empty()) info["description"] = req.description;
+      if (req.has_min) info["min"] = req.min_val;
+      if (req.has_max) info["max"] = req.max_val;
+      if (!req.options.empty()) info["options"] = req.options;
+      if (req.is_integer) info["is_integer"] = true;
+
+      (*current)[segments.back()] = info;
+    }
+
+    return root.dump();
   }
 
 } // namespace fins

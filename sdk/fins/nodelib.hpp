@@ -39,8 +39,11 @@ namespace fins {
   using json = nlohmann::json;
 
   class NodeLib {
+  public:
+    enum class LoadState { IDLE, LOADING, COMPLETE, ERROR };
   private:
     std::function<void()> on_reloaded_callback_;
+    std::atomic<LoadState> load_state_{LoadState::IDLE};
 
   public:
     NodeLib() {
@@ -77,6 +80,9 @@ namespace fins {
       }
     }
 
+    void set_load_state(LoadState s) { load_state_ = s; }
+    LoadState get_load_state() const { return load_state_; }
+
     void load_from_executable_dir() {
       try {
         fs::path exe_path = fs::read_symlink("/proc/self/exe");
@@ -86,6 +92,8 @@ namespace fins {
     }
 
     void load_directory(const std::string &dir_path) {
+      load_state_ = LoadState::LOADING;
+
       std::string expanded_path = expand_user(dir_path);
       if (!fs::exists(expanded_path))
         return;
@@ -140,14 +148,19 @@ namespace fins {
         }
       }
       FINS_LOG_INFO("[NodeLib] Load complete: {} success, {} fail.", success_count, fail_count);
+
+      load_state_ = LoadState::COMPLETE;
     }
 
     bool load_plugin(const std::string &path) {
+      load_state_ = LoadState::LOADING;
       try {
         load(path);
+        load_state_ = LoadState::COMPLETE;
         return true;
       } catch (const std::exception &e) {
         FINS_LOG_ERROR("[NodeLib] Error: {}", e.what());
+        load_state_ = LoadState::ERROR;
         return false;
       }
     }
@@ -224,6 +237,9 @@ namespace fins {
 #else
     json get_capabilities() const { return FINS_NODE_FACTORY.get_capabilities(); }
 #endif
+
+    std::string get_dataflow_json() const { return last_dataflow_json_; }
+
     void print_capabilities() const {
       json caps = get_capabilities();
       if (caps.is_null() || caps.empty()) {
@@ -282,6 +298,7 @@ namespace fins {
 
     void load_json(const std::string &json_str) {
       FINS_LOG_INFO("[NodeLib] Received new dataflow. Clearing previous execution graph...");
+      last_dataflow_json_ = json_str;
       FINS_STUDIO.clear();
 
       json root = json::parse(json_str);
@@ -386,6 +403,39 @@ namespace fins {
               std::string conn_str = input_info["connect"].get<std::string>();
               
               auto [src_id, src_out_name] = split_conn(conn_str);
+              
+              if (input_info.contains("schedule") && input_info["schedule"].is_string()) {
+                ScheduleInfo schedule_info;
+                std::string schedule_str = input_info["schedule"].get<std::string>();
+                
+                size_t priority_start = schedule_str.find("PRIORITY:") + 9;
+                size_t priority_end = schedule_str.find(";", priority_start);
+                if (priority_end == std::string::npos) priority_end = schedule_str.length();
+                std::string priority_str = schedule_str.substr(priority_start, priority_end - priority_start);
+                
+                if (priority_str == "Urgent") {
+                  schedule_info.priority = SchedulePriority::Urgent;
+                } else if (priority_str == "High") {
+                  schedule_info.priority = SchedulePriority::High;
+                } else if (priority_str == "Medium") {
+                  schedule_info.priority = SchedulePriority::Medium;
+                } else if (priority_str == "Low") {
+                  schedule_info.priority = SchedulePriority::Low;
+                }
+                
+                size_t queue_start = schedule_str.find("QUEUE:") + 6;
+                size_t queue_end = schedule_str.find(";", queue_start);
+                if (queue_end == std::string::npos) queue_end = schedule_str.length();
+                std::string queue_str = schedule_str.substr(queue_start, queue_end - queue_start);
+                
+                if (queue_str == "FCFS") {
+                  schedule_info.queue = ScheduleQueue::FCFS;
+                } else if (queue_str == "LGFS") {
+                  schedule_info.queue = ScheduleQueue::LGFS;
+                }
+                
+                FINS_STUDIO.set_step_schedule(dest_id, schedule_info);
+              }
               
               if (node_id_to_full_key_.find(src_id) == node_id_to_full_key_.end()) {
                  throw std::runtime_error("Source node ID not found: " + src_id);
@@ -640,6 +690,8 @@ namespace fins {
     std::map<std::string, std::shared_ptr<PluginContext>> registry_;
 
     json capabilities_cache_;
+
+    std::string last_dataflow_json_;
 
     std::string watch_dir_;
     std::thread monitor_thread_;

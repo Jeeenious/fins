@@ -6,7 +6,7 @@
 
 // main.cpp
 
-#include <fins/agent/server.hpp>
+#include <fins/server/server.hpp>
 #include <fins/node_log.hpp>
 #include <fins/thread_manager.hpp>
 #include <fins/utils/performance_recorder.hpp>
@@ -32,12 +32,14 @@ void print_usage(const char *prog_name) {
             << "  --threads-medium <n>    Set medium priority thread pool size (default: 4)\n"
             << "  --threads-low <n>       Set low priority thread pool size (default: 4)\n"
             << "  --log-level <level>     Set node log level (0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=OFF) (default: 1)\n"
+            << "  --perf                  Enable performance monitor (default: off)\n"
             << "  --plugin <file>         Load specified .so plugin file (can be repeated)\n"
             << "  --load-all              Load all plugins from ~/.fins/install/ (ignores --plugin)\n"
             << "  --webui <url>           Connect to WebUI URL (e.g. http://localhost:8080)\n"
             << "  --name <agent_name>     Set agent name (default: agent-any)\n"
             << "  --ip <agent_ip>         Set agent IP binding (default: 0.0.0.0)\n"
             << "  --port <agent_port>     Set agent listening port (default: 9090)\n"
+            << "  --terminal-log <on/off> Enable/disable terminal log printing (default: on)\n"
             << "  -h, --help              Show this help message\n";
 }
 
@@ -50,6 +52,8 @@ int main(int argc, char **argv) {
   int medium_threads = 0;
   int low_threads = 0;
   int log_level = 1; // INFO
+  bool terminal_log = true;
+  bool enable_perf = false;
   bool load_all = false;
   std::vector<std::string> plugins;
   std::string webui_url = "http://localhost:8080";
@@ -57,39 +61,37 @@ int main(int argc, char **argv) {
   std::string agent_ip = "0.0.0.0";
   int agent_port = 9090;
 
-  struct option long_options[] = {{"threads-urgent", required_argument, 0, 'u'},
-                                  {"threads-high", required_argument, 0, 'H'},
-                                  {"threads-medium", required_argument, 0, 'm'},
-                                  {"threads-low", required_argument, 0, 'l'},
-                                  {"log-level", required_argument, 0, 'L'},
+  struct option long_options[] = {{"log-level", required_argument, 0, 'L'},
+                                  {"perf", no_argument, 0, 'f'},
                                   {"plugin", required_argument, 0, 'p'},
                                   {"load-all", no_argument, 0, 'A'},
                                   {"webui", required_argument, 0, 'w'},
                                   {"name", required_argument, 0, 'n'},
                                   {"ip", required_argument, 0, 'I'},
                                   {"port", required_argument, 0, 'P'},
+                                  {"terminal-log", required_argument, 0, 'T'},
                                   {"help", no_argument, 0, 'h'},
                                   {0, 0, 0, 0}};
 
   int opt;
   int option_index = 0;
-  while ((opt = getopt_long(argc, argv, "u:H:m:l:L:p:Aw:n:I:P:h", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, "u:H:m:l:L:f:p:Aw:n:I:P:T:h", long_options, &option_index)) != -1) {
     switch (opt) {
-      case 'u':
-        urgent_threads = std::stoi(optarg);
-        break;
-      case 'H':
-        high_threads = std::stoi(optarg);
-        break;
-      case 'm':
-        medium_threads = std::stoi(optarg);
-        break;
-      case 'l':
-        low_threads = std::stoi(optarg);
-        break;
       case 'L':
         log_level = std::stoi(optarg);
         break;
+      case 'f':
+        enable_perf = true;
+        break;
+      case 'T': {
+        std::string val = optarg;
+        if (val == "off" || val == "0" || val == "false") {
+          terminal_log = false;
+        } else {
+          terminal_log = true;
+        }
+        break;
+      }
       case 'p':
         plugins.push_back(optarg);
         break;
@@ -123,17 +125,19 @@ int main(int argc, char **argv) {
   if (log_level > 4)
     log_level = 4;
   fins::set_node_log_level(static_cast<fins::NodeLogLevel>(log_level));
+  fins::Logger::get().set_node_terminal_enabled(terminal_log);
 
-  // Set Thread Pool
-  FINS_THREAD_MANAGER.set_urgent_threads(urgent_threads);
-  FINS_THREAD_MANAGER.set_high_threads(high_threads);
-  FINS_THREAD_MANAGER.set_medium_threads(medium_threads);
-  FINS_THREAD_MANAGER.set_low_threads(low_threads);
   FINS_THREAD_MANAGER.start();
 
-  FINS_PERF_MONITOR.start();
+  if (enable_perf) {
+    FINS_PERF_MONITOR.start();
+  }
 
   fins::NodeLib lib;
+
+  fins::AgentServer server(lib);
+
+  server.connect(webui_url);
 
   // Load plugins
   if (load_all) {
@@ -144,13 +148,7 @@ int main(int argc, char **argv) {
       lib.load_plugin(p);
     }
   }
-
-  fins::AgentServer server(lib);
-
-  FINS_LOG_INFO("[Agent] Connecting to WebUI: {}", webui_url);
-  server.connect(webui_url);
-
-  FINS_LOG_INFO("[Agent] Starting agent '{}' on {}:{}", agent_name, agent_ip, agent_port);
+  
   server.start(agent_name, agent_ip, agent_port);
 
   while (g_running) {

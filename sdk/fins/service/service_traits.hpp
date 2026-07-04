@@ -47,20 +47,39 @@ namespace fins {
   template<template<typename> class Predicate, typename Head, typename... Tail>
   struct filter_types<Predicate, Head, Tail...> {
     using HeadTuple = std::conditional_t<Predicate<Head>::value, unwrap_type_t<Head>, std::tuple<>>;
-
     using TailTuple = typename filter_types<Predicate, Tail...>::type;
-
     using type = decltype(std::tuple_cat(std::declval<HeadTuple>(), std::declval<TailTuple>()));
   };
+
+  template<typename Tuple>
+  struct service_return_helper {
+    using type = void;
+  };
+
+  template<typename T>
+  struct service_return_helper<std::tuple<T>> {
+    using type = T;
+  };
+
+  template<typename... Ts>
+  struct service_return_helper<std::tuple<Ts...>> {
+    using type = std::tuple<Ts...>;
+  };
+
 
   template<typename... Args>
   struct ServiceTraits {
     using InputTuple = typename filter_types<is_request, Args...>::type;
     using OutputTuple = typename filter_types<is_response, Args...>::type;
 
-    using ReturnType = std::conditional_t<
-        std::tuple_size_v<OutputTuple> == 0, void,
-        std::conditional_t<std::tuple_size_v<OutputTuple> == 1, std::tuple_element_t<0, OutputTuple>, OutputTuple>>;
+    using ReturnType = typename service_return_helper<OutputTuple>::type;
+  };
+
+  template<typename Ret, typename... Args>
+  struct ServiceTraits<Ret(Args...)> {
+    using InputTuple = std::tuple<Args...>;
+    using OutputTuple = std::conditional_t<std::is_void_v<Ret>, std::tuple<>, std::tuple<Ret>>;
+    using ReturnType = Ret;
   };
 
 } // namespace fins
