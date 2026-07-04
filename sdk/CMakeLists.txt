@@ -1,13 +1,15 @@
 # sdk/CMakeLists.txt
 
 cmake_minimum_required(VERSION 3.16)
-project(fins VERSION 0.1.0 LANGUAGES CXX)
+project(finevision VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN 1)
+
+find_package(ament_cmake QUIET)
 
 file(GLOB_RECURSE raw_sources CONFIGURE_DEPENDS "*.cpp")
 
@@ -27,13 +29,7 @@ target_compile_definitions(fins_sdk PUBLIC FMT_HEADER_ONLY)
 target_include_directories(fins_sdk PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/fins/third_party/fmt/include>
-)
-
-add_library(fins_shared SHARED ${SDK_SOURCES})
-target_compile_definitions(fins_shared PUBLIC FMT_HEADER_ONLY)
-target_include_directories(fins_shared PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/fins/third_party/fmt/include>
+    $<INSTALL_INTERFACE:include>
 )
 
 if (FINS_PLATFORM STREQUAL "ARM")
@@ -49,4 +45,30 @@ if (FINS_PLATFORM STREQUAL "ARM")
     )
     target_link_libraries(fins_sdk PUBLIC zenoh_shared)
     target_compile_definitions(fins_sdk PUBLIC FINS_HAS_ZENOH)
+endif()
+
+if(ament_cmake_FOUND)
+    install(TARGETS fins_sdk EXPORT fins_sdk
+        ARCHIVE DESTINATION lib
+        LIBRARY DESTINATION lib
+        RUNTIME DESTINATION bin
+    )
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/fins/" 
+        DESTINATION include/fins
+        FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
+    )
+    ament_register_extension("ament_cmake" "fins" "cmake/fins-extras.cmake")
+    
+    ament_export_targets(fins_sdk)
+    ament_export_dependencies(Threads)
+    ament_package()
+else()
+    install(TARGETS fins_sdk 
+        ARCHIVE DESTINATION lib
+        LIBRARY DESTINATION lib
+    )
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/fins/" 
+        DESTINATION include/fins
+        FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
+    )
 endif()

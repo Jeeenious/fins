@@ -1,7 +1,7 @@
 # CMakeLists.txt
 
 cmake_minimum_required(VERSION 3.16)
-project(FineVision)
+project(finevision_sdk)
 
 # Compile Options
 
@@ -112,3 +112,8 @@ endif()
 
 add_subdirectory(sdk)
 add_subdirectory(examples)
+
+if(ament_cmake_FOUND)
+    ament_export_cmake_extra_files(cmake/finevision-extras.cmake)
+    ament_package()
+endif()
