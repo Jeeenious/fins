@@ -51,23 +51,6 @@ namespace fins {
     std::string feedback_type;
   };
 
-  enum class SchedulePriority {
-    Urgent,
-    High,
-    Medium,
-    Low
-  };
-
-  enum class ScheduleQueue {
-    FCFS,  // First Come First Serve
-    LGFS   // Last Got First Serve (drop new if busy)
-  };
-
-  struct ScheduleInfo {
-    SchedulePriority priority = SchedulePriority::Medium; ///< 调度优先级 / Scheduling priority
-    ScheduleQueue queue = ScheduleQueue::FCFS;            ///< 队列策略 / Queue strategy
-  };
-
   /**
    * @brief 节点元数据 / Node metadata
    * @details 包含节点的完整描述信息，包括名称、端口、参数等。
@@ -90,8 +73,6 @@ namespace fins {
 
     std::vector<ActionInfo> commanders;
     std::vector<ActionInfo> actors;
-
-    ScheduleInfo schedule;
 
     nlohmann::json to_json() const {
       nlohmann::json j;
@@ -149,19 +130,6 @@ namespace fins {
       j["servers"] = map_services(servers);
       j["commanders"] = map_actions(commanders);
       j["actors"] = map_actions(actors);
-      
-      std::string priority_str;
-      switch (schedule.priority) {
-        case SchedulePriority::Urgent: priority_str = "Urgent"; break;
-        case SchedulePriority::High: priority_str = "High"; break;
-        case SchedulePriority::Medium: priority_str = "Medium"; break;
-        case SchedulePriority::Low: priority_str = "Low"; break;
-      }
-      std::string queue_str = (schedule.queue == ScheduleQueue::FCFS) ? "FCFS" : "LGFS";
-      j["schedule"] = {
-        {"priority", priority_str},
-        {"queue", queue_str}
-      };
       
       return j;
     }

@@ -46,7 +46,6 @@ namespace fins {
     std::atomic<bool> running_{false};
     std::atomic<bool> shutdown_requested_{false};
 
-    ScheduleInfo schedule_info_;
     bool schedule_configured_{false};
     std::atomic<bool> is_busy_{false};
 
@@ -172,17 +171,6 @@ namespace fins {
       return {};
     }
 
-    void set_schedule(const ScheduleInfo &info) {
-      schedule_info_ = info;
-      schedule_configured_ = true;
-      
-      apply_schedule_policy();
-    }
-
-    const ScheduleInfo& get_schedule() const {
-      return schedule_info_;
-    }
-
     bool has_schedule() const {
       return schedule_configured_;
     }
@@ -238,56 +226,6 @@ namespace fins {
       input_threads_.clear();
     }
 
-    void apply_schedule_policy() {
-      if (!schedule_configured_) {
-        return;
-      }
-
-      pthread_t self = pthread_self();
-
-      if (schedule_info_.priority == SchedulePriority::Urgent || 
-          schedule_info_.priority == SchedulePriority::High) {
-        
-        struct sched_param param;
-        param.sched_priority = (schedule_info_.priority == SchedulePriority::Urgent) ? 50 : 30;
-        
-        int result = pthread_setschedparam(self, SCHED_FIFO, &param);
-        if (result != 0) {
-          FINS_LOG_WARN("[Step {}] Failed to set SCHED_FIFO (errno={}), falling back to nice value. "
-                        "Priority: {}", id_, result, 
-                        (schedule_info_.priority == SchedulePriority::Urgent) ? "Urgent" : "High");
-          
-          int nice_val = (schedule_info_.priority == SchedulePriority::Urgent) ? -20 : -10;
-          setpriority(PRIO_PROCESS, 0, nice_val);
-        }
-      } else {
-        struct sched_param param;
-        param.sched_priority = 0;
-        pthread_setschedparam(self, SCHED_OTHER, &param);
-        
-        int nice_val;
-        if (schedule_info_.priority == SchedulePriority::Medium) {
-          nice_val = 0;
-        } else {
-          nice_val = 10;
-        }
-        setpriority(PRIO_PROCESS, 0, nice_val);
-      }
-
-      FINS_LOG_INFO("[Step {}] Schedule policy applied: priority={}, queue={}", id_,
-                    (schedule_info_.priority == SchedulePriority::Urgent) ? "Urgent" :
-                    (schedule_info_.priority == SchedulePriority::High) ? "High" :
-                    (schedule_info_.priority == SchedulePriority::Medium) ? "Medium" : "Low",
-                    (schedule_info_.queue == ScheduleQueue::FCFS) ? "FCFS" : "LGFS");
-    }
-
-    bool should_drop_message() const {
-      if (schedule_info_.queue == ScheduleQueue::LGFS && is_busy_.load(std::memory_order_relaxed)) {
-        return true;
-      }
-      return false;
-    }
-
   private:
     struct PipeEntry {
       int port;
@@ -304,8 +242,6 @@ namespace fins {
       char t_name[16];
       snprintf(t_name, sizeof(t_name), "f_in_%d_%s", port_index, id_.c_str());
       pthread_setname_np(pthread_self(), t_name);
-
-      apply_schedule_policy();
 
       std::vector<PipeEntry> active_pipes;
       {
@@ -348,31 +284,19 @@ namespace fins {
 #endif
 
         for (auto &entry: active_pipes) {
-          if (schedule_configured_ && schedule_info_.queue == ScheduleQueue::LGFS) {
-            AnyMsg tmp_msg;
-            if (!entry.ptr->try_pop(tmp_msg)) {
-              continue;
-            }
-            msg = tmp_msg;
-          } else {
-            auto msg_opt = entry.ptr->pop_wait();
-            if (!msg_opt)
-              continue;
-            msg = *msg_opt;
-          }
-
-          if (should_drop_message()) {
-            FINS_LOG_DEBUG("[Step {}] LGFS: Dropping message for {}", id_, get_port_description(entry.port));
+          // todo: trigger method
+          AnyMsg tmp_msg;
+          if (!entry.ptr->try_pop(tmp_msg)) {
             continue;
           }
+          msg = tmp_msg;
 
           auto t_recv = fins::now(); 
           worked = true;
           const AnyMsg &msg_ref = msg;
 
-          if (schedule_configured_ && schedule_info_.queue == ScheduleQueue::LGFS) {
-            is_busy_.store(true, std::memory_order_relaxed);
-          }
+          // todo: if (schedule_configured_ && schedule_info_.queue == ScheduleQueue::LGFS)
+          is_busy_.store(true, std::memory_order_relaxed);
 
 #ifdef FINS_LIGHT_SCHEDULER
           node_->on_input(entry.port, msg_ref);
@@ -422,9 +346,8 @@ namespace fins {
           }
 #endif
 
-          if (schedule_configured_ && schedule_info_.queue == ScheduleQueue::LGFS) {
-            is_busy_.store(false, std::memory_order_relaxed);
-          }
+          // todo: if (schedule_configured_ && schedule_info_.queue == ScheduleQueue::LGFS)
+          is_busy_.store(false, std::memory_order_relaxed);
         }
       }
     }
