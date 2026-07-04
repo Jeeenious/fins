@@ -39,18 +39,6 @@ namespace fins {
     std::string default_value;
   };
 
-  struct ServiceInfo {
-    std::string name;
-    std::string request_type;
-    std::string response_type;
-  };
-
-  struct ActionInfo {
-    std::string name;
-    std::string goal_type;
-    std::string feedback_type;
-  };
-
   /**
    * @brief 节点元数据 / Node metadata
    * @details 包含节点的完整描述信息，包括名称、端口、参数等。
@@ -67,12 +55,6 @@ namespace fins {
     std::vector<PortInfo> inputs;
     std::vector<PortInfo> outputs;
     std::vector<ParameterInfo> parameters;
-
-    std::vector<ServiceInfo> clients;
-    std::vector<ServiceInfo> servers;
-
-    std::vector<ActionInfo> commanders;
-    std::vector<ActionInfo> actors;
 
     nlohmann::json to_json() const {
       nlohmann::json j;
@@ -107,29 +89,9 @@ namespace fins {
         return arr;
       };
 
-      auto map_services = [](const std::vector<ServiceInfo> &svcs) {
-        nlohmann::json arr = nlohmann::json::array();
-        for (const auto &s: svcs) {
-          arr.push_back({{"name", s.name}, {"request_type", s.request_type}, {"response_type", s.response_type}});
-        }
-        return arr;
-      };
-
-      auto map_actions = [](const std::vector<ActionInfo> &acts) {
-        nlohmann::json arr = nlohmann::json::array();
-        for (const auto &a: acts) {
-          arr.push_back({{"name", a.name}, {"goal_type", a.goal_type}, {"feedback_type", a.feedback_type}});
-        }
-        return arr;
-      };
-
       j["inputs"] = map_ports(inputs);
       j["outputs"] = map_ports(outputs);
       j["parameters"] = map_parameters(parameters);
-      j["clients"] = map_services(clients);
-      j["servers"] = map_services(servers);
-      j["commanders"] = map_actions(commanders);
-      j["actors"] = map_actions(actors);
       
       return j;
     }
