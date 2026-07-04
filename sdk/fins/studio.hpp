@@ -134,50 +134,6 @@ namespace fins {
       it->second->update_node_parameter(param_name, value);
     }
 
-    void set_step_client_topic(const std::string &step_id, const std::string &key, const std::string &topic) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      auto it = steps_.find(step_id);
-      if (it == steps_.end()) {
-        FINS_LOG_ERROR("[Studio] Error: Step not found: {}", step_id);
-        return;
-      }
-
-      it->second->set_client_topic(key, topic);
-    }
-
-    void set_step_server_topic(const std::string &step_id, const std::string &key, const std::string &topic) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      auto it = steps_.find(step_id);
-      if (it == steps_.end()) {
-        FINS_LOG_ERROR("[Studio] Error: Step not found: {}", step_id);
-        return;
-      }
-
-      it->second->set_server_topic(key, topic);
-    }
-
-    void set_step_commander_topic(const std::string &step_id, const std::string &key, const std::string &topic) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      auto it = steps_.find(step_id);
-      if (it == steps_.end()) {
-        FINS_LOG_ERROR("[Studio] Error: Step not found: {}", step_id);
-        return;
-      }
-
-      it->second->set_commander_topic(key, topic);
-    }
-
-    void set_step_actor_topic(const std::string &step_id, const std::string &key, const std::string &topic) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      auto it = steps_.find(step_id);
-      if (it == steps_.end()) {
-        FINS_LOG_ERROR("[Studio] Error: Step not found: {}", step_id);
-        return;
-      }
-
-      it->second->set_actor_topic(key, topic);
-    }
-
     void set_step_schedule(const std::string &step_id, const ScheduleInfo &schedule) {
       std::lock_guard<std::mutex> lock(mutex_);
       auto it = steps_.find(step_id);

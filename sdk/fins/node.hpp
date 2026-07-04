@@ -11,12 +11,6 @@
 #include <algorithm>
 #include <fins/msg.hpp>
 #include <fins/node_log.hpp>
-#include <fins/service/service_manager.hpp>
-#include <fins/service/service_tags.hpp>
-#include <fins/service/service_traits.hpp>
-#include <fins/action/action_manager.hpp>
-#include <fins/action/action_tags.hpp>
-#include <fins/action/action_traits.hpp>
 #include <fins/third_party/json.hpp>
 #include <fins/type/string_convert.hpp>
 #include <fins/type/type_register.hpp>
@@ -76,9 +70,8 @@ namespace fins {
 
   /**
    * @brief 节点元数据 / Node metadata
-   * @details 包含节点的完整描述信息，包括名称、端口、参数、服务和动作等。
-   *          Contains the complete description of a node, including name, ports,
-   *          parameters, services, and actions.
+   * @details 包含节点的完整描述信息，包括名称、端口、参数等。
+   *          Contains the complete description of a node, including name, ports, parameters.
    */
   struct NodeMeta {
     std::string name;
@@ -254,12 +247,6 @@ namespace fins {
     virtual ScopedSegmentTimer recorder(const std::string& label, AcqTime acq_time) = 0;
     virtual ScopedSegmentTimer recorder(const std::string& label, double acq_time_sec) = 0;
     virtual std::vector<LogEntry> get_logs() = 0;
-
-    virtual void set_client_topic(const std::string &name, const std::string &topic) = 0;
-    virtual void set_server_topic(const std::string &name, const std::string &topic) = 0;
-
-    virtual void set_commander_topic(const std::string &name, const std::string &topic) = 0;
-    virtual void set_actor_topic(const std::string &name, const std::string &topic) = 0;
   };
 
   template<typename T>
@@ -272,28 +259,6 @@ namespace fins {
   struct member_func_traits<R (C::*)(Args...) const> {
     using class_type = C;
   };
-
-  template<typename InTuple, typename Ret>
-  struct ClientGenerator;
-
-  template<typename... InArgs, typename Ret>
-  struct ClientGenerator<std::tuple<InArgs...>, Ret> {
-    static auto generate(const std::string& name) {
-      return ServiceClient<Ret, InArgs...>(name);
-    }
-  };
-
-  template<typename Tuple, typename Ret, typename Class, typename Func>
-  struct TypedServerBinder;
-
-  template<typename... InArgs, typename Ret, typename Class, typename Func>
-  struct TypedServerBinder<std::tuple<InArgs...>, Ret, Class, Func> {
-    static void bind(const std::string& topic, Class* instance, Func func) {
-      auto delegate = FastDelegate<Ret, InArgs...>::template from_member<Class>(instance, func);
-      FINS_SERVICE_MANAGER.register_typed_service<Ret, InArgs...>(topic, std::move(delegate));
-    }
-  };
-
 
   /**
    * @brief 节点基类 / Node base class
@@ -335,32 +300,6 @@ namespace fins {
     int next_output_port_ = 0;
 
     std::map<std::string, std::string> client_remaps_;
-
-    struct ServerHandle {
-      ServiceManager::ServiceCallback callback;
-      std::type_index input_id = std::type_index(typeid(void));
-      std::type_index output_id = std::type_index(typeid(void));
-      std::unique_ptr<ServiceHandler> handler;
-    };
-    std::map<std::string, ServerHandle> server_handles_;
-    std::map<std::string, std::string> server_remaps_;
-
-    struct CommanderHandle {
-      ActionManager::ResultCallback result_callback;
-      ActionManager::FeedbackCallback feedback_callback;
-      std::type_index goal_type_id = std::type_index(typeid(void));
-      std::type_index feedback_type_id = std::type_index(typeid(void));
-    };
-    std::map<std::string, CommanderHandle> commander_handles_;
-    std::map<std::string, std::string> commander_remaps_;
-
-    struct ActorHandle {
-      ActionManager::GoalCallback goal_callback;
-      std::type_index goal_type_id = std::type_index(typeid(void));
-      std::type_index feedback_type_id = std::type_index(typeid(void));
-    };
-    std::map<std::string, ActorHandle> actor_handles_;
-    std::map<std::string, std::string> actor_remaps_;
 
   public:
     /**
@@ -448,51 +387,6 @@ namespace fins {
     }
 
     void initialize() override {}
-
-    void set_client_topic(const std::string &key, const std::string &topic) override { client_remaps_[key] = topic; }
-
-    void set_server_topic(const std::string &key, const std::string &topic) override {
-      server_remaps_[key] = topic;
-
-      auto it = server_handles_.find(key);
-      if (it != server_handles_.end()) {
-        FINS_LOG_INFO("[Node] Applying Server Remap: Internal '{}' -> Topic '{}'", key, topic);
-        if (it->second.handler) {
-          // Clone the handler if possible, or move it if it's a one-time thing.
-          // Since it's unique_ptr, we might need a better way if multiple topics map to same internal key.
-          // But usually it's 1-to-1 or just one remap.
-          // For now, let's assume we can move it or we need a way to register it.
-          // Actually, register_service_handler takes ownership.
-          // If it was already registered, it might be gone.
-          // Let's check how TypedServiceHandler is created. It's created in register_server.
-          // We should probably store a factory or just the handler and use it.
-          // For now, let's just register it.
-          FINS_SERVICE_MANAGER.register_service_handler(topic, std::move(it->second.handler), it->second.input_id, it->second.output_id);
-        } else if (it->second.callback) {
-          FINS_SERVICE_MANAGER.register_service(topic, it->second.callback, it->second.input_id, it->second.output_id);
-        }
-      }
-    }
-
-    void set_commander_topic(const std::string &key, const std::string &topic) override {
-      commander_remaps_[key] = topic;
-      auto it = commander_handles_.find(key);
-      if (it != commander_handles_.end()) {
-        FINS_LOG_INFO("[Node] Applying Commander Remap: Internal '{}' -> Topic '{}'", key, topic);
-        FINS_ACTION_MANAGER.register_commander(topic, it->second.goal_type_id, it->second.feedback_type_id,
-                                                it->second.result_callback, it->second.feedback_callback);
-      }
-    }
-
-    void set_actor_topic(const std::string &key, const std::string &topic) override {
-      actor_remaps_[key] = topic;
-      auto it = actor_handles_.find(key);
-      if (it != actor_handles_.end()) {
-        FINS_LOG_INFO("[Node] Applying Actor Remap: Internal '{}' -> Topic '{}'", key, topic);
-        FINS_ACTION_MANAGER.register_actor(topic, it->second.goal_type_id, it->second.feedback_type_id,
-                                            it->second.goal_callback);
-      }
-    }
 
   protected:
     /**
@@ -662,7 +556,6 @@ namespace fins {
         (static_cast<ClassType *>(this)->*method)(*typed_msg.data);
       };
     }
-
 
     /**
      * @brief 注册固定端口输出 / Register fixed-port output
@@ -902,189 +795,6 @@ namespace fins {
       return tuple_types_to_string_impl<Tuple>(std::make_index_sequence<std::tuple_size_v<Tuple>>{});
     }
 
-    template<typename... Args>
-    auto register_client(const std::string &name) {
-      using Traits = ServiceTraits<Args...>;
-      using InTuple = typename Traits::InputTuple;
-      using OutTuple = typename Traits::OutputTuple;
-      using RetType = typename Traits::ReturnType;
-
-      std::string req_str = tuple_types_to_string<InTuple>();
-      std::string res_str = tuple_types_to_string<OutTuple>();
-
-      meta_.clients.push_back({name, req_str, res_str});
-
-      std::string actual_topic = name;
-      if (client_remaps_.count(name)) {
-        actual_topic = client_remaps_[name];
-      }
-
-      return ClientGenerator<InTuple, RetType>::generate(actual_topic);
-    }
-
-    template<typename... Args, typename Func>
-    void register_server(const std::string &name, Func &&callback_ptr) {
-      using Traits = ServiceTraits<Args...>;
-      using InTuple = typename Traits::InputTuple;
-      using OutTuple = typename Traits::OutputTuple;
-      using RetType = typename Traits::ReturnType;
-
-      using ClassType = typename member_func_traits<std::decay_t<Func>>::class_type;
-
-      std::string req_str = tuple_types_to_string<InTuple>();
-      std::string res_str = tuple_types_to_string<OutTuple>();
-
-      meta_.servers.push_back({name, req_str, res_str});
-
-      std::string actual_topic = name;
-      if (server_remaps_.count(name)) {
-        actual_topic = server_remaps_[name];
-      }
-
-      TypedServerBinder<InTuple, RetType, ClassType, std::decay_t<Func>>::bind(
-          actual_topic, static_cast<ClassType*>(this), callback_ptr
-      );
-
-      class TypedServiceHandler : public ServiceHandler {
-          ClassType* instance_;
-          std::decay_t<Func> func_;
-      public:
-          TypedServiceHandler(ClassType* inst, Func f) : instance_(inst), func_(f) {}
-
-          std::any invoke(const std::any* args, size_t count) override {
-              if (count != std::tuple_size_v<InTuple>) {
-                  throw std::runtime_error("Server received wrong number of arguments");
-              }
-              return call_member_array_impl<InTuple, RetType, ClassType>(
-                  func_, instance_, args, std::make_index_sequence<std::tuple_size_v<InTuple>>{}
-              );
-          }
-      };
-
-      auto handler = std::make_unique<TypedServiceHandler>(static_cast<ClassType*>(this), callback_ptr);
-      server_handles_[name] = {nullptr, std::type_index(typeid(InTuple)), std::type_index(typeid(OutTuple)), std::move(handler)};
-    }
-
-    template<typename... Args, typename ResultFunc, typename FeedbackFunc>
-    void register_commander(const std::string &name, ResultFunc &&result_callback, FeedbackFunc &&feedback_callback) {
-      using Traits = ActionTraits<Args...>;
-      using GoalTuple = typename Traits::GoalTuple;
-      using FeedbackTuple = typename Traits::FeedbackTuple;
-
-      using ResultClassType = typename member_func_traits<std::decay_t<ResultFunc>>::class_type;
-      using FeedbackClassType = typename member_func_traits<std::decay_t<FeedbackFunc>>::class_type;
-
-      std::string goal_str = tuple_types_to_string<GoalTuple>();
-      std::string feedback_str = tuple_types_to_string<FeedbackTuple>();
-
-      meta_.commanders.push_back({name, goal_str, feedback_str});
-
-      auto result_wrapper = [this, func = result_callback](ActionState state) {
-        (static_cast<ResultClassType *>(this)->*func)(state);
-      };
-
-      auto feedback_wrapper = [this, func = feedback_callback](const std::vector<std::any> &args) {
-        if (args.size() != std::tuple_size_v<FeedbackTuple>) {
-          throw std::runtime_error("Commander received wrong number of feedback arguments");
-        }
-        call_feedback_impl<FeedbackTuple, FeedbackClassType>(func, args,
-                                                              std::make_index_sequence<std::tuple_size_v<FeedbackTuple>>{});
-      };
-
-      commander_handles_[name] = {result_wrapper, feedback_wrapper, std::type_index(typeid(GoalTuple)),
-                                   std::type_index(typeid(FeedbackTuple))};
-
-      FINS_ACTION_MANAGER.register_commander(name, std::type_index(typeid(GoalTuple)),
-                                              std::type_index(typeid(FeedbackTuple)), result_wrapper, feedback_wrapper);
-    }
-    
-    template<typename... Args, typename GoalFunc>
-    void register_actor(const std::string &name, GoalFunc &&goal_callback) {
-      using Traits = ActionTraits<Args...>;
-      using GoalTuple = typename Traits::GoalTuple;
-      using FeedbackTuple = typename Traits::FeedbackTuple;
-
-      using GoalClassType = typename member_func_traits<std::decay_t<GoalFunc>>::class_type;
-
-      std::string goal_str = tuple_types_to_string<GoalTuple>();
-      std::string feedback_str = tuple_types_to_string<FeedbackTuple>();
-
-      meta_.actors.push_back({name, goal_str, feedback_str});
-
-      auto goal_wrapper = [this, func = goal_callback](std::shared_ptr<ActionSessionBase> session,
-                                                        const std::vector<std::any> &args) {
-        if (args.size() != std::tuple_size_v<GoalTuple>) {
-          throw std::runtime_error("Actor received wrong number of goal arguments");
-        }
-        call_goal_impl_with_session<GoalTuple, GoalClassType>(session, func, args,
-                                                               std::make_index_sequence<std::tuple_size_v<GoalTuple>>{});
-      };
-
-      actor_handles_[name] = {goal_wrapper, std::type_index(typeid(GoalTuple)),
-                               std::type_index(typeid(FeedbackTuple))};
-
-      FINS_ACTION_MANAGER.register_actor(name, std::type_index(typeid(GoalTuple)),
-                                          std::type_index(typeid(FeedbackTuple)), goal_wrapper);
-    }
-
-    template<typename... GoalArgs>
-    std::shared_ptr<ActionSessionBase> create_action(const std::string &name, GoalArgs &&...goal_args) {
-      std::vector<std::any> type_erased_args;
-      type_erased_args.reserve(sizeof...(goal_args));
-      (type_erased_args.push_back(std::any(std::forward<GoalArgs>(goal_args))), ...);
-
-      auto cmd_it = commander_handles_.find(name);
-      if (cmd_it == commander_handles_.end()) {
-        throw std::runtime_error("Commander '" + name + "' not registered");
-      }
-
-      std::string actual_topic = name;
-      if (commander_remaps_.count(name)) {
-        actual_topic = commander_remaps_[name];
-      }
-
-      return FINS_ACTION_MANAGER.create_action_session(actual_topic, std::move(type_erased_args),
-                                                        cmd_it->second.goal_type_id, cmd_it->second.feedback_type_id);
-    }
-
-    template<typename... GoalArgs>
-    std::shared_ptr<ActionSessionBase> create_action(const std::string &name, const GoalArgs &...goal_args) {
-      std::vector<std::any> type_erased_args;
-      type_erased_args.reserve(sizeof...(goal_args));
-      (type_erased_args.push_back(std::any(goal_args)), ...);
-
-      auto cmd_it = commander_handles_.find(name);
-      if (cmd_it == commander_handles_.end()) {
-        throw std::runtime_error("Commander '" + name + "' not registered");
-      }
-
-      std::string actual_topic = name;
-      if (commander_remaps_.count(name)) {
-        actual_topic = commander_remaps_[name];
-      }
-
-      return FINS_ACTION_MANAGER.create_action_session(actual_topic, std::move(type_erased_args),
-                                                        cmd_it->second.goal_type_id, cmd_it->second.feedback_type_id);
-    }
-
-    ActionState get_action_state(const std::string &name) {
-      std::string actual_topic = name;
-      if (commander_remaps_.count(name)) {
-        actual_topic = commander_remaps_[name];
-      }
-
-      return FINS_ACTION_MANAGER.get_action_state(actual_topic);
-    }
-
-    void cancel_action(const std::string &name) {
-      std::string actual_topic = name;
-      if (commander_remaps_.count(name)) {
-        actual_topic = commander_remaps_[name];
-      }
-
-      FINS_ACTION_MANAGER.cancel_action(actual_topic);
-    }
-
   private:
     template<typename InTuple, typename RetType, typename ClassType, typename Func, size_t... Is>
     static std::any call_member_array_impl(Func func, ClassType* inst, const std::any* args, std::index_sequence<Is...>) {
@@ -1113,13 +823,6 @@ namespace fins {
     void call_feedback_impl(Func func, const std::vector<std::any> &args, std::index_sequence<Is...>) {
       auto typed_args = std::make_tuple(std::any_cast<std::tuple_element_t<Is, FeedbackTuple>>(args[Is])...);
       (static_cast<ClassType *>(this)->*func)(std::get<Is>(typed_args)...);
-    }
-
-    template<typename GoalTuple, typename ClassType, typename Func, size_t... Is>
-    void call_goal_impl_with_session(std::shared_ptr<ActionSessionBase> session, Func func,
-                                      const std::vector<std::any> &args, std::index_sequence<Is...>) {
-      auto typed_args = std::make_tuple(std::any_cast<std::tuple_element_t<Is, GoalTuple>>(args[Is])...);
-      (static_cast<ClassType *>(this)->*func)(session, std::get<Is>(typed_args)...);
     }
   };
 

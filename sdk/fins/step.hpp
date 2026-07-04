@@ -132,18 +132,6 @@ namespace fins {
       }
     }
 
-    void set_client_topic(const std::string &key, const std::string &topic) {
-      if (node_) {
-        node_->set_client_topic(key, topic);
-      }
-    }
-
-    void set_server_topic(const std::string &key, const std::string &topic) {
-      if (node_) {
-        node_->set_server_topic(key, topic);
-      }
-    }
-
     std::shared_ptr<INode> get_node() const { return node_; }
 
     void inject_node(std::shared_ptr<INode> new_node) {
@@ -175,18 +163,6 @@ namespace fins {
         return port_info.name;
       }
       return "unknown";
-    }
-
-    void set_commander_topic(const std::string &key, const std::string &topic) {
-      if (node_) {
-        node_->set_commander_topic(key, topic);
-      }
-    }
-
-    void set_actor_topic(const std::string &key, const std::string &topic) {
-      if (node_) {
-        node_->set_actor_topic(key, topic);
-      }
     }
 
     std::vector<LogEntry> get_logs() {

@@ -347,46 +347,6 @@ namespace fins {
             }
           }
         }
-
-        // 4. Clients (Service Remapping)
-        if (node.contains("clients") && node["clients"].is_array()) {
-          for (const auto &client : node["clients"]) {
-            if (client.contains("name") && client.contains("topic")) {
-              FINS_STUDIO.set_step_client_topic(id, client["name"].get<std::string>(),
-                                         client["topic"].get<std::string>());
-            }
-          }
-        }
-
-        // 5. Servers (Service Remapping)
-        if (node.contains("servers") && node["servers"].is_array()) {
-          for (const auto &server : node["servers"]) {
-            if (server.contains("name") && server.contains("topic")) {
-              FINS_STUDIO.set_step_server_topic(id, server["name"].get<std::string>(),
-                                         server["topic"].get<std::string>());
-            }
-          }
-        }
-
-        // 6. Commanders (Action Remapping)
-        if (node.contains("commanders") && node["commanders"].is_array()) {
-          for (const auto &commander : node["commanders"]) {
-            if (commander.contains("name") && commander.contains("topic")) {
-              FINS_STUDIO.set_step_commander_topic(id, commander["name"].get<std::string>(),
-                                                    commander["topic"].get<std::string>());
-            }
-          }
-        }
-
-        // 7. Actors (Action Remapping)
-        if (node.contains("actors") && node["actors"].is_array()) {
-          for (const auto &actor : node["actors"]) {
-            if (actor.contains("name") && actor.contains("topic")) {
-              FINS_STUDIO.set_step_actor_topic(id, actor["name"].get<std::string>(),
-                                                actor["topic"].get<std::string>());
-            }
-          }
-        }
       }
 
       // ==========================================
