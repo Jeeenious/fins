@@ -35,8 +35,8 @@ namespace fins {
   class Step : public std::enable_shared_from_this<Step> {
   private:
     std::string id_;
-    std::shared_ptr<INode> node_;
     NodeMeta cached_meta_;
+    std::shared_ptr<INode> node_;
 
     std::map<int, std::vector<std::string>> pipes_in_;
     std::map<int, std::vector<std::string>> pipes_out_;
@@ -46,7 +46,7 @@ namespace fins {
     std::atomic<bool> running_{false};
     std::atomic<bool> shutdown_requested_{false};
 
-    bool schedule_configured_{false};
+    // bool schedule_configured_{false};
     std::atomic<bool> is_busy_{false};
 
   public:
@@ -171,9 +171,9 @@ namespace fins {
       return {};
     }
 
-    bool has_schedule() const {
-      return schedule_configured_;
-    }
+    // bool has_schedule() const {
+    //   return schedule_configured_;
+    // }
 
   private:
     void publish(int port_index, AnyMsg msg) {

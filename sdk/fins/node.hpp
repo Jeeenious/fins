@@ -51,6 +51,7 @@ namespace fins {
     std::string source;
     std::string package_name;
     std::string version = "default";
+    int frequency = -1;
 
     std::vector<PortInfo> inputs;
     std::vector<PortInfo> outputs;
@@ -64,6 +65,7 @@ namespace fins {
       j["source"] = source;
       j["package_name"] = package_name;
       j["version"] = version;
+      j["frequency"] = frequency;
 
       auto map_ports = [](const std::vector<PortInfo> &ports) {
         nlohmann::json arr = nlohmann::json::array();
