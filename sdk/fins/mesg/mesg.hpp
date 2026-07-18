@@ -22,9 +22,6 @@ namespace fins::rt {
   struct Message {
     std::shared_ptr<void> frame{nullptr};
 
-    fins::util::Time pub_time;
-    fins::util::Time sub_time;
-
     size_t type_size{0};                        // 自定义结构体大小 (防御增量修改导致的布局越界)
     size_t type_hash{0};                        // 运行时类型硬核 Hash (用于校验基础类名)
     uint32_t abi_tag{0};                        // 第三方大库 ABI 版本号 (防御跨环境编译大库撕裂)
@@ -36,14 +33,11 @@ namespace fins::rt {
         throw std::runtime_error("[Fins Fatal] Attempting to publish a message frame that is already occupied.");
       }
 
-      pub_time = fins::util::now();
-
       using RawT = std::decay_t<T>;
       type_size = sizeof(RawT);
       type_name = typeid(RawT).name();
       type_hash = typeid(RawT).hash_code();
       abi_tag = util::ABITag<RawT>::value();
-
       frame = std::make_shared<RawT>();
 
       return std::static_pointer_cast<T>(frame);
@@ -54,8 +48,6 @@ namespace fins::rt {
       if (frame == nullptr) {
         throw std::runtime_error("[Fins Fatal] Attempting to subscribe to a null message frame.");
       }
-
-      sub_time = fins::util::now();
 
       using RawT = std::decay_t<T>;
       size_t target_size = sizeof(RawT);
@@ -68,8 +60,6 @@ namespace fins::rt {
             << type_name << "], but the plugin is trying to cast it to [" << typeid(RawT).name() << "].";
         throw std::runtime_error(oss.str());
       }
-
-      // 防线 2：校验结构体内存大小 (专门拦截自定义结构体增量修改漏编的越界隐患)
       if (type_size != target_size) {
         std::ostringstream oss;
         oss << "[Fins Fatal] Structural Size Mismatch for [" << type_name
@@ -78,8 +68,6 @@ namespace fins::rt {
             << " bytes. Incremental structure update detected, memory layout is broken!";
         throw std::runtime_error(oss.str());
       }
-
-      // 防线 3：校验三方生态库 ABI 一致性[cite: 1]
       if (abi_tag != target_abi) {
         std::ostringstream oss;
         oss << "[Fins Fatal] Third-party ABI Version Conflict for [" << type_name
