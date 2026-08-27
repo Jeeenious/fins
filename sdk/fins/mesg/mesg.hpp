@@ -1,8 +1,9 @@
 #pragma once
 
+#include <map>
 #include "../utils/form.hpp"
+#include "../utils/tag_ABI.hpp"
 #include "../utils/time.hpp"
-#include "../utils/abi.hpp"
 
 namespace fins::rt {
 
@@ -44,7 +45,7 @@ namespace fins::rt {
     }
 
     template<typename T>
-    std::shared_ptr<T> sub() {
+    std::shared_ptr<T> sub() const {
       if (frame == nullptr) {
         throw std::runtime_error("[Fins Fatal] Attempting to subscribe to a null message frame.");
       }
@@ -80,7 +81,5 @@ namespace fins::rt {
       return std::static_pointer_cast<T>(frame);
     }
   };
-
-  using MsgBundle = std::map<std::string, Message>;
 
 } // namespace fins::rt

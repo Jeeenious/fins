@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target test_algo_pipeline test_pipeline test_expand test_assembly test_plugin_loader test_thread_pool -j\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target test_assembly -j 2>&1 | tail -30\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target test_algo_pipeline test_pipeline test_expand test_assembly test_plugin_loader test_thread_pool -j 2>&1 | tail -25\")",
+      "Bash(wsl -e bash -lc 'cd /mnt/d/Desktop/fins/sdk/fins/test/build_check && for t in test_algo_pipeline test_pipeline test_expand test_plugin_loader; do echo \"===$t===\"; ./$t 2>&1 | grep -E '\\\\''PASSED|FAILED|FAIL'\\\\'' | tail -6; done')",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test/build_check && echo '===test_algo_pipeline==='; ./test_algo_pipeline 2>&1 | tail -12; echo '===test_plugin_loader==='; ./test_plugin_loader 2>&1 | tail -12\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test/build_check && ./test_algo_pipeline 2>&1 | grep -iE 'pass|fail|ok|summary|====' | tail -10\")",
+      "Bash(rtk git *)",
+      "Bash(rtk ls *)",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target test_algo_pipeline test_pipeline test_expand test_assembly test_plugin_loader test_thread_pool -j 2>&1 | tail -40\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target test_assembly -j\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target test_algo_pipeline test_pipeline test_expand test_assembly test_plugin_loader test_thread_pool -j 2>&1 | tail -30\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target test_algo_pipeline test_pipeline test_expand test_assembly test_plugin_loader test_thread_pool -j 2>&1 | grep -E 'Built target|PASSED|FAIL|Error' | tail -30\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins && sed -E -i 's/\\\\ball_idle\\\\b/is_hp_done/g; s/\\\\bgrab_ready\\\\b/grab_ready_job/g; s/\\\\badvance\\\\b/on_job_done/g; s/\\\\bwrap_hyper_period\\\\b/rollover_hp/g; s/\\\\bexpand\\\\b/expand_hyper_graph/g' sdk/fins/g_state.hpp sdk/fins/test/test_assembly.cpp sdk/fins/test/test_pipeline.cpp sdk/fins/test/test_expand.cpp sdk/fins/thread_pool.hpp sdk/fins/RPC_listener.hpp sdk/fins/plugin_loader.hpp sdk/fins/utils/form.hpp sdk/fins/algo/algo_utility.hpp sdk/fins/docs/precedence_graph_design.md && echo OK\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target test_algo_pipeline test_pipeline test_expand test_assembly test_plugin_loader test_thread_pool -j 2>&1 | grep -E 'Built target|PASSED|FAIL|Error|error:' | tail -30\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target test_algo_pipeline test_pipeline test_expand test_assembly test_plugin_loader test_thread_pool -j 2>&1\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && timeout 240 cmake --build build_check --target test_algo_pipeline test_pipeline test_expand test_assembly test_plugin_loader test_thread_pool -j\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && timeout 120 cmake --build build_check --target test_assembly -j\")",
+      "Bash(rtk read *)",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && timeout 240 cmake --build build_check --target agent_main cfg_client test_plugin_0 -j 2>&1 | tail -30\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && timeout 240 cmake -S . -B build_check 2>&1 | tail -20\")",
+      "Bash(wsl -e bash -lc \"mkdir -p /tmp/fins_agent_plugins && cp /mnt/d/Desktop/fins/sdk/fins/test/build_check/plugins/test_plugin_0.so /tmp/fins_agent_plugins/ && ls -la /tmp/fins_agent_plugins/\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && timeout 60 ./build_check/agent_main 18080 /tmp/fins_agent_plugins\")",
+      "Bash(sed 's/^[- ][- ]*//')",
+      "Bash(wsl -e bash -lc 'cd /mnt/d/Desktop/fins/sdk/fins/test && python3 -c \" *)"
+    ]
+  }
+}

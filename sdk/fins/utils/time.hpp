@@ -6,6 +6,32 @@
 
 #pragma once
 
+// ============================================================================
+// time — 时间工具：区分「墙上时间」与「单调时间」两类时钟
+// ============================================================================
+//
+// 内部逻辑：
+//   本文件提供两类时钟的时间接口，用途不同、类型上不可混用：
+//   - 墙上时间（system_clock）：Time / now() / to_string()——记录"发生时刻"，
+//     可格式化为 YYYY-MM-DD HH:MM:SS.ffffff（operator<</to_string 走 localtime_r），
+//     也用于跨进程/跨机对表（epoch 数值）。缺点：随 NTP 校时/手动改时间跳变。
+//   - 单调时间（steady_clock）：SteadyTime / steady_now() / latency_*()——只保证
+//     递增不跳变，用于测量时间间隔（延迟/耗时）。延迟测量必须用它，否则校时会让
+//     间隔跳变甚至为负。两套时钟 epoch 不同，不允许直接相减（编译器会拒绝）。
+//   历史教训：latency_* 原本基于 system_clock（旧 now()-acq_time），文件头曾有
+//   todo"墙上时间计算的延迟不可靠"，本版已改为 steady_clock。
+//
+// 资源消耗：
+//   - 纯内联函数，无运行期状态；每次调用读时钟（vDSO/syscall），纳秒级开销
+//   - get_thread_cpu_time_ns() 读 CLOCK_THREAD_CPUTIME_ID（每线程一次 syscall）
+//
+// 对外接口：
+//   墙上：now() / zero() / to_seconds / to_microseconds / to_nanoseconds /
+//         from_seconds / operator<< / to_string
+//   单调：steady_now() / latency_sec / latency_ms / latency_us（参数为 SteadyTime）
+//   其他：get_thread_cpu_time_ns()；ROS2 桥接（FINS_HAS_ROS2 时启用）
+// ============================================================================
+
 #include <chrono>
 #include <iomanip>
 #include <logger.hpp>
@@ -24,24 +50,31 @@ namespace fins::util {
   using Time = std::chrono::time_point<sys_clock, std::chrono::nanoseconds>;
 
   inline Time now() {
-    return std::chrono::time_point_cast<std::chrono::nanoseconds>(sys_clock::now()); 
+    return std::chrono::time_point_cast<std::chrono::nanoseconds>(sys_clock::now());
   }
 
   inline constexpr Time zero() {
     return Time{std::chrono::nanoseconds{0}};
   }
 
-  inline double latency_sec(const Time &acq_time) {
-    auto current = now();
-    if (acq_time == zero()) return 0.0;
+  using steady_clock = std::chrono::steady_clock;
+  using SteadyTime = std::chrono::time_point<steady_clock, std::chrono::nanoseconds>;
+
+  inline SteadyTime steady_now() {
+    return std::chrono::time_point_cast<std::chrono::nanoseconds>(steady_clock::now());
+  }
+
+  inline double latency_sec(const SteadyTime &acq_time) {
+    auto current = steady_now();
+    if (acq_time == SteadyTime{}) return 0.0;
     return std::chrono::duration<double>(current - acq_time).count();
   }
-  
-  inline double latency_ms(const Time &acq_time) {
+
+  inline double latency_ms(const SteadyTime &acq_time) {
     return latency_sec(acq_time) * 1000.0;
   }
 
-  inline double latency_us(const Time &acq_time) {
+  inline double latency_us(const SteadyTime &acq_time) {
     return latency_sec(acq_time) * 1e6;
   }
 
@@ -71,16 +104,17 @@ namespace fins::util {
   }
   
 #ifdef FINS_HAS_ROS2
-  inline AcqTime from_ros_time(const builtin_interfaces::msg::Time& ros_msg) {
+  // ROS2 时间戳是墙上时间（epoch 数值），与 Time（system_clock）同源，可直接互转。
+  inline Time from_ros_time(const builtin_interfaces::msg::Time& ros_msg) {
     std::chrono::nanoseconds dur(ros_msg.sec * 1000000000LL + ros_msg.nanosec);
-    return AcqTime(dur);
+    return Time(dur);
   }
 
-  inline AcqTime from_ros_time(const rclcpp::Time& ros_time) {
-    return AcqTime(std::chrono::nanoseconds(ros_time.nanoseconds()));
+  inline Time from_ros_time(const rclcpp::Time& ros_time) {
+    return Time(std::chrono::nanoseconds(ros_time.nanoseconds()));
   }
 
-  inline builtin_interfaces::msg::Time to_ros_msg_time(const AcqTime& acq_time) {
+  inline builtin_interfaces::msg::Time to_ros_msg_time(const Time& acq_time) {
     auto ns_total = acq_time.time_since_epoch().count();
     builtin_interfaces::msg::Time msg;
     msg.sec = static_cast<int32_t>(ns_total / 1000000000LL);
@@ -88,7 +122,7 @@ namespace fins::util {
     return msg;
   }
 
-  inline rclcpp::Time to_ros_time(const AcqTime& acq_time) {
+  inline rclcpp::Time to_ros_time(const Time& acq_time) {
     return rclcpp::Time(acq_time.time_since_epoch().count(), RCL_SYSTEM_TIME);
   }
 #endif // FINS_HAS_ROS2
@@ -113,4 +147,4 @@ namespace fins::util {
     oss << ts;
     return oss.str();
   }
-} // namespace std
+} // namespace fins::util

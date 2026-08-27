@@ -27,6 +27,19 @@
 namespace fins {
 
   class Server {
+
+  public:
+    static Server &instance() {
+      static Server inst;
+      return inst;
+    }
+
+  private:
+    Server() = default;
+    ~Server() = default;
+    Server(const Server &) = delete;
+    Server &operator=(const Server &) = delete;
+
   public:
     explicit Server(const std::string &orchestrator_server)
         : orchestrator_server_(orchestrator_server) {
@@ -68,6 +81,33 @@ namespace fins {
     void setup_routes() {
       server_.new_task_queue = [] { return new httplib::ThreadPool(4); };
 
+      /**
+       * @brief 加载数据流配置
+       *
+       * 接收客户端上传的数据流(Dataflow) JSON 配置，并加载到节点库中。
+       * 加载前会清空当前 FINS Studio 中已有的数据流。
+       *
+       * HTTP Method:
+       *   POST /load_dataflow
+       *
+       * Request Body:
+       *   JSON 格式的数据流配置
+       *
+       * Response:
+       *   成功:
+       *   {
+       *      "status": "success",
+       *      "message": "Dataflow loaded."
+       *   }
+       *
+       *   失败:
+       *   {
+       *      "status": "error",
+       *      "message": "错误信息"
+       *   }
+       *
+       * @exception JSON解析失败、数据流加载失败时返回 HTTP 500
+       */
       server_.Post("/load_dataflow", [&](const httplib::Request &req, httplib::Response &res) {
         FINS_LOG_DEBUG("[AgentServer] /load_dataflow received: {}", std::to_string(req.body));
         try {
@@ -85,6 +125,26 @@ namespace fins {
         }
       });
 
+      /**
+       * @brief 获取当前加载的数据流配置
+       *
+       * 从 NodeLib 中获取当前的数据流 JSON 描述。
+       *
+       * HTTP Method:
+       *   GET /get_dataflow
+       *
+       * Response:
+       *   成功:
+       *     返回当前 dataflow JSON
+       *
+       *   失败:
+       *   {
+       *      "status": "error",
+       *      "message": "No dataflow loaded."
+       *   }
+       *
+       * @exception 获取数据流异常时返回 HTTP 500
+       */
       server_.Get("/get_dataflow", [&](const httplib::Request &, httplib::Response &res) {
         try {
           std::string df_json = node_lib_.get_dataflow_json();
@@ -99,6 +159,28 @@ namespace fins {
         }
       });
 
+      /**
+       * @brief 应用参数配置
+       *
+       * 接收 YAML 格式参数配置，并加载到 FINS 参数服务器。
+       * 用于动态更新节点运行参数。
+       *
+       * HTTP Method:
+       *   POST /apply_parameters
+       *
+       * Request Body:
+       * {
+       *    "content": "yaml配置字符串"
+       * }
+       *
+       * Response:
+       * {
+       *    "status": "success",
+       *    "message": "Parameters applied."
+       * }
+       *
+       * @exception YAML解析失败或参数加载失败时返回 HTTP 500
+       */
       server_.Post("/apply_parameters", [&](const httplib::Request &req, httplib::Response &res) {
         try {
           json params = json::parse(req.body);
@@ -112,12 +194,70 @@ namespace fins {
         }
       });
 
+      /**
+       * @brief 获取当前 FINS Studio 运行状态
+       *
+       * 查询当前数据流执行状态。
+       *
+       * HTTP Method:
+       *   GET /get_status
+       *
+       * Response:
+       * {
+       *    "status": "RUNNING"
+       * }
+       *
+       * 或
+       *
+       * {
+       *    "status": "STOPPED"
+       * }
+       *
+       * @note
+       * RUNNING 表示数据流正在运行
+       * STOPPED 表示数据流已暂停
+       */
       server_.Get("/get_status", [&](const httplib::Request &, httplib::Response &res) {
         bool running = FINS_STUDIO.is_running();
         std::string state_str = running ? "RUNNING" : "STOPPED";
         res.set_content(json{{"status", state_str}}.dump(), "application/json");
       });
 
+      /**
+       * @brief 设置 FINS Studio 运行状态
+       *
+       * 根据客户端请求启动或停止数据流运行。
+       *
+       * HTTP Method:
+       *   POST /set_status
+       *
+       * Request Body:
+       * {
+       *    "state": "RUNNING"
+       * }
+       *
+       * 或
+       *
+       * {
+       *    "state": "STOPPED"
+       * }
+       *
+       * Processing:
+       *   RUNNING:
+       *      调用 FINS_STUDIO.run() 启动执行
+       *
+       *   STOPPED:
+       *      调用 FINS_STUDIO.pause() 暂停执行
+       *
+       * Response:
+       * {
+       *    "status": "success",
+       *    "message": "State updated."
+       * }
+       *
+       * @exception
+       * 状态非法返回 HTTP 400
+       */
       server_.Post("/set_status", [&](const httplib::Request &req, httplib::Response &res) {
         try {
           json body = json::parse(req.body);
@@ -139,11 +279,50 @@ namespace fins {
         }
       });
 
+      /**
+       * @brief 重置 FINS Studio
+       *
+       * 清理当前运行状态，使 Studio 恢复初始状态。
+       *
+       * HTTP Method:
+       *   POST /reset
+       *
+       * Response:
+       * {
+       *    "status": "success",
+       *    "message": "Studio reset."
+       * }
+       *
+       * @note
+       * 不需要请求参数。
+       */
       server_.Post("/reset", [&](const httplib::Request &, httplib::Response &res) {
         FINS_STUDIO.reset();
         res.set_content(json{{"status", "success"}, {"message", "Studio reset."}}.dump(), "application/json");
       });
 
+      /**
+       * @brief 获取参数模板信息
+       *
+       * 返回系统参数模板以及当前生效参数。
+       * 用于前端参数配置界面初始化。
+       *
+       * HTTP Method:
+       *   GET /get_params_template
+       *
+       * Response:
+       * {
+       *    "template_yaml": "默认参数模板",
+       *    "template_json": {},
+       *    "current_yaml": "当前参数"
+       * }
+       *
+       * Data Source:
+       *   fins::param_server()
+       *
+       * @exception
+       * 参数模板生成失败返回 HTTP 500
+       */
       server_.Get("/get_params_template", [&](const httplib::Request &, httplib::Response &res) {
         try {
           json response;
@@ -159,6 +338,37 @@ namespace fins {
         }
       });
 
+      /**
+       * @brief 获取插件加载状态
+       *
+       * 查询 NodeLib 当前插件加载进度。
+       *
+       * HTTP Method:
+       *   GET /plugin_status
+       *
+       * Response:
+       *
+       * {
+       *    "state": "IDLE"
+       * }
+       *
+       * 状态说明:
+       *
+       * IDLE:
+       *    空闲状态，没有加载任务
+       *
+       * LOADING:
+       *    正在加载插件
+       *
+       * COMPLETE:
+       *    插件加载完成
+       *
+       * ERROR:
+       *    插件加载失败
+       *
+       * @note
+       * 用于前端显示插件加载进度。
+       */
       server_.Get("/plugin_status", [&](const httplib::Request &, httplib::Response &res) {
           auto state = node_lib_.get_load_state();
           json j;
@@ -171,39 +381,6 @@ namespace fins {
           res.set_content(j.dump(), "application/json");
       });
 
-    }
-
-    void monitoringLoop() {
-      pthread_setname_np(pthread_self(), "fins_telemetry");
-
-      httplib::Client orchestrator_client(orchestrator_server_);
-      orchestrator_client.set_connection_timeout(2, 0);
-
-      auto last_report_time = std::chrono::steady_clock::now();
-
-#ifdef FINS_ARM_ARCH
-      const double monitor_interval_s = 5.0;
-#else
-      const double monitor_interval_s = 1.0;
-#endif
-
-      while (!stop_monitoring_) {
-        if (!registered_) {
-          if (registerAgent(orchestrator_client)) {
-            registered_ = true;
-            FINS_LOG_INFO("[AgentServer] Successfully connected to orchestrator at {}", orchestrator_server_);
-          }
-        }
-
-        auto now = std::chrono::steady_clock::now();
-        if (registered_ && std::chrono::duration_cast<std::chrono::seconds>(now - last_report_time).count() >= monitor_interval_s) {
-          if (!reportTelemetry(orchestrator_client)) {
-            registered_ = false;
-          }
-          last_report_time = now;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      }
     }
 
     bool registerAgent(httplib::Client &client) {
