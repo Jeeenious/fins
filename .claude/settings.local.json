@@ -24,7 +24,9 @@
       "Bash(wsl -e bash -lc \"mkdir -p /tmp/fins_agent_plugins && cp /mnt/d/Desktop/fins/sdk/fins/test/build_check/plugins/test_plugin_0.so /tmp/fins_agent_plugins/ && ls -la /tmp/fins_agent_plugins/\")",
       "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && timeout 60 ./build_check/agent_main 18080 /tmp/fins_agent_plugins\")",
       "Bash(sed 's/^[- ][- ]*//')",
-      "Bash(wsl -e bash -lc 'cd /mnt/d/Desktop/fins/sdk/fins/test && python3 -c \" *)"
+      "Bash(wsl -e bash -lc 'cd /mnt/d/Desktop/fins/sdk/fins/test && python3 -c \" *)",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target client -j 2>&1 | tail -15\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target client -j\")"
     ]
   }
 }

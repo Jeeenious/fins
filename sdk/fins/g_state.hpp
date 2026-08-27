@@ -137,6 +137,20 @@
 #include "utils/logger.hpp"
 
 namespace fins::rt {
+  /// 图顶点 = 正常 job 实例 + 多维权值 + 生命周期状态（调度依据）。
+  ///   job 非空 = 有执行体闭包，闭包只执行（打包输入 → execute → 路由输出），**不含完成事件**；
+  ///   **不碰 state**——Running 由 grab_ready_workload() 拉取时置、Finished 由 on_execute 回调事务
+  ///   回锁直做置（完成事件在装配点事务）；回绕重置回 Pending。见 PrecedenceGraph。
+  ///   （框架不再有虚拟源/历史顶点——跨周期数据滞留由用户显式接内置工具算法承担。）
+  /// Ready（可执行）由前序推导：job 的全部前序顶点 Finished → Ready（无释放时刻；
+  /// 就绪判定框架内置：on_execute 回调经 grab_ready_workload() 拉取最优先就绪，见 PrecedenceGraph）。
+  /// priority = 调度优先级（grab_ready_workload 选最优先就绪的读源；expand_hp ⑥ 从 NodeInfo 填初值，
+  /// priority_updater_ 运行时更新——优先级只存图顶点，无并行结构）。
+  /// 延迟 = 用户算法节点（AlgoBase 派生，函数体内做纯延迟——如内置 delay 算法按
+  /// 阻塞 sleep_for 真延迟，占 worker；时长 offset 由后续超周期展开分析注入，非 JSON），
+  /// 框架不建延迟顶点、无时间门控。
+  inline std::vector<float> core_usages_g{};
+  inline std::atomic<float> mem_usage_g{};
 
   /// .so 加载上下文（library_g.so_ctx 的元素）：dlopen 一个 .so 后解析出的 C 符号工厂。
   /// **构造 = 装载**（dlopen + dlsym 解析 C 符号 + 填 loaded_keys，失败抛异常并清理 handle）；
@@ -405,21 +419,6 @@ namespace fins::rt {
     std::mutex &wr_lock() { return wr_mtx_; }
   };
   inline Pipeline pipeline_g;
-
-  /// 图顶点 = 正常 job 实例 + 多维权值 + 生命周期状态（调度依据）。
-  ///   job 非空 = 有执行体闭包，闭包只执行（打包输入 → execute → 路由输出），**不含完成事件**；
-  ///   **不碰 state**——Running 由 grab_ready_workload() 拉取时置、Finished 由 on_execute 回调事务
-  ///   回锁直做置（完成事件在装配点事务）；回绕重置回 Pending。见 PrecedenceGraph。
-  ///   （框架不再有虚拟源/历史顶点——跨周期数据滞留由用户显式接内置工具算法承担。）
-  /// Ready（可执行）由前序推导：job 的全部前序顶点 Finished → Ready（无释放时刻；
-  /// 就绪判定框架内置：on_execute 回调经 grab_ready_workload() 拉取最优先就绪，见 PrecedenceGraph）。
-  /// priority = 调度优先级（grab_ready_workload 选最优先就绪的读源；expand_hp ⑥ 从 NodeInfo 填初值，
-  /// priority_updater_ 运行时更新——优先级只存图顶点，无并行结构）。
-  /// 延迟 = 用户算法节点（AlgoBase 派生，函数体内做纯延迟——如内置 delay 算法按
-  /// 阻塞 sleep_for 真延迟，占 worker；时长 offset 由后续超周期展开分析注入，非 JSON），
-  /// 框架不建延迟顶点、无时间门控。
-  inline util::TBBMap<float> core_usages_g{};
-  inline std::atomic<float> mem_usage_g{};
 
   // ── 调度运行时（独立全局，无类壳）────────────────────────────
   /// Job = 可执行任务（数据处理函数 + 参数打成的 lambda）。g_state 独有定义——
