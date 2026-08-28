@@ -28,7 +28,7 @@
 // 对外接口：
 //   墙上：now() / zero() / to_seconds / to_microseconds / to_nanoseconds /
 //         from_seconds / operator<< / to_string
-//   单调：steady_now() / latency_sec / latency_ms / latency_us（参数为 SteadyTime）
+//   单调：now_ms() / steady_now() / latency_sec / latency_ms / latency_us（参数为 SteadyTime）
 //   其他：get_thread_cpu_time_ns()；ROS2 桥接（FINS_HAS_ROS2 时启用）
 // ============================================================================
 
@@ -62,6 +62,12 @@ namespace fins::util {
 
   inline SteadyTime steady_now() {
     return std::chrono::time_point_cast<std::chrono::nanoseconds>(steady_clock::now());
+  }
+
+  /// 单调时钟从 epoch 以来的流逝（ms，steady_clock 单调、不随校时跳变）——时间间隔/排期基准；
+  /// 注意与墙上时钟（Time/now()）epoch 不同，不可直接混用。
+  inline double now_ms() {
+    return std::chrono::duration<double, std::milli>(steady_now().time_since_epoch()).count();
   }
 
   inline double latency_sec(const SteadyTime &acq_time) {

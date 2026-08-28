@@ -38,7 +38,7 @@
 - **边 = 绑定边**，无 latest-value——consumer job 读的是展开时静态绑定的 producer job 输出，不是"从边取最新帧"。
 - 数据以 `Message`（`shared_ptr<void>` 帧）承载，只读共享、零拷贝。
 - **状态标记状态而非类型**：顶点类别由 `job` 是否非空区分（空 job = 虚拟源），不设类型枚举；`Ready` 由前序推导（前序全部 `Finished` → Ready，唯一前序条件，无释放时刻，调度器契约）。
-- **延迟不在框架内**：显式数据路径延迟由用户插入"延迟算法节点"（AlgoBase 派生，函数体内做纯延迟，其 `outputs` 接被延迟 job 的 `inputs`，即前序边）；框架 `offset` 保留为 DelayAlgo 的 `sleep_for` 时长（阻塞真延迟，占 worker），不再参与图/调度。
+- **延迟**：① 显式数据路径延迟由用户插入"延迟算法节点"（AlgoBase 派生，函数体内做纯延迟，其 `outputs` 接被延迟 job 的 `inputs`，即前序边）；框架 `offset` 保留为 DelayAlgo 的 `sleep_for` 时长（阻塞真延迟，占 worker），不再参与图/调度；② **周期性任务自动补 delay 假节点**（2026-08-29 新增）——显式配置 period 的节点在其所有相邻 job 实例间插真延迟假节点 `{id}:{k}` → `delay:{id}:{k}` → `{id}:{k+1}`（offset=period，替换原 seq 边），实现"每 period 释放一个 job"的周期性时间语义，见 6.4/7。
 
 ## 4. 展开算法（expand_hp 单函数一步建图）
 
@@ -210,13 +210,18 @@ job 实例级 precedence DAG（正常 job 顶点 + 绑定边，job 闭包携带�
   history_rounds 全部移除；跨周期数据滞留改由用户显式配置**暂存算法顶点**中转——
   producer 输出顶点 → ringbuf（内置算法，内部 deque 滚动保留 depth 帧）→ consumer 输入，
   三段绑定按 stream 匹配自然形成。
-- **延迟 = 用户算法节点（框架不建延迟顶点）**：显式数据路径延迟由用户插入 delay 等
-  内置算法节点（函数体内做纯延迟），其 outputs 接被延迟 job 的 inputs（即前序边）；
-  delay 的 offset 由后续超周期展开/调度阶段分析注入（非 JSON），不建 delay 顶点、
-  无时间门控边。
+- **延迟**：① 用户显式 delay 算法节点（函数体内做纯延迟），其 outputs 接被延迟 job 的
+  inputs（即前序边）；delay 的 offset 由后续超周期展开/调度阶段分析注入（非 JSON）；②
+  **周期性任务自动补 delay 假节点**（2026-08-29）——显式配置 period 的节点，展开的所有
+  相邻 job 实例间插入 delay 假节点（真延迟，offset=period，占 worker，无数据边），seq 边
+  拆两段 `{id}:{k}` → `delay:{id}:{k}` → `{id}:{k+1}`，实现"每 period 释放一个 job"时间
+  语义；继承周期节点不插（跟随 producer 节奏）。
 - **Attrs 定稿**：period/deadline/wcet/abs_deadline（priority 已移除；offset 不入 Attrs，
-  由超周期展开分析注入 DelayAlgo 配置，非 JSON）。`update()` 回绕时 abs_deadline 整体平移
-  一个超周期，数据/边不清（跨周期存活靠共享帧 + 暂存算法顶点）。
+  由超周期展开分析注入 DelayAlgo 配置，非 JSON）。`rollover_hp()` 回绕时**起点更新为当前
+  真实时钟**（now_ms，2026-08-28 修正：旧版机械累加 hyper_period 与实际时间脱钩，执行快慢
+  不定），abs_deadline 由主线程每轮 `update_abs_deadline()` 按真实时钟滚动校正（起点从
+  hyper_start_ms 滚到 now 所在时窗 + (k+1)·deadline，执行快慢不定始终对齐真实时间轴），数据/边不清
+  （跨周期存活靠共享帧 + 暂存算法顶点）。
 - **测试迁移**：test_pipeline 断言迁移到 job 实例级（cam:0/disp:0），TEST 4a 覆盖四态
   状态机 + offset 相位（无虚拟源回退、负断言无入边）；TEST 4b 三内置算法端到端
   （delay 透传 / ringbuf 取时间段）；test_assembly 不变

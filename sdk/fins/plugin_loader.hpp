@@ -17,8 +17,8 @@
 //   由装配点回调完成，loader 不直接访问全局表：
 //     - on_library_add    载荷 (so_path, shared_ptr<Plugin>)——ctx 已构造装载，装配点 SET
 //     - on_library_modify 载荷 (so_path, shared_ptr<Plugin>)——ctx 是重载的新 Plugin，
-//                     装配点先卸旧（GET → take_keys → ERASE）再 SET 新
-//     - on_library_delete 载荷 (so_path)——文件已从磁盘消失，装配点 GET 旧 ctx →
+//                     装配点先卸旧（读旧 ctx → take_keys → ERASE）再 SET 新
+//     - on_library_delete 载荷 (so_path)——文件已从磁盘消失，装配点读旧 ctx →
 //                     take_keys()（取 keys 通知）→ ERASE（引用计数归零时析构 dlclose）
 //   回调注册与 start 分离：guard 文件事件 → Plugin 构造装载库机制接线在装配接口
 //   on_library_add/on_library_modify/on_library_delete 内部完成——main 装配的 handler 直接移动
@@ -54,7 +54,7 @@
 //   因为 dlopen 持有内存映射（引用计数）。因此 on_library_delete 回调触发时：
 //     1. .so 文件已从磁盘消失
 //     2. 但库代码仍在进程地址空间中，所有已创建的 algo 实例正常工作
-//     3. 装配点回调从 library_g.so_ctx GET 旧 ctx → ctx->take_keys()（取 keys）→ ERASE
+//     3. 装配点回调从 library_g.so_ctx 读旧 ctx → ctx->take_keys()（取 keys）→ ERASE
 //     4. 无实例引用时 Plugin 析构 → dlclose 卸载库
 //   只要有任何 algo 实例持有 shared_ptr<Plugin>（expand_hp() 的删除器里），库就
 //   不会被卸载。这是 Linux dlopen/dlclose 的保证，与文件是否仍在磁盘无关。
@@ -66,10 +66,10 @@
 //                                        构造装载（dlopen + 解析符号 + 填 keys），
 //                                        装配点在回调内 TBBMAP_SET(library_g.so_ctx, so, ctx)
 //   on_library_modify(handler)            — 注册「修改」回调：载荷同 add（ctx 是重载新 Plugin）；
-//                                        装配点在回调内先卸旧（GET → take_keys → ERASE）
+//                                        装配点在回调内先卸旧（读旧 ctx → take_keys → ERASE）
 //                                        再 SET 新 ctx
 //   on_library_delete(handler)            — 注册「删除」回调：载荷仅 (so_path)（文件已删）；
-//                                        装配点在回调内 GET 旧 ctx → take_keys → ERASE
+//                                        装配点在回调内读旧 ctx → take_keys → ERASE
 //   init(plugin_dir)                  — 初始化：设置插件目录（start 前调用）
 //   start(num_threads)                — 启动监听线程（build_thread_pool(num_threads)
 //                                        构建文件事件回调派发线程池 + watch(plugin_dir_) +
@@ -121,7 +121,7 @@ namespace fins::rt {
         if (!is_so_path(path)) return;
         try {
           const auto ctx = std::make_shared<Plugin>(path);   // 构造装载：dlopen + 解析符号 + 填 keys
-          add_cb(path, ctx);                  // 装配点：TBBMAP_SET(library_g.so_ctx, path, ctx)
+          add_cb(path, ctx);                  // 装配点：TBBMAP_SET(library_g.so_ctx, so, ctx)
           FINS_LOG_INFO("[PluginLoader] hot-load: {}", path);
         } catch (const std::exception &e) {
           FINS_LOG_ERROR("[PluginLoader] hot-load failed: {} — {}", path, e.what());
@@ -130,7 +130,7 @@ namespace fins::rt {
     }
     /// 注册「修改」回调：.so 被修改（IN_CLOSE_WRITE）后触发，载荷 (so_path, ctx)——
     /// ctx 是重载的新 Plugin（新 handle，已构造装载）。装配点在回调内先处理
-    /// 旧条目（GET 旧 ctx → take_keys() 取走 keys → ERASE），再 TBBMAP_SET 新 ctx。
+    /// 旧条目（const_accessor 读旧 ctx → take_keys() 取走 keys → ERASE），再 TBBMAP_SET 新 ctx。
     /// loader 不直接访问 library_g.so_ctx。
     /// handler 直接移动捕获进 guard 闭包，不存私有成员：guard 文件事件 → 构造 Plugin
     /// （make_shared<Plugin>(path)，重载新 handle）→ 调 handler(so_path, ctx)（装配点卸旧 + 重填）。
@@ -147,7 +147,7 @@ namespace fins::rt {
       });
     }
     /// 注册「删除」回调：.so 被删后触发，载荷仅 (so_path)（文件已从磁盘消失）。
-    /// 装配点在回调内 GET 旧 ctx → take_keys()（取走 keys）→ ERASE（析构 dlclose 兜底）——
+    /// 装配点在回调内读旧 ctx → take_keys()（取走 keys）→ ERASE（析构 dlclose 兜底）——
     /// loader 不直接访问 library_g.so_ctx。
     /// handler 直接移动捕获进 guard 闭包，不存私有成员：guard 文件事件（IN_DELETE/
     /// IN_MOVED_FROM）→ 调 handler(so_path)（装配点维护全局表）。
@@ -155,7 +155,7 @@ namespace fins::rt {
       guard_->on_delete([this, del_cb = std::move(handler)](const std::string &path) {
         if (!is_so_path(path)) return;
         try {
-          del_cb(path);                       // 装配点：GET ctx → take_keys → ERASE
+          del_cb(path);                       // 装配点：读旧 ctx → take_keys → ERASE
           FINS_LOG_INFO("[PluginLoader] hot-unload: {}", path);
         } catch (const std::exception &e) {
           FINS_LOG_ERROR("[PluginLoader] hot-unload failed: {} — {}", path, e.what());
