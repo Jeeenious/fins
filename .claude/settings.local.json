@@ -26,7 +26,21 @@
       "Bash(sed 's/^[- ][- ]*//')",
       "Bash(wsl -e bash -lc 'cd /mnt/d/Desktop/fins/sdk/fins/test && python3 -c \" *)",
       "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target client -j 2>&1 | tail -15\")",
-      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target client -j\")"
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target client -j\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target test_dataflow -j\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake -S . -B build_check >/dev/null 2>&1 && cmake --build build_check --target test_dataflow -j\")",
+      "Read(//mnt/d/Desktop/fins/sdk/fins/**)",
+      "Bash(./build_check/test_dataflow)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target test_dataflow -j 2>&1 | tail -30; echo '=== run ==='; ./build_check/test_dataflow 2>&1 | tail -30; echo exit=\\\\$?\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake -S . -B build_check 2>&1 | tail -15\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake -S . -B build_check 2>&1 | tail -5 && cmake --build build_check --target test_dataflow -j 2>&1 | tail -30\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake -S . -B build_check 2>&1 | grep -iE 'error|missing|warning' | head -20\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake -S . -B build_check 2>&1 | tail -3 && cmake --build build_check --target test_dataflow -j 2>&1 | tail -30\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target client server -j 2>&1 | tail -6\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake -S . -B build_check && cmake --build build_check --target test_configurate -j\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake -S . -B build_check && cmake --build build_check --target test_communicate -j\")",
+      "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && cmake --build build_check --target test_communicate -j\")"
     ]
   }
 }

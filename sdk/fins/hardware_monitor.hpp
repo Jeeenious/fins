@@ -10,7 +10,7 @@
 //   由装配点在 on_sample 回调内把全局容器传给 observe_* 完成（组件不含业务、不依赖全局状态）。
 //   observe_cpu()：读 /proc/stat 的 cpuN 行，与上一轮差值算每核 CPU 使用率 → 填 vector
 //     （索引=核号；首轮只记基线不填——使用率须两次采样差值才有意义）。
-//   observe_mem()：读 /proc/meminfo（MemTotal/MemAvailable）→ 填 atomic（失败保持原值）。
+//   observe_mem()：读 /proc/meminfo（MemTotal/MemAvailable）→ 返回使用率（失败返回 0）。
 //   触发与观测分离：run() 只触发 on_sample（不自动采样），装配点回调内显式调 observe_*，
 //   并决定传哪个全局容器（写全局 / 调度分析 / 打印）。
 //   停止：stop() 置 stop_ 后 join 触发线程；sleep_for 期间置位最多延迟一个触发周期。
@@ -25,13 +25,13 @@
 //   HardwareMonitor::instance().init(1000.0f)    — 定触发周期 ms（默认 1000）
 //   HardwareMonitor::instance().on_sample(cb)     — 每周期完成触发（start 前注册）
 //   HardwareMonitor::instance().observe_cpu(core_usages_g)  — 填每核 CPU（索引=核号）
-//   HardwareMonitor::instance().observe_mem(mem_usage_g)    — 填内存使用率
+//   HardwareMonitor::instance().observe_mem()               — 观测内存，返回使用率
 //   HardwareMonitor::instance().start()           — 起触发线程（幂等）
 //   HardwareMonitor::instance().stop()            — 停触发线程（幂等，析构复用）
 //   典型装配：
 //     on_sample([] {
-//       HardwareMonitor::instance().observe_cpu(core_usages_g);  // 填全局每核 CPU
-//       HardwareMonitor::instance().observe_mem(mem_usage_g);    // 填全局内存
+//       HardwareMonitor::instance().observe_cpu(core_usages_g);   // 填全局每核 CPU
+//       mem_usage_g = HardwareMonitor::instance().observe_mem();  // 拿返回的内存使用率
 //     });
 // ============================================================================
 
@@ -99,8 +99,8 @@ public:
     }
   }
 
-  /// 观测内存使用率（0~100），写入调用方给的 atomic（失败保持原值）。
-  /// **组件不引用任何全局对象**——atomic 由装配点传入（如 mem_usage_g），组件只更新调用方 atomic。
+  /// 观测内存使用率（0~100），返回结果（失败返回 0）。**组件不引用任何全局对象**——
+  /// 由装配点在 on_sample 回调内拿到返回值再写全局 / 消费。
   float observe_mem() {
     float v = 0.0f;
     read_mem_pct(v);
