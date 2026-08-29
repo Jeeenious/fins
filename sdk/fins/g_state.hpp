@@ -130,6 +130,18 @@ namespace fins::rt {
   /** @brief so 上下文表（library_g）：[so_path] → Plugin，唯一算法定位数据源；装配点回调维护。 */
   struct Library{
     util::TBBMap<std::shared_ptr<Plugin>> so_ctx;
+
+    /** @brief 取全部已注册算法定位键（[name]:[version]，跨所有 so 的 loaded_keys 聚合去重），
+     *  与 Pipeline::algo_keys() 配套供装配点做算法就绪检查（expand_hp 前比对）。
+     * @retval std::set<std::string> 全部已注册算法键（去重）
+     */
+    std::set<std::string> algo_keys() const {
+      std::set<std::string> keys;
+      for (auto it = so_ctx.begin(); it != so_ctx.end(); ++it)
+        for (const auto &k : it->second->loaded_keys)
+          keys.insert(k);
+      return keys;
+    }
   };
   inline Library library_g;
 
@@ -284,6 +296,20 @@ namespace fins::rt {
       for (size_t i = 0; i < nodes.size(); ++i)
         if (nodes[i].input_ports.empty() && nodes[i].period <= 0)
           throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) + "] 无输入节点必填 period");
+    }
+
+    /** @brief 取本 pipeline 引用的全部算法定位键（[name]:[version] 列表，与 Plugin::loaded_keys 同构），
+     *  供装配点与 library_g.so_ctx 比对做算法就绪检查（expand_hp 前调用，未全部注册则 defer）。
+     *  非破坏性：只读 nodes 生成键列表（对比 Plugin::take_keys 的 move 语义——比对后还需用 nodes 建图，
+     *  不能清空）。
+     * @retval std::vector<std::string> 每节点 name:version（顺序 = nodes 顺序；同算法多节点可出现重复键）
+     */
+    std::vector<std::string> algo_keys() const {
+      std::vector<std::string> keys;
+      keys.reserve(nodes.size());
+      for (const auto &node : nodes)
+        keys.emplace_back(node.name + ":" + node.version);
+      return keys;
     }
 
   private:

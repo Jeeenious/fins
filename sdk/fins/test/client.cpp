@@ -132,7 +132,7 @@ int main(int argc, char **argv) {
       pipeline_g.cache.write() = j;
       graph_g.pending = true;
       graph_g.cv.notify_all();
-      FINS_LOG_INFO("[agent] remote call received");
+      FINS_LOG_INFO("[agent] pipeline modified");
     });
   RPCListener::instance().on_library_add("/plugin/add", plugin_dir, [](const std::string &) {});
   RPCListener::instance().on_library_modify("/plugin/modify", plugin_dir, [](const std::string &) {});
@@ -242,6 +242,21 @@ int main(int argc, char **argv) {
           FINS_LOG_ERROR("[agent] pipeline parse/topology failed: {}", e.what());
           graph_g.cv.notify_all();
           continue;
+        }
+
+        // 算法就绪检查（独立于 expand_hp）：pipeline 引用键须全部在插件库已注册键中；
+        // 缺失 → 保留 pending 等热加载（on_library_* notify 唤醒重查），不丢弃配置
+        {
+          const auto pipe_keys = pipeline_g.algo_keys();
+          const auto lib_keys  = library_g.algo_keys();   // 全部已注册算法键（去重集合）
+          bool ready = true;
+          for (const auto &key : pipe_keys)
+            if (!lib_keys.count(key)) { ready = false; break; }
+          if (!ready) {
+            FINS_LOG_INFO("[agent] algo not ready, defer (pending kept, wait plugin load)");
+            graph_g.cv.wait_for(lk, std::chrono::milliseconds(500));   // 等热加载 notify 唤醒重试
+            continue;   // 保留 pending，不丢弃配置
+          }
         }
 
         try {
