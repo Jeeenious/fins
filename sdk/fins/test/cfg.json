@@ -1,0 +1,6 @@
+[
+  {"id": "cam", "name": "usr_src", "version": "1.0.0",
+   "period": 100, "parameters": [{"value": 7}], "outputs": ["cam_feed"]},
+  {"id": "disp", "name": "usr_sink", "version": "1.0.0",
+   "parameters": [{"value": 2}], "inputs": ["cam_feed"]}
+]
