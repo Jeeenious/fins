@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -134,6 +135,20 @@ namespace fins::util {
      * @retval 无
      */
     void add_edge(const NodeId &from, const NodeId &to, const std::string &tag, EdgeT data) {
+      // 建图自洽校验：边引用的 from/to 顶点必须已存在（有边必有顶点）。任一缺失抛
+      // std::out_of_range——把"有边无顶点"从运行期 grab_ready_workload 裸崩，提前到建图期
+      // 加边那一刻、精确到这条边（消息含 from→to）。expand_hp 持锁建图，装配点 try-catch
+      // 记日志拒绝本次配置。仅校验存在性，不校验是否已建边/重复边。
+      {
+        typename TBBMap<VertexT>::const_accessor a;
+        if (!nodes_.find(a, from))
+          throw std::out_of_range("DAG add_edge source missing: " + from + " -> " + to);
+      }
+      {
+        typename TBBMap<VertexT>::const_accessor b;
+        if (!nodes_.find(b, to))
+          throw std::out_of_range("DAG add_edge target missing: " + from + " -> " + to);
+      }
       {
         typename TBBMap<std::vector<Edge>>::accessor a;
         adj_.insert(a, from);
