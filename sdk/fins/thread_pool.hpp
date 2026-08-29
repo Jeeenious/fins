@@ -188,7 +188,7 @@ namespace fins::rt {
 
     void working(int idx) {
       bind_core(idx + 1);  // 跳过 core 0
-      set_realtime(99);    // SCHED_FIFO 实时优先级：同核 CFS（主线程/计时线程）不能抢占忙等待
+      set_realtime(1);    // SCHED_FIFO 实时优先级：同核 CFS（主线程/计时线程）不能抢占忙等待
       FINS_LOG_INFO("[ThreadPool] worker {} -> core {}", idx, idx + 1);
 
       {  // 宣布就绪：start() 据此得知所有 worker 已绑定核、即将在取任务回调上等待
