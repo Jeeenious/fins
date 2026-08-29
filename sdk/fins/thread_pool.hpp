@@ -191,13 +191,15 @@ namespace fins::rt {
       }
       ready_cv_.notify_all();
 
-      // 非抢占：执行完回调（取 + 执行任务）后才回到循环开头。
-      // 取任务回调由装配点注册（on_execute），线程池不感知任务队列/图实现。
-      // 回调返回 false（无更多工作，通常停止）→ worker 退出循环。
-      // todo 这里应该给个 try-catch
       while (!stop_.load()) {
         if (!cb_) break;      // 空回调（未注册）直接退出
-        if (!cb_()) break;    // 回调返回 false → 无更多工作 → 退出
+        try {
+          if (!cb_()) break;  // 回调返回 false → 无更多工作 → 退出
+        } catch (const std::exception &e) {
+          FINS_LOG_ERROR("[ThreadPool] worker {} callback threw: {}", idx, e.what());
+        } catch (...) {
+          FINS_LOG_ERROR("[ThreadPool] worker {} callback threw unknown exception", idx);
+        }
       }
     }
 
