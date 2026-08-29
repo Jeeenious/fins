@@ -25,7 +25,8 @@
 //   捕获进 guard 闭包（同 RPCListener::on_pipeline_update，不存私有成员），闭包内
 //   make_shared<Plugin>(path) 后调 handler。线程池由 start(num_threads) 显式构建
 //   （guard_.build_thread_pool(num_threads)）；start() 不含任何回调注册/接线，只做
-//   build_thread_pool + watch + 起线程。init(plugin_dir) 先定插件目录（配置），
+//   build_thread_pool + watch + scan_existing（启动扫描加载目录下已有插件，走
+//   on_library_add 路径）+ 起线程。init(plugin_dir) 先定插件目录（配置），
 //   start 只接收线程数作为唯一参数（与 RPCListener::init/start 接口风格一致）。
 //
 // 线程模型：
@@ -73,6 +74,7 @@
 //   init(plugin_dir)                  — 初始化：设置插件目录（start 前调用）
 //   start(num_threads)                — 启动监听线程（build_thread_pool(num_threads)
 //                                        构建文件事件回调派发线程池 + watch(plugin_dir_) +
+//                                        scan_existing() 启动扫描加载已有插件 +
 //                                        起 watching_；接线在 on_library_add/on_library_modify/
 //                                        on_library_delete 内完成，start 前调用）
 //   事件载荷：add/modify = (so_path, shared_ptr<Plugin>)；delete = (so_path)。
@@ -173,7 +175,8 @@ namespace fins::rt {
     /// on_library_add/on_library_modify/on_library_delete 业务回调都在 start 前经上述接口完成；
     /// 文件事件回调派发线程池由本方法显式构建（guard_->build_thread_pool(num_threads)，
     /// start 唯一参数）。
-    /// 本方法只做 build_thread_pool + watch(plugin_dir_) + 起 watching_ 线程，
+    /// 本方法只做 build_thread_pool + watch(plugin_dir_) + scan_existing（启动时
+    /// 扫描目录下已有插件，逐文件走 on_library_add 路径装载）+ 起 watching_ 线程，
     /// 不含任何回调注册/接线。
     void start(int num_threads) {
       // 幂等：已在监听则忽略——重复 start() 重赋值 joinable 的 watching_ 线程会 terminate
@@ -183,6 +186,7 @@ namespace fins::rt {
       }
       guard_->build_thread_pool(num_threads); // 文件事件回调派发线程池（start 唯一参数）
       guard_->watch(plugin_dir_);
+      guard_->scan_existing();               // 启动扫描加载已有插件（on_library_add 路径）
       watching_ = std::thread([this] { guard_->start(); });
     }
 

@@ -87,6 +87,8 @@ namespace fins::util {
   ///   build_thread_pool(n)   — 显式构建内置线程池（start 前；未调用则 start 惰性 4 线程）
   ///   watch(dir)             — 添加监听目录（可多次，start 前调用）
   ///   on_add/on_modify/on_delete(cb) — 注册增/改/删回调（cb: full_path → void）
+  ///   scan_existing()        — 扫描已监听目录现存文件，逐文件派发 on_add 事件
+  ///                            （启动时加载已有插件，PluginLoader::start 调用）
   ///   start()                — 阻塞运行事件循环（后台线程中调用）
   ///   stop()                 — 请求停止事件循环
   class Guard {
@@ -164,6 +166,28 @@ namespace fins::util {
     void on_add(Callback cb)    { std::lock_guard<std::mutex> lock(mtx_); on_add_ = std::move(cb); }
     void on_modify(Callback cb) { std::lock_guard<std::mutex> lock(mtx_); on_modify_ = std::move(cb); }
     void on_delete(Callback cb) { std::lock_guard<std::mutex> lock(mtx_); on_delete_ = std::move(cb); }
+
+    /// @brief 扫描已监听目录下现存的所有文件，逐文件作为 on_add 事件异步派发
+    ///  （复用 dispatch → 线程池 → on_add_ 闭包，与后续增量监听共用同一回调路径）。
+    ///  典型 = 启动时加载已有插件（PluginLoader::start 在 watch 后调用）；须在
+    ///  build_thread_pool 之后、事件循环起线程之前调用——pending_dirs_ 在事件循环
+    ///  里被清空，pool_ 由 build_thread_pool 建好，on_add_ 未注册时 dispatch 直接跳过。
+    void scan_existing() {
+      std::vector<std::string> dirs;
+      {
+        std::lock_guard<std::mutex> lock(mtx_);
+        dirs = pending_dirs_;   // watch() 填入的目录，事件循环前未被清空
+      }
+      for (const auto &dir : dirs) {
+        try {
+          if (!fs::exists(dir) || !fs::is_directory(dir)) continue;
+          for (const auto &entry : fs::recursive_directory_iterator(
+                   dir, fs::directory_options::skip_permission_denied))
+            if (entry.is_regular_file())
+              dispatch(on_add_, entry.path().string());
+        } catch (...) {}
+      }
+    }
 
     /// @brief 阻塞运行事件循环
     void start() {
