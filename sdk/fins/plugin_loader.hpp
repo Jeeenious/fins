@@ -186,7 +186,6 @@ namespace fins::rt {
       }
       guard_->build_thread_pool(num_threads); // 文件事件回调派发线程池（start 唯一参数）
       guard_->watch(plugin_dir_);
-      guard_->scan_existing();               // 启动扫描加载已有插件（on_library_add 路径）
       watching_ = std::thread([this] { guard_->start(); });
     }
 

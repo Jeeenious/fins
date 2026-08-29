@@ -5,8 +5,9 @@
 // 内部逻辑：
 //   main 作为装配点，把业务回调注册进组件（组件不感知业务），随后阻塞在
 //   main 调度循环直到收到停止信号：
-//   1. PluginLoader::on_library_add/modify/delete — 扫描插件目录，维护
-//      library_g.so_ctx（[so_path] → shared_ptr<Plugin>，SET/ERASE 由装配点做）。
+//   1. 插件加载（main 开头 create_directories 后）：装配点遍历 plugin_dir 存量装载 .so
+//      → make_shared<Plugin>(path) → SET library_g.so_ctx（Guard/PluginLoader 不承担存量扫描）；
+//      增量热加载由 PluginLoader::on_library_add/modify/delete 回调维护（SET/ERASE 由装配点做）。
 //   2. RPCListener::on_pipeline_update("/update") — 收包：存原始 JSON 到
 //      pipeline_g.cache.write()（不解析，HTTP 恒 200）+ 直写 graph_g.pending = true
 //      + cv.notify_all()；建图由 main 调度循环图静止时 commit + parse_pipeline
@@ -38,8 +39,8 @@
 //
 // 对外接口（装配示例）：
 //   agent_main [rpc_port=18080] [plugin_dir=/tmp/fins_agent_plugins]
-//   PluginLoader::on_library_add/modify/delete(handler) — 文件变更回调（装配点 SET/ERASE）
-//   PluginLoader::init(plugin_dir) / start(num_threads) — 初始化目录 / 启动监听
+//   PluginLoader::on_library_add/modify/delete(handler) — 增量增/改/删回调（装配点 SET/ERASE）
+//   PluginLoader::init(plugin_dir) / start(num_threads) — 初始化目录 / 启动监听（存量装载 main 开头做）
 //   RPCListener::on_pipeline_update("/update", handler) — 建图路由（存 JSON + pending 置位）
 //   RPCListener::init(host,port,chost,cport) / start(num_threads) — 监听
 //   ThreadPool::on_execute(cb) / start(n) / stop() — worker 带锁单步事务（cb 收线程序号 wid，
@@ -79,11 +80,21 @@ static fins::util::TBBMap<std::deque<long long>> idle_hist;
 int main(int argc, char **argv) {
   const int rpc_port = argc > 1 ? std::atoi(argv[1]) : 18080;
   const std::string plugin_dir = argc > 2 ? argv[2] : "./plugins";
-  fs::create_directories(plugin_dir);
 
-  // ── 装配 PluginLoader：loader 只做库机制，library_g.so_ctx 维护经回调注入 ──
+  // ── 临时：插件加载：全局插件初始化（存量扫描装载）──
+  try {
+    for (const auto &entry : fs::recursive_directory_iterator(
+             plugin_dir, fs::directory_options::skip_permission_denied)) {
+      const std::string p = entry.path().string();
+      auto ctx = std::make_shared<Plugin>(p);   // 构造装载：dlopen + 解析符号 + 填 keys
+      TBBMAP_SET(library_g.so_ctx, p, ctx);
+      FINS_LOG_INFO("[agent] lib add: {}", p);
+    }
+  } catch (...) {}
+
+  // ── 装配 PluginLoader：loader 只做库机制（增量增/改/删事件回调注入），存量装载上面已做 ──
   PluginLoader::instance().on_library_add([](const std::string &so, std::shared_ptr<Plugin> ctx) {
-    // 新增 .so（含 start 时 scan_existing 扫描到的存量插件）：ctx 已构造装载，直接 SET
+    // 新增 .so：ctx 已构造装载，直接 SET
     TBBMAP_SET(library_g.so_ctx, so, ctx);
     FINS_LOG_INFO("[agent] lib add: {}", so);
     graph_g.cv.notify_all();   // 库变更 → 唤醒主循环即时重查插件就绪（defer 自动恢复）
@@ -140,10 +151,6 @@ int main(int argc, char **argv) {
 
   // ── 装配 ThreadPool worker：带锁单步事务（拉取 → 锁外执行 → 回锁直做完成事件）──
   ThreadPool::instance().on_execute([](int wid) -> bool {
-
-#if FINS_TIMING
-      const auto _t0 = std::chrono::steady_clock::now();   // 空闲段起点：完成上一任务 → 拉到下一任务（含 cv.wait）
-#endif
 
     std::unique_lock lk(graph_g.mtx);
     for (;;) {
@@ -219,6 +226,7 @@ int main(int argc, char **argv) {
       if (wcet_updater) wcet_updater(graph_g);   // 每次事件唤醒 → wcet 更新一次（滚动排期后刷新）
       if (priority_updater) priority_updater(graph_g);  // 每次事件唤醒 → 优先级更新一次（滚动排期后刷新）
       if (graph_g.is_hp_done() && graph_g.pending.load()) {
+
         nlohmann::json cfg;
         {
           std::lock_guard wlk(pipeline_g.wr_lock());   // 与 RPC handler 同锁：cache 写/commit/read 串行
