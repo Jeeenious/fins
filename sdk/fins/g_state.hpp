@@ -10,10 +10,20 @@
 // 集中存放跨组件共享的运行时状态：pipeline_g（解析态 Pipeline：cache JSON 双缓冲 +
 // parse_pipeline/check_topology 两段解析）+ library_g（算法定位表 so_ctx）+ graph_g
 // （PrecedenceGraph 单份运行图 + 调度依据；公开成员 mtx/cv/stopped/pending + 无锁原语
-// expand_hp/grab_ready_workload/is_hp_done/rollover_hp）。
+// check_algo_ready/expand_hp/grab_ready_workload/grab_delay_workload/is_hp_done/rollover_hp）。
 // 数据流：RPC 存 JSON → pending → 主线程调度循环图静止时 commit+parse+check_topology+expand_hp 重建。
 // 装配点写法与语义细节见 docs/precedence_graph_design.md 及各类型前注释。
 // ============================================================================
+
+// ============================================================================
+// 全局宏：FINS_TIMING — 执行耗时统计开关（编译期，全库可见）
+//   1（默认）：record_exec 写 exec_us_hist_ 环形队列 + worker 完成事件做 job/exec 计时聚合
+//   0       ：热路径零计时开销——record_exec 变空操作、bind_job 闭包与 worker 不量时钟
+// 关闭方式：编译期 -DFINS_TIMING=0（实时部署减负；功能验证期默认开，便于观察耗时）。
+// ============================================================================
+#ifndef FINS_TIMING
+#define FINS_TIMING 1
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -305,7 +315,7 @@ namespace fins::rt {
     float period{0};
     float deadline{1};            // 相对截止期（ms；缺省 = wcet）
 
-    float ddl{0};                 // 绝对截止期（ms；滚动排期 = 主线程每轮 update_abs_deadline 按当前
+    float ddl{0};                 // 绝对截止期（ms；滚动排期 = 主线程事件驱动 update_abs_deadline 按当前
     float wcet{1};                // 最坏执行时间（ms；缺省 1）
     int priority{0};
 
@@ -537,16 +547,15 @@ namespace fins::rt {
     }
 
     /** @brief ⑥ 建顶点：每节点展开 node_count 个 job 实例顶点 {id}:{k}（k=0..N-1），载荷 =
-     *  attrs 基础（period/deadline/wcet/priority）+ abs_deadline 按 job 序排 = 超周期起点 +
-     *  (k+1)·deadline（无 release/相位）。
+     *  attrs 基础（period/deadline/wcet/priority）。abs_deadline 不在建图期排期——由运行时
+     *  update_abs_deadline 按真实时钟 + v.k·period 滚动校正（无 release/相位）。
      * @param dag 目标图（就地加顶点）
-     * @param hyper_start_ms 超周期起点（ms；abs_deadline 排期基准）
      * @param nodes 解析态节点表（只读）
      * @param period_final 节点 id → 最终周期（只读；⑤ 的结果）
      * @param node_count 节点 id → 实例数（只读；⑤ 的结果）
      * @retval 无
      */
-    static void build_vertices(util::DirectedAcyclicGraph<Workload, Message> &dag, float hyper_start_ms,
+    static void build_vertex(util::DirectedAcyclicGraph<Workload, Message> &dag,
                                const std::vector<NodeInfo> &nodes,
                                const std::map<std::string, float> &period_final,
                                const std::map<std::string, size_t> &node_count) {
@@ -560,55 +569,15 @@ namespace fins::rt {
           v.deadline     = info.deadline;   // parse 已折到 wcet（缺省 = wcet）
           v.priority     = info.priority;   // grab_ready_workload 选最优先就绪的初值（priority_updater 运行时更新）
           v.wcet         = info.wcet;
-          v.ddl          = hyper_start_ms + (float)(k + 1) * info.deadline;
           dag.add_node(info.id + ":" + std::to_string(k), std::move(v));
-        }
-      }
-    }
-
-    /** @brief ⑥.5 显式周期节点 job 间插入 delay 假节点：{id}:{k} → delay:{id}:{k} → {id}:{k+1}。
-     *  周期性任务时间语义——每对相邻 job 间真延迟一个执行周期 period（sleep offset=period，
-     *  占 worker）；delay 假节点无数据边（纯时间门控），前序关系经两段 seq 边（{id}:{k} 完成 →
-     *  delay sleep → {id}:{k+1} 就绪）。只对显式配置 period 的节点（info.period > 0）；
-     *  继承周期节点不插（跟随 producer 节奏）。delay 假顶点不调 record_exec（时间门控非算法
-     *  执行，不污染 exec_us_hist_）；完成事件由装配点通用回锁直做照常推进。
-     * @param dag 目标图（就地加 delay 假顶点）
-     * @param hyper_start_ms 超周期起点（ms；abs_deadline 排期基准）
-     * @param nodes 解析态节点表（只读）
-     * @param period_final 节点 id → 最终周期（只读；offset 取值源）
-     * @param node_count 节点 id → 实例数（只读）
-     * @retval 无
-     */
-    static void build_delays(util::DirectedAcyclicGraph<Workload, Message> &dag, float hyper_start_ms,
-                             const std::vector<NodeInfo> &nodes,
-                             const std::map<std::string, float> &period_final,
-                             const std::map<std::string, size_t> &node_count) {
-      for (const auto &info : nodes) {
-        if (info.period <= 0) continue;                  // 仅显式配置周期节点
-        const size_t N = node_count.at(info.id);
-        const float offset = period_final.at(info.id);   // = info.period（显式周期）
-        for (size_t k = 0; k + 1 < N; ++k) {
-          Workload v;
-          v.id           = "delay:" + info.id + ":" + std::to_string(k);
-          v.name         = "delay";
-          v.k            = k + 1;                        // 第 k+1 周期步进
-          v.priority     = info.priority;
-          v.period       = offset;
-          v.deadline     = offset;
-          v.wcet         = offset;                       // sleep 时长 = period
-          v.ddl          = hyper_start_ms + (float)(k + 2) * offset;
-          v.job          = [offset]() {                  // 纯时间门控，无数据路由
-            std::this_thread::sleep_for(std::chrono::duration<float, std::milli>(offset));
-          };
-          dag.add_node(v.id, std::move(v));
         }
       }
     }
 
     /** @brief ⑦ 建边：seq 连续边（同节点实例串行）+ 同名端口直连绑定边。
      *  seq 边：{id}:{k} → {id}:{k+1}，边名 "seq:"+id（Replication 多实例串行——job 实例按超周期
-     *  序逐个执行，保证同节点内串行）。显式周期节点（info.period>0）经 delay 假节点拆两段
-     *  （{id}:{k} → delay:{id}:{k} → {id}:{k+1}，见 ⑥.5 build_delays）；继承周期节点单段。
+     *  序逐个执行，保证同节点内串行；周期节点实例的**释放时刻约束**由时间链挂靠边承担（⑦.5
+     *  build_sync_points），seq 只保证前一个实例完成后才允许下一个开始）。
      *  绑定边：consumer 每输入端口 pn 绑输出 pn 的唯一 producer 节点（单写者已由 check_topology
      *  保证唯一），整数式 pk=((k+1)·Np-1)/Nc 连 producer:{pk} → consumer:{k}（时段内最新已完成帧，
      *  同速率一一对应；快 producer→慢 consumer 绑末帧；慢 producer→快 consumer 共享帧；恒有边）。
@@ -618,22 +587,14 @@ namespace fins::rt {
      * @param node_count 节点 id → 实例数（只读）
      * @retval 无
      */
-    static void build_edges(util::DirectedAcyclicGraph<Workload, Message> &dag,
+    static void build_edge(util::DirectedAcyclicGraph<Workload, Message> &dag,
                             const std::vector<NodeInfo> &nodes,
                             const std::map<std::string, size_t> &node_count) {
       for (const auto &info : nodes) {
         const size_t N = node_count.at(info.id);
-        const bool periodic = info.period > 0;   // 显式周期节点：job 间经 delay 假节点（周期步进）
-        for (size_t k = 0; k + 1 < N; ++k) {
-          if (periodic) {
-            const std::string dv = "delay:" + info.id + ":" + std::to_string(k);
-            dag.add_edge(info.id + ":" + std::to_string(k), dv, "seq:" + info.id, Message{});
-            dag.add_edge(dv, info.id + ":" + std::to_string(k + 1), "seq:" + info.id, Message{});
-          } else {
-            dag.add_edge(info.id + ":" + std::to_string(k), info.id + ":" + std::to_string(k + 1),
-                         "seq:" + info.id, Message{});
-          }
-        }
+        for (size_t k = 0; k + 1 < N; ++k)
+          dag.add_edge(info.id + ":" + std::to_string(k), info.id + ":" + std::to_string(k + 1),
+                       "seq:" + info.id, Message{});
       }
       std::map<std::string, std::string> producer_of;   // 输出端口名 → producer 节点 id（首生产者，函数内局部）
       for (const auto &info : nodes)
@@ -655,6 +616,52 @@ namespace fins::rt {
       }
     }
 
+    /** @brief ⑦.5 时间链：解析同步时间点（显式周期节点释放时刻并集）→ 建时间点顶点（job = 延迟
+     *  （sleep_until 绝对释放时刻，timer 拿到 w 直接 job() 即实现延迟）、period=相对 hyper_start_ms
+     *  的释放偏移）+ 挂靠边 tp:s → {id}:{k}（释放约束：时间点 Finished 任务才就绪）。仅显式周期
+     *  节点（info.period>0）产生同步点并挂靠；继承周期节点仍纯数据流驱动。时间点按绝对释放时刻聚合
+     *  ——多任务共享同一时间点（如两个 50ms 任务与一个 100ms 任务同时刻释放共用该点），锚定真实
+     *  时钟消除旧 delay 的漂移。注意顺序：须在 build_edge 之后调用（其挂靠边引用的任务顶点已由
+     *  build_vertex 建好、时间点顶点自建）。
+     * @param nodes 解析态节点表（只读）
+     * @param node_count 节点 id → 实例数（只读）
+     * @retval 无
+     */
+    void pin_sync(const std::vector<NodeInfo> &nodes,
+                  const std::map<std::string, size_t> &node_count) {
+      std::set<float> S;   // 同步点集合：显式周期节点释放时刻并集（去重升序）
+      for (const auto &info : nodes) {
+        if (info.period <= 0) continue;
+        const size_t N = node_count.at(info.id);
+        for (size_t k = 0; k < N; ++k) S.insert((float)k * info.period);
+      }
+      std::map<float, std::string> tp_id;   // 偏移 → 时间点顶点 id（序号化，无精度碰撞）
+      size_t seq = 0;
+      for (const float off : S) tp_id[off] = "tp:" + std::to_string(seq++);
+      for (const auto &[off, id] : tp_id) {
+        Workload v;
+        v.id     = id;
+        v.name   = "time";
+        v.period = off;   // 相对 hyper_start_ms 的释放偏移（timer grab_delay_workload 读，非周期）
+        v.job = [this, off]() {   // 延迟执行体：timer 拿到 w 直接 job() 即 sleep_until 到绝对释放时刻；
+                                  // job 内实时读 hyper_start_ms → rollover 平移后自动对齐新起点，无漂移
+          const float at = hyper_start_ms + off;
+          const auto until = std::chrono::steady_clock::now()
+              + std::chrono::microseconds((long long)(at - fins::util::now_ms()) * 1000ll);
+          std::this_thread::sleep_until(until);
+        };
+        dag.add_node(id, std::move(v));
+      }
+      for (const auto &info : nodes) {
+        if (info.period <= 0) continue;
+        const size_t N = node_count.at(info.id);
+        for (size_t k = 0; k < N; ++k) {
+          const float off = (float)k * info.period;
+          dag.add_edge(tp_id.at(off), info.id + ":" + std::to_string(k), "time", Message{});
+        }
+      }
+    }
+
     /**
      * @brief ⑧ 填 job 执行体闭包：按 NodeInfo 端口序打包输入/输出 array → AlgoBase execute →
      *        输出路由下游绑定边 + record_mesg 维护 loop 滑动窗口，运行时不再接触原始 JSON。
@@ -670,7 +677,7 @@ namespace fins::rt {
      * @param node_count 节点 id → job 实例数（只读）
      * @retval 无
      */
-    void build_jobs(const std::vector<NodeInfo> &nodes, float hyper_period,
+    void bind_job(const std::vector<NodeInfo> &nodes, float hyper_period,
                     const std::map<std::string, std::shared_ptr<AlgoBase>> &by_id,
                     const std::map<std::string, size_t> &node_count) {
       for (const auto &info : nodes) {
@@ -733,12 +740,14 @@ namespace fins::rt {
               // 输出：按 NodeInfo输出端口序预构造 array（算法按位置写）
               std::vector<Message> outputs(sinfo->output_ports.size());
               // 执行：配置已建图期注入 algo 实例（AlgoFunc configs_ 类型化帧，execute 零解析）。
+
               // 耗时统计：execute 前后 steady_clock 计时（us）→ record_exec(节点 id, us)——仅
               // execute 耗时，不含输入打包/输出路由；按节点环形队列，expand_hp 重建保留不清。
               const auto _t0 = std::chrono::steady_clock::now();
               algo->execute(inputs, outputs);
               record_exec(sinfo->id, std::chrono::duration<double, std::micro>(
                   std::chrono::steady_clock::now() - _t0).count());
+
               for (size_t i = 0; i < outputs.size(); ++i) {
                 const std::string &pn = sinfo->output_ports[i];
                 for (auto &e : dag.edges_from(vtx, pn))
@@ -757,8 +766,8 @@ namespace fins::rt {
      * @brief 建图唯一入口（**无锁原语，前提调用方持 mtx**）：清空旧图 + 8 步单函数建图——
      *        ① 端口索引 build_port_index → ② 超周期 build_hyper_period →
      *        ③ 拓扑序 build_topo_order → ④ 实例化 build_instances → ⑤ 支配周期/实例数
-     *        build_dominance → ⑥ 建顶点 build_vertices → ⑥.5 显式周期节点插 delay 假节点
-     *        build_delays → ⑦ 建边 build_edges → ⑧ 填 job 闭包 build_jobs。超周期起点 = 当前
+     *        build_dominance → ⑥ 建顶点 build_vertex → ⑦ 建边 build_edge → ⑦.5 时间链
+     *        build_sync_points（同步时间点顶点 + 挂靠边）→ ⑧ 填 job 闭包 bind_job。超周期起点 = 当前
      *        真实时钟；只清 mesg_hist_cap 容量表，message_hist_ 历史槽跨重建保留不清。空配置 → 空图。
      * @param pipeline 解析态 Pipeline（调用方传 pipeline_g 或局部，取其 nodes 快照）
      * @param library  算法定位 Library（调用方传 library_g，取其 so_ctx 快照）
@@ -796,29 +805,33 @@ namespace fins::rt {
       build_dominance(topo, by_info, producers, hyper_period_ms, period_final, node_count);
 
       // ⑥ 建顶点 {id}:{k}
-      build_vertices(dag, hyper_start_ms, nodes, period_final, node_count);
+      build_vertex(dag, nodes, period_final, node_count);
 
-      // ⑥.5 显式周期节点 job 间插 delay 假节点（真延迟 offset=period）
-      build_delays(dag, hyper_start_ms, nodes, period_final, node_count);
+      // ⑦ seq 连续边 + 绑定边
+      build_edge(dag, nodes, node_count);
 
-      // ⑦ seq（显式周期节点经 delay）+ 绑定边
-      build_edges(dag, nodes, node_count);
+      // ⑦.5 时间链：同步时间点顶点 + 挂靠边（图编辑好后钉时间约束）
+      pin_sync(nodes, node_count);
 
       // ⑧ job 闭包
-      build_jobs(nodes, hyper_period_ms, by_id, node_count);
+      bind_job(nodes, hyper_period_ms, by_id, node_count);
+
+      // todo 更新 ddl
+      // todo 更新 wcet
     }
 
     /**
      * @brief 超周期回绕（**无锁原语，前提调用方持 mtx**；主线程调度循环图静止时调用）：
-     *        起点更新为当前真实时钟 + 全部 job 顶点重置 Pending（seq 边不闭合，回绕后 {id}:{0}
-     *        由 grab_ready_workload 重新拉取；loop 数据槽跨周期保留不清；abs_deadline 由主线程
-     *        每轮 update_abs_deadline 滚动校正，非本函数职责）。
+     *        起点更新为当前真实时钟 + **全部顶点**（job 任务 + 延迟时间点）重置 Pending
+     *        （seq 边不闭合，回绕后 {id}:{0} 由 grab_ready_workload 重新拉取；时间点由
+     *        计时线程 grab_delay_workload 重新拉取释放；loop 数据槽跨周期保留不清；abs_deadline 由
+     *        主线程事件驱动 update_abs_deadline 滚动校正，非本函数职责）。
      * @retval 无
      */
     void rollover_hp() {
       hyper_start_ms = fins::util::now_ms();   // 起点更新为当前真实时钟
       dag.for_each_vertex([&](const std::string &, Workload &v) {
-        if (v.job) v.state = Workload::State::Pending;  // 有执行体 → 重置待执行
+        v.state = Workload::State::Pending;   // 全部顶点（含时间点）重置待执行/待释放
       });
     }
 
@@ -830,7 +843,8 @@ namespace fins::rt {
      */
     bool is_hp_done() {
       bool idle = true;
-      dag.for_each_vertex([&](const std::string &, const Workload &w) {
+      dag.for_each_vertex([&](const std::string &id, const Workload &w) {
+        if (id.rfind("tp:", 0) == 0) return;   // 时间点不算执行体（图静止 = 计算任务链完成，tp 释放不阻塞回绕）
         if (w.job && w.state != Workload::State::Finished) idle = false;
       });
       return idle;
@@ -848,6 +862,7 @@ namespace fins::rt {
     Workload *grab_ready_workload() {
       std::vector<std::string> cand;
       dag.for_each_vertex([&](const std::string &id, const Workload &w) {
+        if (id.rfind("tp:", 0) == 0) return;   // 时间点由 timer 拉（延迟不能在线程池执行），worker 不碰
         if (w.state == Workload::State::Pending && w.job) cand.push_back(id);
       });
       std::optional<std::string> best;
@@ -866,12 +881,35 @@ namespace fins::rt {
     }
 
     /**
+     * @brief 拉取最近待释放时间点（**无锁原语，前提调用方持 mtx**；装配点计时线程调用，与
+     *        grab_ready_workload 对称——worker 拿计算 job、timer 拿延迟时间点）：遍历 "tp:"
+     *        时间点顶点，找 Pending 中释放绝对时刻（hyper_start_ms + period）最近的一个返回
+     *        （图内指针；同超周期起点下 period 最小 = 最近释放）。timer 拿到后与 worker 对称：
+     *        置 Running → 锁外执行其 job（sleep_until 睡到释放时刻）→ 回锁置 Finished + notify。
+     *        无 Pending 时间点 → nullptr。
+     * @retval Workload* 图内时间点顶点指针；nullptr = 无待释放时间点
+     */
+    Workload *grab_delay_workload() {
+      float best_off = std::numeric_limits<float>::max();
+      std::optional<std::string> best;
+      dag.for_each_vertex([&](const std::string &id, const Workload &w) {
+        if (w.state != Workload::State::Pending) return;   // 仅 Pending 时间点
+        if (id.rfind("tp:", 0) != 0) return;               // id 前缀 "tp:" 识别时间点
+        if (w.period < best_off) { best_off = w.period; best = id; }
+      });
+      if (!best) return nullptr;
+      Workload *picked = nullptr;   // mutate_vertex 回调取可变指针（同 grab_ready_workload）
+      dag.mutate_vertex(*best, [&picked](Workload &x) { picked = &x; });
+      return picked;
+    }
+
+    /**
      * @brief 滚动校正全部 job 顶点的 abs_deadline（**无锁原语，前提调用方持 mtx**；主线程调度
-     *        循环每轮 priority_updater 之前调用）：基于当前真实时钟 now，从 hyper_start_ms 起按
-     *        超周期滚动起点到 now 所在时窗，abs_deadline = 滚动后起点 + (k+1)·deadline——
-     *        执行快慢不定时 deadline 始终对齐真实时间轴（供 priority_updater/将来 EDF 消费），
-     *        不再依赖回绕副作用。超周期内幂等；无超周期（hyper_period_ms<=0）不滚动（保持
-     *        expand 设置值）。
+     *        循环事件驱动唤醒后 priority_updater 之前调用）：基于当前真实时钟 now，从
+     *        hyper_start_ms 起按超周期滚动起点到 now 所在时窗，abs_deadline = 滚动后起点 +
+     *        (k+1)·deadline——执行快慢不定时 deadline 始终对齐真实时间轴（供 priority_updater/
+     *        将来 EDF 消费），不再依赖回绕副作用。超周期内幂等；无超周期（hyper_period_ms<=0）
+     *        不滚动（保持 expand 设置值）。
      * @retval 无
      */
     void update_abs_deadline() {

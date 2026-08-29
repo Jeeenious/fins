@@ -11,7 +11,7 @@
 // 内部逻辑：
 //   n 个 worker 线程，worker i 绑定 core (i+1)（跳过 core 0，留给系统中断/管理）。
 //   每个 worker 的自调度循环：
-//     while (!stop_.load()) { if (!cb_) break; if (!cb_()) break; }
+//     while (!stop_.load()) { if (!cb_) break; if (!cb_(idx)) break; }
 //   每轮调用装配点注册的取任务回调 cb_（bool），由它自己完成"取任务 + 执行"：
 //   典型装配 = 装配点写带锁单步事务（g_state.hpp 的 PrecedenceGraph 无锁原语 + 公开成员锁）：
 //   持 mtx：stopped.load() 检查 → grab_ready_workload() 锁内纯拉取（**不回绕**）从运行图拉取
@@ -63,8 +63,9 @@
 // 对外接口：
 //   instance()                          — 单例
 //   on_execute(cb)                    — 注册取任务回调（bool，须在 start() 前）；
-//                                          cb: () -> bool，返回 true 继续取下一任务、
-//                                          false（无更多工作，通常停止）退出；
+//                                          cb: (int wid) -> bool，wid = 线程序号（worker i →
+//                                          wid=i，可用于按线程独立统计/绑核信息）；返回 true 继续
+//                                          取下一任务、false（无更多工作，通常停止）退出；
 //                                          典型装配 = 装配点写带锁单步事务（on_execute 回调内
 //                                          持 graph_g.mtx：stopped.load() 检查 → grab_ready_workload 锁内
 //                                          拉取（返回 Workload*）→ 锁外执行 → 回锁直做完成事件
@@ -76,7 +77,7 @@
 //   stop()                              — 置停止位并回收 worker 线程（须先置调度停止位并唤醒
 //                                          on_execute 回调的 wait，见停止约定）；析构时自动调用
 //   装配示例（业务方 main 中）：
-//     ThreadPool::instance().on_execute([]() -> bool {
+//     ThreadPool::instance().on_execute([](int /*wid*/) -> bool {
 //       std::unique_lock lk(graph_g.mtx);
 //       for (;;) {
 //         if (graph_g.stopped.load()) return false;    // 停止 → 退出 worker 循环
@@ -120,8 +121,9 @@ namespace fins::rt {
     /// 取任务回调：worker 每轮调它完成"取任务 + 执行"。由装配点在 main 中通过
     /// on_execute() 注册（典型：装配点写带锁单步事务——持 graph_g.mtx：stopped.load() 检查 →
     /// grab_ready_workload 拉取 → 锁外执行 → 回锁直做完成事件 → 无可拉 cv.wait；线程池不直接引用图/任务源）。
-    /// 返回 bool：true 继续取下一任务；false = 无更多工作（停止）→ worker 退出循环。
-    std::function<bool()> cb_;
+    /// 参数 = 线程序号 wid（worker i → wid=i）；返回 bool：true 继续取下一任务；
+    /// false = 无更多工作（停止）→ worker 退出循环。
+    std::function<bool(int)> cb_;
     /// 线程池自身的停止位
     /// worker 每轮检查，置位后退出循环。
     /// 调度停止位（PrecedenceGraph 公开成员 stopped）仍由装配点经 graph_g.stopped = true +
@@ -137,8 +139,9 @@ namespace fins::rt {
     /// 注册取任务回调（bool，须在 start() 前调用）：worker 循环每轮调用 cb()
     /// 一次，由回调自己完成"取任务 + 执行"（典型：装配点写带锁单步事务——持 graph_g.mtx：
     /// stopped.load() 检查 → grab_ready_workload 拉取 → 锁外执行 → 回锁直做完成事件 → 无可拉 cv.wait）。
-    /// 返回 true 继续取下一任务；返回 false = 无更多工作（停止）→ worker 退出循环。
-    void on_execute(std::function<bool()> cb) {
+    /// 回调参数 = 线程序号 wid（worker i → wid=i，供按线程独立统计用）；返回 true 继续取下一任务；
+    /// 返回 false = 无更多工作（停止）→ worker 退出循环。
+    void on_execute(std::function<bool(int)> cb) {
       cb_ = std::move(cb);
     }
 
@@ -194,7 +197,7 @@ namespace fins::rt {
       while (!stop_.load()) {
         if (!cb_) break;      // 空回调（未注册）直接退出
         try {
-          if (!cb_()) break;  // 回调返回 false → 无更多工作 → 退出
+          if (!cb_(idx)) break;  // 回调返回 false → 无更多工作 → 退出（idx = 线程序号）
         } catch (const std::exception &e) {
           FINS_LOG_ERROR("[ThreadPool] worker {} callback threw: {}", idx, e.what());
         } catch (...) {
