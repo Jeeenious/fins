@@ -10,7 +10,7 @@
 //   - .so：插件目录下每个 .so 装载为 1 个 Plugin（dlopen handle + C 工厂）
 //
 // 对外接口（装配示例）：
-//   agent_main [rpc_port=18080] [plugin_dir=/tmp/fins_agent_plugins]
+//   agent_main [rpc_port=18080] [plugin_dir=./plugins] [num_workers=2]
 //   PluginLoader::on_library_add/modify/delete(handler) — 增量增/改/删回调（装配点 SET/ERASE）
 //   PluginLoader::init(plugin_dir) / start(num_threads) — 初始化目录 / 启动监听（存量装载 main 开头做）
 //   RPCListener::on_pipeline_update("/update", handler) — 建图路由（存 JSON + pending 置位）
@@ -54,6 +54,8 @@ static std::deque<long long> rollover_latency{};
 int main(int argc, char **argv) {
   const int rpc_port = argc > 1 ? std::atoi(argv[1]) : 18080;
   const std::string plugin_dir = argc > 2 ? argv[2] : "./plugins";
+  int num_workers = argc > 3 ? std::atoi(argv[3]) : 2;   // 线程池 worker 数；非法/≤0 回落默认 2
+  if (num_workers < 1) num_workers = 2;
 
   // ── 临时：插件加载：全局插件初始化（存量扫描装载）──
   try {
@@ -124,17 +126,20 @@ int main(int argc, char **argv) {
   HardwareMonitor::instance().start();
 
   // ── 装配 ThreadPool worker：带锁单步事务（拉取 → 锁外执行 → 回锁直做完成事件）──
-  ThreadPool::instance().on_execute([](int wid) -> bool {
+  ThreadPool::instance().on_execute([](const int wid) -> bool {
 
     std::unique_lock lk(graph_g.mtx);
     for (;;) {
       if (graph_g.stopped.load()) return false;
 
+      if (graph_g.is_workload_ready()) {
+
 #if FINS_TIMING
-      const auto _t0 = std::chrono::steady_clock::now();   // 空闲段起点：完成上一任务 → 拉到下一任务（含 cv.wait）
+  const auto _t0 = std::chrono::steady_clock::now();   // 空闲段起点：完成上一任务 → 拉到下一任务（含 cv.wait）
 #endif
 
-      if (auto w = graph_g.grab_ready_workload()) {
+        auto w = graph_g.grab_ready_workload();
+
         lk.unlock();
 
 #if FINS_TIMING
@@ -143,21 +148,16 @@ int main(int argc, char **argv) {
 
         w->job();
 
-// #if FINS_TIMING
-//       const long long exec_us = std::chrono::duration<double, std::micro>(
-//         std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（job 闭包总时长）
-// #endif
+#if FINS_TIMING
+      const long long exec_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（job 闭包总时长）
+#endif
 
         lk.lock();
 
-        graph_g.sign_done_workload(w->id);   // 回锁直做完成事件：置 done + 传播 pred_left + 入 ready
+        graph_g.set_workload_done(w->id);   // 回锁直做完成事件：置 done + 传播 pred_left + 入 ready
 
         graph_g.cv.notify_all();
-
-#if FINS_TIMING
-const long long exec_us = std::chrono::duration<double, std::micro>(
-std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（job 闭包总时长）
-#endif
 
 #if FINS_TIMING
       const long long idle_us = std::chrono::duration<double, std::micro>(
@@ -171,7 +171,7 @@ std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（jo
       graph_g.cv.wait_for(lk, std::chrono::milliseconds(1));   // 等完成/回绕/expand_hp/停止（notify 快路径 + 1ms 超时兜底 lost wakeup）
     }
   });
-  ThreadPool::instance().start(15);
+  ThreadPool::instance().start(num_workers);
 
   // ── 停止信号：SIGINT/SIGTERM → 置停止位唤醒 main 循环与 worker ──
   std::signal(SIGINT,  [](int) { graph_g.stopped = true; graph_g.cv.notify_all(); });
@@ -188,7 +188,7 @@ std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（jo
         tl.unlock();
         tp->job();                              // 锁外执行：sleep_until 睡到释放时刻（延迟实现）
         tl.lock();
-        graph_g.sign_done_workload(tp->id);   // 回锁直做完成事件：置 done + 传播 pred_left（释放后继 job 顶点）
+        graph_g.set_workload_done(tp->id);   // 回锁直做完成事件：置 done + 传播 pred_left（释放后继 job 顶点）
         graph_g.cv.notify_all();
         continue;
       }
@@ -251,14 +251,14 @@ std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（jo
           FINS_LOG_ERROR("[agent] pipeline apply failed: {}", e.what());
         }
 
+        graph_g.pending = false;   // 已应用（成功/失败均清除，勿残留导致 commit 翻到未写份交替重建）
+        graph_g.cv.notify_all();
+
 #if FINS_TIMING
         const long long expand_us = std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - _e0).count();
         expand_latency.push_back(expand_us);
 #endif
-
-        graph_g.pending = false;   // 已应用（成功/失败均清除，勿残留导致 commit 翻到未写份交替重建）
-        graph_g.cv.notify_all();
 
         continue;
       }
@@ -270,13 +270,14 @@ std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（jo
 
         graph_g.rollover_hp();
 
+        graph_g.cv.notify_all();
+
 #if FINS_TIMING
         const long long rollover_us = std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - _r0).count();
         rollover_latency.push_back(rollover_us);
 #endif
 
-        graph_g.cv.notify_all();
         continue;
       }
       graph_g.cv.wait_for(lk, std::chrono::milliseconds(1));   // 纯事件等待（notify 快路径 + 1ms 超时兜底 lost wakeup）

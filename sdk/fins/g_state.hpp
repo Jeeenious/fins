@@ -899,6 +899,10 @@ namespace fins::rt {
 
     bool is_hp_empty() { return dag.size() == 0; }
 
+    bool is_workload_ready() {
+      return !ready_.empty();
+    }
+
     /**
      * @brief 拉取就绪顶点（**无锁原语，前提调用方持 mtx**；装配点 on_execute 回调事务内部调用）：
      *        FIFO 就绪集（ready_，pred_left 减到 0 时 on_job_done 入队）队首出 → mutate_vertex
@@ -946,7 +950,7 @@ namespace fins::rt {
      * @param id 已完成顶点 id（job 顶点或 "tp:" 时间点顶点）
      * @retval 无
      */
-    void sign_done_workload(const std::string &id) {
+    void set_workload_done(const std::string &id) {
       if (!done_.insert(id).second) return;   // 幂等防御（正常每顶点恰完成一次）
       for (const auto &s : dag.out_nodes(id)) {
         auto it = pred_left_.find(s);
