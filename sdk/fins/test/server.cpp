@@ -23,10 +23,11 @@
 #include <string>
 
 // 写死默认：无参运行即发这份 json（换用例改 DEFAULT_CFG 一行，路径相对运行目录）
-static const char *DEFAULT_CFG = "../cfg_usr_chain100.json";
+// static const char *DEFAULT_CFG = "../cfg_usr_chain2.json";
 // static const char *DEFAULT_CFG = "../cfg_usr_chain10.json";
+// static const char *DEFAULT_CFG = "../cfg_usr_chain100.json";
 // static const char *DEFAULT_CFG = "../cfg_usr_fork2.json";
-// static const char *DEFAULT_CFG = "../cfg_usr_fork10.json";
+static const char *DEFAULT_CFG = "../cfg_usr_fork10.json";
 // static const char *DEFAULT_CFG = "../cfg_usr_join2.json";
 // static const char *DEFAULT_CFG = "../cfg_usr_join10.json";
 

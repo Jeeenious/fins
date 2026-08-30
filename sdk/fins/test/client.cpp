@@ -76,6 +76,8 @@ namespace fs = std::filesystem;
 
 static fins::util::TBBMap<std::deque<long long>> exec_hist;
 static fins::util::TBBMap<std::deque<long long>> idle_hist;
+static std::deque<long long> expand_latency{};
+static std::deque<long long> rollover_latency{};
 
 int main(int argc, char **argv) {
   const int rpc_port = argc > 1 ? std::atoi(argv[1]) : 18080;
@@ -157,7 +159,7 @@ int main(int argc, char **argv) {
       if (graph_g.stopped.load()) return false;
 
 #if FINS_TIMING
-      const auto _t1 = std::chrono::steady_clock::now();   // 空闲段起点：完成上一任务 → 拉到下一任务（含 cv.wait）
+      const auto _t0 = std::chrono::steady_clock::now();   // 空闲段起点：完成上一任务 → 拉到下一任务（含 cv.wait）
 #endif
 
       if (auto w = graph_g.grab_ready_workload()) {
@@ -165,14 +167,14 @@ int main(int argc, char **argv) {
         lk.unlock();
 
 #if FINS_TIMING
-        const auto _t2 = std::chrono::steady_clock::now();
+        const auto _t1 = std::chrono::steady_clock::now();
 #endif
 
         w->job();
 
 #if FINS_TIMING
       const long long exec_us = std::chrono::duration<double, std::micro>(
-          std::chrono::steady_clock::now() - _t2).count();   // 本线程本次实测（job 闭包总时长）
+          std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（job 闭包总时长）
 #endif
 
         lk.lock();
@@ -181,7 +183,7 @@ int main(int argc, char **argv) {
 
 #if FINS_TIMING
       const long long idle_us = std::chrono::duration<double, std::micro>(
-          std::chrono::steady_clock::now() - _t1).count() - exec_us;   // 本线程本次空闲（完成上一任务 → 拉到下一任务）
+          std::chrono::steady_clock::now() - _t0).count() - exec_us;   // 本线程本次空闲（完成上一任务 → 拉到下一任务）
       TBBMAP_UPDATE(exec_hist, std::to_string(wid), [&](auto &q) { q.push_back(exec_us); });
       TBBMAP_UPDATE(idle_hist, std::to_string(wid), [&](auto &q) { q.push_back(idle_us); });
 #endif
@@ -227,6 +229,10 @@ int main(int argc, char **argv) {
       if (priority_updater) priority_updater(graph_g);  // 每次事件唤醒 → 优先级更新一次（滚动排期后刷新）
       if (graph_g.is_hp_done() && graph_g.pending.load()) {
 
+#if FINS_TIMING
+        const auto _e0 = std::chrono::steady_clock::now();   // expand_hp 建图计时起点
+#endif
+
         nlohmann::json cfg;
         {
           std::lock_guard wlk(pipeline_g.wr_lock());   // 与 RPC handler 同锁：cache 写/commit/read 串行
@@ -259,6 +265,7 @@ int main(int argc, char **argv) {
           }
         }
 
+
         try {
           graph_g.expand_hp(pipeline_g, library_g);
           FINS_LOG_INFO("[agent] pipeline applied: {} vertices", graph_g.dag.size());
@@ -267,12 +274,33 @@ int main(int argc, char **argv) {
           FINS_LOG_ERROR("[agent] pipeline apply failed: {}", e.what());
         }
 
+#if FINS_TIMING
+        const long long expand_us = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - _e0).count();
+        expand_latency.push_back(expand_us);
+        FINS_LOG_INFO("[agent] expand_hp cost {} us", expand_us);
+#endif
+
         graph_g.pending = false;   // 已应用（成功/失败均清除，勿残留导致 commit 翻到未写份交替重建）
         graph_g.cv.notify_all();
+
         continue;
       }
       if (graph_g.hyper_period_ms > 0 && graph_g.is_hp_done() && !graph_g.pending.load()) {
+
+#if FINS_TIMING
+        const auto _r0 = std::chrono::steady_clock::now();   // rollover_hp 回绕计时起点
+#endif
+
         graph_g.rollover_hp();
+
+#if FINS_TIMING
+        const long long rollover_us = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - _r0).count();
+        rollover_latency.push_back(rollover_us);
+        FINS_LOG_INFO("[agent] rollover_hp cost {} us", rollover_us);
+#endif
+
         graph_g.cv.notify_all();
         continue;
       }
@@ -304,7 +332,18 @@ int main(int argc, char **argv) {
       for (size_t i = 0; i < n; ++i)
         ofs << wid << ',' << i << ',' << eq[i] << ',' << (*iq)[i] << '\n';
     }
-    FINS_LOG_INFO("[agent] exec/idle 原始样本已写入 exec_stats.csv");
+    ofs.close();
+  }
+  // ── CSV 导出：主线程 expand/rollover 耗时样本（kind: expand=建图 / rollover=超周期回绕）──
+  {
+    std::ofstream ofs("main_loop_stats.csv");
+    ofs << "kind,idx,us,extra\n";
+    for (size_t i = 0; i < expand_latency.size(); ++i)
+      ofs << "expand," << i << ',' << expand_latency[i] << ",\n";
+    for (size_t i = 0; i < rollover_latency.size(); ++i)
+      ofs << "rollover," << i << ',' << rollover_latency[i] << ",\n";
+    ofs << "\n";
+    ofs.close();
   }
 #endif
 
