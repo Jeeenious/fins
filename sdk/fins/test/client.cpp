@@ -173,9 +173,11 @@ int main(int argc, char **argv) {
   });
   ThreadPool::instance().start(num_workers);
 
-  // ── 停止信号：SIGINT/SIGTERM → 置停止位唤醒 main 循环与 worker ──
-  std::signal(SIGINT,  [](int) { graph_g.stopped = true; graph_g.cv.notify_all(); });
-  std::signal(SIGTERM, [](int) { graph_g.stopped = true; graph_g.cv.notify_all(); });
+  // ── 停止信号：SIGINT/SIGTERM → 只置原子停止位（async-signal-safe；不调 cv.notify_all——
+  //    condition_variable 非 async-signal-safe，信号上下文调 stdlib 是 UB）。
+  //    主循环/worker/计时线程全部 cv.wait_for(1ms) 兜底超时，1ms 内自行醒来看到 stopped 退出。──
+  std::signal(SIGINT,  [](int) { graph_g.stopped = true; });
+  std::signal(SIGTERM, [](int) { graph_g.stopped = true; });
   FINS_LOG_INFO("[agent] listening on :{} plugin_dir={}", rpc_port, plugin_dir);
 
   // ── 计时线程：与 worker 完全对称——grab tp 延迟时间点 → 锁外执行其 sleep job → 回锁置 Finished
@@ -287,14 +289,20 @@ int main(int argc, char **argv) {
   // ── 回收：先置停止位唤醒全部线程 → 计时线程 → worker → 组件 stop ──
   graph_g.stopped = true;
   graph_g.cv.notify_all();
-  if (timer_th.joinable()) timer_th.join();   // 回收计时线程（可能在 tp->job() 睡到释放点，join 等其退出）
+  FINS_LOG_INFO("[agent] teardown: join timer thread");
+  if (timer_th.joinable()) timer_th.join();
+  FINS_LOG_INFO("[agent] teardown: stop thread pool");
   ThreadPool::instance().stop();
+  FINS_LOG_INFO("[agent] teardown: stop remote call listener");
   RPCListener::instance().stop();
+  FINS_LOG_INFO("[agent] teardown: stop plugin dir watchdog");
   PluginLoader::instance().stop();
+  FINS_LOG_INFO("[agent] teardown: stop hardware monitor");
   HardwareMonitor::instance().stop();
 
 #if FINS_TIMING
   // ── CSV 导出：每 worker 的原始 exec/idle 样本序列（exec 与 idle 一一配对；供离线分析/绘图）──
+  FINS_LOG_INFO("[agent] exporting timing data");
   {
     std::ofstream ofs("exec_stats.csv");
     ofs << "wid,idx,exec_us,idle_us\n";

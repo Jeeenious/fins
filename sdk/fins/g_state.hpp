@@ -680,12 +680,14 @@ namespace fins::rt {
         v.id     = id;
         v.name   = "time";
         v.period = off;   // 相对 hyper_start_ms 的释放偏移（timer grab_delay_workload 读，非周期）
-        v.job = [this, off]() {   // 延迟执行体：timer 拿到 w 直接 job() 即 sleep_until 到绝对释放时刻；
-                                  // job 内实时读 hyper_start_ms → rollover 平移后自动对齐新起点，无漂移
+        v.job = [this, off]() {   // 延迟执行体：timer 拿到 w 直接 job() 即睡到绝对释放时刻；
+                                  // job 内实时读 hyper_start_ms → rollover 平移后自动对齐新起点，无漂移；
+                                  // 1ms 步进轮询 stopped → 停止信号下最多 ~1ms 退出，不被长延迟拖住 join
           const double at = hyper_start_ms + off;
           const auto until = std::chrono::steady_clock::now()
               + std::chrono::microseconds((long long)(at - fins::util::now_ms()) * 1000ll);
-          std::this_thread::sleep_until(until);
+          while (!stopped.load() && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         };
         dag.add_node(id, std::move(v));
       }
