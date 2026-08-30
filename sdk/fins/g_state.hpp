@@ -135,10 +135,10 @@ namespace fins::rt {
      *  与 Pipeline::algo_keys() 配套供装配点做算法就绪检查（expand_hp 前比对）。
      * @retval std::set<std::string> 全部已注册算法键（去重）
      */
-    std::set<std::string> algo_keys() const {
+    [[nodiscard]] std::set<std::string> algo_keys() const {
       std::set<std::string> keys;
-      for (auto it = so_ctx.begin(); it != so_ctx.end(); ++it)
-        for (const auto &k : it->second->loaded_keys)
+      for (const auto &val: so_ctx | std::views::values)
+        for (const auto &k : val->loaded_keys)
           keys.insert(k);
       return keys;
     }
@@ -152,9 +152,9 @@ namespace fins::rt {
     std::string name;                                    // 算法名（[name:version] = so 表定位键）
     std::string version;                                 // 算法版本（定位键）
 
-    float period{0};                                     // 执行周期（ms；0 = 未配置，走支配继承）
-    float deadline{1};                                   // 相对截止期（ms；缺省已折成 wcet）
-    float wcet{1};                                       // 最坏执行时间（ms；缺省 1）
+    double period{0};                                    // 执行周期（ms；0 = 未配置，走支配继承）
+    double deadline{1};                                  // 相对截止期（ms；缺省已折成 wcet）
+    double wcet{1};                                      // 最坏执行时间（ms；缺省 1）
     int priority{0};                                     // 调度优先级（缺省 0；expand_hp ⑥ 填顶点 Workload.priority 初值）
     size_t cap{10};                                     // 滑动窗口容量（hist 长度：loop 反馈历史槽每端口保留帧数；默认 10，config 顶层 "cap" 可配）
 
@@ -162,8 +162,8 @@ namespace fins::rt {
     std::vector<std::string> output_ports;
     std::vector<nlohmann::json> config_cache;
 
-    std::map<std::string, float> loop_timer;                 // loop 端口 → 定义（显式端口补充定义）
-    std::map<std::string, float> loop_step;                  // loop 端口 → 定义（显式端口补充定义）
+    std::map<std::string, double> loop_timer;                // loop 端口 → 定义（显式端口补充定义）
+    std::map<std::string, double> loop_step;                 // loop 端口 → 定义（显式端口补充定义）
 
     /** @brief 逐节点自解析：全部结构校验 + 字段抽取（Pipeline::parse 只拆封顶层后逐个调用
      *  本构造器）。parameters 为**位置式取值表** config_cache——只取 p["value"]、名字丢弃
@@ -217,9 +217,9 @@ namespace fins::rt {
       id       = n["id"].get<std::string>();
       name     = n["name"].get<std::string>();
       version  = n["version"].get<std::string>();
-      period   = n.contains("period")   ? n["period"].get<float>()   : 0.0f;
-      wcet     = n.contains("wcet")     ? n["wcet"].get<float>()     : 1.0f;
-      deadline = n.contains("deadline") ? n["deadline"].get<float>() : wcet;  // 缺省 = wcet
+      period   = n.contains("period")   ? n["period"].get<double>()   : 0.0;
+      wcet     = n.contains("wcet")     ? n["wcet"].get<double>()     : 1.0;
+      deadline = n.contains("deadline") ? n["deadline"].get<double>() : wcet;  // 缺省 = wcet
       priority = n.contains("priority") ? n["priority"].get<int>()   : 0;    // 缺省 0
       cap      = n.contains("cap")      ? n["cap"].get<size_t>() : 10;        // 缺省 10
       if (n.contains("inputs") && n["inputs"].is_array())
@@ -230,8 +230,8 @@ namespace fins::rt {
         for (const auto &[mode, ports] : n["loop"].items()) {
           if (!ports.is_object()) continue;
           for (const auto &[port, arg] : ports.items()) {
-            if (mode == "timer") loop_timer[port] = arg.get<float>();  // 观测周期 ms
-            else                loop_step[port]  = arg.get<float>();  // 迭代步 N
+            if (mode == "timer") loop_timer[port] = arg.get<double>();  // 观测周期 ms
+            else                loop_step[port]  = arg.get<double>();  // 迭代步 N
           }
         }
       }
@@ -304,7 +304,7 @@ namespace fins::rt {
      *  不能清空）。
      * @retval std::vector<std::string> 每节点 name:version（顺序 = nodes 顺序；同算法多节点可出现重复键）
      */
-    std::vector<std::string> algo_keys() const {
+    [[nodiscard]] std::vector<std::string> algo_keys() const {
       std::vector<std::string> keys;
       keys.reserve(nodes.size());
       for (const auto &node : nodes)
@@ -338,11 +338,11 @@ namespace fins::rt {
     size_t k{0};                  // 超周期内实例序号（expand_hp ⑥ 建顶点填；update_abs_deadline 滚动校正用）
 
 
-    float period{0};
-    float deadline{1};            // 相对截止期（ms；缺省 = wcet）
+    double period{0};
+    double deadline{1};           // 相对截止期（ms；缺省 = wcet）
 
-    float ddl{0};                 // 绝对截止期（ms；滚动排期 = 主线程事件驱动 update_abs_deadline 按当前
-    float wcet{1};                // 最坏执行时间（ms；缺省 1）
+    double ddl{0};                // 绝对截止期（ms；滚动排期 = 主线程事件驱动 update_abs_deadline 按当前
+    double wcet{1};               // 最坏执行时间（ms；缺省 1）
     int priority{0};
 
     std::function<void()> job;    // 执行体（闭包捕获实例 + 节点配置，执行时现查边取帧/发布）
@@ -357,8 +357,8 @@ namespace fins::rt {
     //    on_execute 回调 / 主线程调度循环）──
     util::DirectedAcyclicGraph<Workload, Message> dag;  // 顶点带权、边=Message 槽
 
-    float hyper_period_ms{0};       // 超周期长度（ms）
-    float hyper_start_ms{0};    // 当前超周期起点（ms；expand 初始化 = 当前真实时钟、rollover_hp 回绕更新 = 当前真实时钟）
+    double hyper_period_ms{0};       // 超周期长度（ms）
+    double hyper_start_ms{0};    // 当前超周期起点（ms；expand 初始化 = 当前真实时钟、rollover_hp 回绕更新 = 当前真实时钟）
 
     // ── 历史数据统计（loop 反馈滑动窗口，按输出端口名）
     std::map<std::string, size_t> mesg_hist_cap{};   // 滑动窗口容量（expand_hp 填充：loop 反馈输出端口 → producer 节点 NodeInfo.cap，默认 10 可配；expand_hp 重建时清空重算；运行时只读无并发写）
@@ -441,20 +441,20 @@ namespace fins::rt {
 
     /** @brief ② 超周期：lcm(全部显式周期节点 period)（无周期节点 → 返回 0 不回绕）。
      * @param nodes 解析态节点表（只读；只统计 info.period > 0 的节点）
-     * @retval float 超周期长度（ms）；无周期节点返回 0
+     * @retval double 超周期长度（ms）；无周期节点返回 0
      */
-    static float build_hyper_period(const std::vector<NodeInfo> &nodes) {
-      long long hp = 1;
+    static double build_hyper_period(const std::vector<NodeInfo> &nodes) {
+      double hp = 1;
       bool any_periodic = false;
       for (const auto &info : nodes) {
-        const float T = info.period;   // 已由 parse 抽取
+        const double T = info.period;   // 已由 parse 抽取
         if (T <= 0) continue;
         any_periodic = true;
-        long long a = hp, b = (long long)(T + 0.5f);
-        while (b) { long long r = a % b; a = b; b = r; }   // a = gcd(hp, T)
-        hp = (hp / a) * (long long)(T + 0.5f);
+        double a = hp, b = T + 0.5;
+        while (b > 1e-9) { double r = fmod(a, b); a = b; b = r; }   // a = gcd(hp, T)
+        hp = (hp / a) * (T + 0.5);   // lcm(hp, T) = hp * T / gcd(hp, T)
       }
-      return any_periodic ? (float)hp : 0.0f;
+      return any_periodic ? hp : 0.0;
     }
 
     /** @brief ③ 拓扑序：BFS 从源展开（生产者先于消费者）；环未覆盖的节点补入末尾。
@@ -546,29 +546,29 @@ namespace fins::rt {
     static void build_dominance(const std::vector<std::string> &topo,
                                 const std::map<std::string, const NodeInfo *> &by_info,
                                 const std::map<std::string, std::vector<std::string>> &producers,
-                                const float hyper_period,
-                                std::map<std::string, float> &period_final,
+                                const double hyper_period,
+                                std::map<std::string, double> &period_final,
                                 std::map<std::string, size_t> &node_count) {
       for (const auto &id : topo) {
         const auto *info = by_info.at(id);
-        float T = info->period;                    // 显式配置周期（0 = 未配置 → 走继承）
+        double T = info->period;                   // 显式配置周期（0 = 未配置 → 走继承）
         if (T <= 0) {
           // 未配置 → 继承前级：多前级取最短周期前级（topo 序保证前级已定最终周期）
           std::string trig;
-          float best = 0;
+          double best = 0;
           for (const auto &pn : info->input_ports)
-            if (!info->loop_timer.count(pn) && !info->loop_step.count(pn)) {  // loop 端口：反馈 producer 是自身，不参与继承
+            if (!info->loop_timer.contains(pn) && !info->loop_step.contains(pn)) {  // loop 端口：反馈 producer 是自身，不参与继承
               auto pit = producers.find(pn);
               if (pit == producers.end()) continue;   // 孤立输入端口（无 producer）→ 无继承源
               for (const auto &p : pit->second) {
-                const float pt = period_final.count(p) ? period_final[p] : 0;
+                const double pt = period_final.contains(p) ? period_final[p] : 0;
                 if (trig.empty() || pt < best) { trig = p; best = pt; }
               }
             }
-          T = (!trig.empty() && period_final.count(trig)) ? period_final[trig] : 0.0f;
+          T = (!trig.empty() && period_final.contains(trig)) ? period_final[trig] : 0.0;
         }
         period_final[id] = T;
-        node_count[id] = (T > 0) ? (size_t)(hyper_period / T + 0.5f) : 1;
+        node_count[id] = (T > 0) ? static_cast<size_t>(std::lround(hyper_period / T)) : 1;
       }
     }
 
@@ -583,7 +583,7 @@ namespace fins::rt {
      */
     static void build_vertex(util::DirectedAcyclicGraph<Workload, Message> &dag,
                                const std::vector<NodeInfo> &nodes,
-                               const std::map<std::string, float> &period_final,
+                               const std::map<std::string, double> &period_final,
                                const std::map<std::string, size_t> &node_count) {
       for (const auto &info : nodes) {
         const size_t N = node_count.at(info.id);
@@ -655,15 +655,15 @@ namespace fins::rt {
      */
     void pin_sync(const std::vector<NodeInfo> &nodes,
                   const std::map<std::string, size_t> &node_count) {
-      std::set<float> S;   // 同步点集合：显式周期节点释放时刻并集（去重升序）
+      std::set<double> S;   // 同步点集合：显式周期节点释放时刻并集（去重升序）
       for (const auto &info : nodes) {
         if (info.period <= 0) continue;
         const size_t N = node_count.at(info.id);
-        for (size_t k = 0; k < N; ++k) S.insert((float)k * info.period);
+        for (size_t k = 0; k < N; ++k) S.insert((double)k * info.period);
       }
-      std::map<float, std::string> tp_id;   // 偏移 → 时间点顶点 id（序号化，无精度碰撞）
+      std::map<double, std::string> tp_id;   // 偏移 → 时间点顶点 id（序号化，无精度碰撞）
       size_t seq = 0;
-      for (const float off : S) tp_id[off] = "tp:" + std::to_string(seq++);
+      for (const double off : S) tp_id[off] = "tp:" + std::to_string(seq++);
       for (const auto &[off, id] : tp_id) {
         Workload v;
         v.id     = id;
@@ -671,7 +671,7 @@ namespace fins::rt {
         v.period = off;   // 相对 hyper_start_ms 的释放偏移（timer grab_delay_workload 读，非周期）
         v.job = [this, off]() {   // 延迟执行体：timer 拿到 w 直接 job() 即 sleep_until 到绝对释放时刻；
                                   // job 内实时读 hyper_start_ms → rollover 平移后自动对齐新起点，无漂移
-          const float at = hyper_start_ms + off;
+          const double at = hyper_start_ms + off;
           const auto until = std::chrono::steady_clock::now()
               + std::chrono::microseconds((long long)(at - fins::util::now_ms()) * 1000ll);
           std::this_thread::sleep_until(until);
@@ -682,7 +682,7 @@ namespace fins::rt {
         if (info.period <= 0) continue;
         const size_t N = node_count.at(info.id);
         for (size_t k = 0; k < N; ++k) {
-          const float off = (float)k * info.period;
+          const double off = (double)k * info.period;
           dag.add_edge(tp_id.at(off), info.id + ":" + std::to_string(k), "time", Message{});
         }
       }
@@ -703,7 +703,7 @@ namespace fins::rt {
      * @param node_count 节点 id → job 实例数（只读）
      * @retval 无
      */
-    void bind_job(const std::vector<NodeInfo> &nodes, float hyper_period,
+    void bind_job(const std::vector<NodeInfo> &nodes, double hyper_period,
                     const std::map<std::string, std::shared_ptr<AlgoBase>> &by_id,
                     const std::map<std::string, size_t> &node_count) {
       for (const auto &info : nodes) {
@@ -720,7 +720,7 @@ namespace fins::rt {
         // step 定长迭代步 N；timer 观测周期/节点周期 → 窗口帧数（ceil）。
         std::map<std::string, size_t> loop_w;   // loop 端口 → 聚合窗口（帧数，恒长定长）
         if (!info.loop_step.empty() || !info.loop_timer.empty()) {
-          const float Tnode = (n > 0 && hyper_period > 0) ? hyper_period / (float)n : 0.0f;
+          const double Tnode = (n > 0 && hyper_period > 0) ? hyper_period / (double)n : 0.0;
           for (const auto &[port, arg] : info.loop_step)
             loop_w[port] = (size_t)arg;   // "step"：迭代步 N（定长窗口）
           for (const auto &[port, arg] : info.loop_timer)
@@ -826,7 +826,7 @@ namespace fins::rt {
       build_instances(nodes, so_ctx, by_id, by_info);
 
       // ⑤ 支配周期 + 实例数
-      std::map<std::string, float> period_final;
+      std::map<std::string, double> period_final;
       std::map<std::string, size_t> node_count;
       build_dominance(topo, by_info, producers, hyper_period_ms, period_final, node_count);
 
@@ -841,9 +841,6 @@ namespace fins::rt {
 
       // ⑧ job 闭包
       bind_job(nodes, hyper_period_ms, by_id, node_count);
-
-      // todo 更新 ddl
-      // todo 更新 wcet
     }
 
     /**
@@ -916,7 +913,7 @@ namespace fins::rt {
      * @retval Workload* 图内时间点顶点指针；nullptr = 无待释放时间点
      */
     Workload *grab_delay_workload() {
-      float best_off = std::numeric_limits<float>::max();
+      double best_off = std::numeric_limits<double>::max();
       std::optional<std::string> best;
       dag.for_each_vertex([&](const std::string &id, const Workload &w) {
         if (w.state != Workload::State::Pending) return;   // 仅 Pending 时间点
@@ -939,14 +936,14 @@ namespace fins::rt {
      * @retval 无
      */
     void update_abs_deadline() {
-      const float now = fins::util::now_ms();
-      const float period = hyper_period_ms;
+      const double now = fins::util::now_ms();
+      const double period = hyper_period_ms;
       dag.for_each_vertex([&](const std::string &, Workload &v) {
         if (!v.job) return;
-        float start = hyper_start_ms;
+        double start = hyper_start_ms;
         if (period > 0 && now > start + period)
           start += std::floor((now - start) / period) * period;
-        v.ddl = start + (float)(v.k + 1) * v.deadline;
+        v.ddl = start + (double)(v.k + 1) * v.deadline;
       });
     }
   };
