@@ -2,34 +2,6 @@
 // agent_main — 独立功能测试主程序（接收外部 JSON 配置启动数据流调度）
 // ============================================================================
 //
-// 内部逻辑：
-//   main 作为装配点，把业务回调注册进组件（组件不感知业务），随后阻塞在
-//   main 调度循环直到收到停止信号：
-//   1. 插件加载（main 开头 create_directories 后）：装配点遍历 plugin_dir 存量装载 .so
-//      → make_shared<Plugin>(path) → SET library_g.so_ctx（Guard/PluginLoader 不承担存量扫描）；
-//      增量热加载由 PluginLoader::on_library_add/modify/delete 回调维护（SET/ERASE 由装配点做）。
-//   2. RPCListener::on_pipeline_update("/update") — 收包：存原始 JSON 到
-//      pipeline_g.cache.write()（不解析，HTTP 恒 200）+ 直写 graph_g.pending = true
-//      + cv.notify_all()；建图由 main 调度循环图静止时 commit + parse_pipeline
-//      + check_topology + expand_hp 就地重建。
-//   3. RPCListener::on_library_add/modify/delete 路由 — .so 上传接口（本测试用
-//      插件目录扫描即可，路由保留作远程注入备选）。
-//   4. ThreadPool::on_execute — worker 带锁单步事务：持 graph_g.mtx 拉取最优先
-//      就绪（grab_ready_workload 置 Running，返回图内顶点 Workload*）→ 锁外
-//      w->job() 执行 → 回锁直做完成事件（w->state = Finished + cv.notify_all()）。
-//   main 调度循环（事件驱动）：被 worker 完成 / 计时线程释放 / pending 任一 notify
-//   唤醒后集中做状态与优先级更新（update_abs_deadline + priority_updater，不回固定
-//   1ms 轮询；时间推进不在此做）；图静止 is_hp_done() → 有配置（pending）commit +
-//   parse + check_topology + check_algo_ready（算法插件未全部注册 → 图不动保持旧图、
-//   库热加载 on_library_* notify 唤醒重试）+ expand_hp / 有超周期 rollover_hp 回绕，
-//   两者后各调 wcet_updater 一次（超周期开始刷新 wcet）→ 否则 cv.wait() 纯事件等待。
-//   计时线程：与 worker 完全对称——grab_delay_workload 拿最近待释放时间点（tp 顶点，
-//   建图时已写入 job = sleep_until 绝对释放时刻）→ 置 Running → 锁外执行 tp->job()
-//   （即睡到点）→ 回锁直做完成事件（Finished + notify），与 worker 完成事件共同唤醒
-//   主线程调度循环。延迟只在此线程执行，不占 worker。
-//   SIGINT/SIGTERM → graph_g.stopped = true + cv.notify_all() 退出循环 → 回收
-//   （置停止位唤醒全部 → timer_th.join() → pool.stop() → RPC.stop() → loader.stop()）。
-//
 // 资源消耗：
 //   - 线程：main 主线程（调度循环）+ 1 个计时线程（时间点释放）+ 2 个绑核 worker
 //           （thread_pool start 参数）+ RPC 1 个监听线程 + HTTP 请求并发池（start 参数）
@@ -163,7 +135,6 @@ int main(int argc, char **argv) {
 #endif
 
       if (auto w = graph_g.grab_ready_workload()) {
-        w->state = Workload::State::Running;   // 拉取置 Running
         lk.unlock();
 
 #if FINS_TIMING
@@ -172,14 +143,21 @@ int main(int argc, char **argv) {
 
         w->job();
 
-#if FINS_TIMING
-      const long long exec_us = std::chrono::duration<double, std::micro>(
-          std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（job 闭包总时长）
-#endif
+// #if FINS_TIMING
+//       const long long exec_us = std::chrono::duration<double, std::micro>(
+//         std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（job 闭包总时长）
+// #endif
 
         lk.lock();
-        w->state = Workload::State::Finished;   // 回锁直做完成事件
+
+        graph_g.sign_done_workload(w->id);   // 回锁直做完成事件：置 done + 传播 pred_left + 入 ready
+
         graph_g.cv.notify_all();
+
+#if FINS_TIMING
+const long long exec_us = std::chrono::duration<double, std::micro>(
+std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（job 闭包总时长）
+#endif
 
 #if FINS_TIMING
       const long long idle_us = std::chrono::duration<double, std::micro>(
@@ -193,7 +171,7 @@ int main(int argc, char **argv) {
       graph_g.cv.wait_for(lk, std::chrono::milliseconds(1));   // 等完成/回绕/expand_hp/停止（notify 快路径 + 1ms 超时兜底 lost wakeup）
     }
   });
-  ThreadPool::instance().start(2);
+  ThreadPool::instance().start(15);
 
   // ── 停止信号：SIGINT/SIGTERM → 置停止位唤醒 main 循环与 worker ──
   std::signal(SIGINT,  [](int) { graph_g.stopped = true; graph_g.cv.notify_all(); });
@@ -207,11 +185,10 @@ int main(int argc, char **argv) {
     std::unique_lock tl(graph_g.mtx);
     while (!graph_g.stopped.load()) {
       if (auto tp = graph_g.grab_delay_workload()) {
-        tp->state = Workload::State::Running;   // 拉取置 Running（同 worker）
         tl.unlock();
         tp->job();                              // 锁外执行：sleep_until 睡到释放时刻（延迟实现）
         tl.lock();
-        tp->state = Workload::State::Finished;  // 回锁直做完成事件
+        graph_g.sign_done_workload(tp->id);   // 回锁直做完成事件：置 done + 传播 pred_left（释放后继 job 顶点）
         graph_g.cv.notify_all();
         continue;
       }
@@ -278,7 +255,6 @@ int main(int argc, char **argv) {
         const long long expand_us = std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - _e0).count();
         expand_latency.push_back(expand_us);
-        FINS_LOG_INFO("[agent] expand_hp cost {} us", expand_us);
 #endif
 
         graph_g.pending = false;   // 已应用（成功/失败均清除，勿残留导致 commit 翻到未写份交替重建）
@@ -286,7 +262,7 @@ int main(int argc, char **argv) {
 
         continue;
       }
-      if (graph_g.hyper_period_ms > 0 && graph_g.is_hp_done() && !graph_g.pending.load()) {
+      if (!graph_g.is_hp_empty() && graph_g.is_hp_done()) {   // 有超周期才回绕（一次性图保持静止，防清 done_ 后 is_hp_done 变 false → 新配置永不 apply）
 
 #if FINS_TIMING
         const auto _r0 = std::chrono::steady_clock::now();   // rollover_hp 回绕计时起点
@@ -298,7 +274,6 @@ int main(int argc, char **argv) {
         const long long rollover_us = std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - _r0).count();
         rollover_latency.push_back(rollover_us);
-        FINS_LOG_INFO("[agent] rollover_hp cost {} us", rollover_us);
 #endif
 
         graph_g.cv.notify_all();

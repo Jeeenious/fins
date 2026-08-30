@@ -10,7 +10,7 @@
 // 集中存放跨组件共享的运行时状态：pipeline_g（解析态 Pipeline：cache JSON 双缓冲 +
 // parse_pipeline/check_topology 两段解析）+ library_g（算法定位表 so_ctx）+ graph_g
 // （PrecedenceGraph 单份运行图 + 调度依据；公开成员 mtx/cv/stopped/pending + 无锁原语
-// check_algo_ready/expand_hp/grab_ready_workload/grab_delay_workload/is_hp_done/rollover_hp）。
+// expand_hp/grab_ready_workload/grab_delay_workload/is_hp_done/is_hp_empty/rollover_hp/on_job_done）。
 // 数据流：RPC 存 JSON → pending → 主线程调度循环图静止时 commit+parse+check_topology+expand_hp 重建。
 // 装配点写法与语义细节见 docs/precedence_graph_design.md 及各类型前注释。
 // ============================================================================
@@ -37,6 +37,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -325,18 +326,13 @@ namespace fins::rt {
   };
   inline Pipeline pipeline_g;
 
-  /** @brief 图顶点 = 正常 job 实例 + 多维权值 + 生命周期状态（调度依据）。job 闭包只执行不碰
-   *  state（Running 由 grab_ready_workload 拉取置、Finished 由装配点回锁直做、回绕重置 Pending）；
-   *  priority = 调度优先级（grab_ready_workload 选最优先就绪）；就绪 = 前序全 Finished。 */
+  /** @brief 图顶点 = 正常 job 实例 + 多维权值（纯数据，无生命周期状态——就绪/完成由
+   *  PrecedenceGraph 侧增量状态 pred_left_/done_/ready_ 判定，装配点完成事件回锁调 on_job_done）。
+   *  priority = 调度优先级（priority_updater 预留更新；当前 ready_ FIFO 不参与排序）。 */
   struct Workload {
-    /** @brief 顶点生命周期状态（标记"走到哪一步"，非"是什么"——顶点类别由 job 是否非空区分）。 */
-    enum class State { Pending, Ready, Running, Finished };
-    State state{State::Pending};  // 生命周期：拉取（grab_ready_workload）置 Running → 装配点回锁直做置 Finished；回绕重置 Pending
-
     std::string id{};             // 顶点名（格式 {节点id}:{k}，如 cam:0/cam:1）——expand_hp ⑥ 建顶点时填 vtx（同 dag 的 map 键）；
     std::string name{};           // 节点名（来自 Pipeline::NodeInfo.name；区别于 id 顶点名 = {name}:{k}）——装配点/测试按节点名识别
     size_t k{0};                  // 超周期内实例序号（expand_hp ⑥ 建顶点填；update_abs_deadline 滚动校正用）
-
 
     double period{0};
     double deadline{1};           // 相对截止期（ms；缺省 = wcet）
@@ -351,7 +347,9 @@ namespace fins::rt {
   /** @brief PrecedenceGraph — 数据流图 + 调度依据（单份运行图 graph_g）。公开成员 = 调度状态
    *  mtx/cv/stopped/pending + 图数据 dag（DAG<Workload, Message>，顶点 {id}:{k}、边=绑定边
    *  Message 槽）+ 超周期/hyper_start_ms + 历史统计（mesg_hist_cap/message_hist_/exec_us_hist_/exec_hist_cap）。
-   *  方法全为无锁原语（expand_hp/grab_ready_workload/is_hp_done/rollover_hp 等），调用方持 mtx。 */
+   *  就绪 = pred_left 增量计数（私有 pred_left_/in_degree_/done_/ready_）。方法全为无锁原语
+   *  （expand_hp/grab_ready_workload/grab_delay_workload/is_hp_done/is_hp_empty/rollover_hp/on_job_done），
+   *  调用方持 mtx。 */
   struct PrecedenceGraph {
     // ── public：图数据 + 无锁原语（方法不碰锁，前提调用方持 mtx；带锁事务在装配点
     //    on_execute 回调 / 主线程调度循环）──
@@ -401,6 +399,12 @@ namespace fins::rt {
     std::atomic<bool> pending{false};
 
   private:
+    // ── 就绪增量调度状态（私有；持 mtx 访问，装配点经无锁原语间接使用）──
+    std::map<std::string, size_t> pred_left_;   // 剩余未完成前序数（含 seq/绑定/tp 挂靠边）
+    std::map<std::string, size_t> in_degree_;   // 入度基准（expand 填；rollover 重置 pred_left_ 用）
+    std::set<std::string> done_;                // 已完成顶点集（job+tp 全计；is_hp_done 计数 + tp 防重拉）
+    std::deque<std::string> ready_;             // 就绪 FIFO（pred_left 减到 0 入队；grab 队首出；priority 预留）
+
     /** @brief ① 端口索引：输出/输入端口名 → 节点 + 一跳邻居（loop 端口跳过——反馈 producer
      *  是自身，无绑定边）。单写者约束已在 Pipeline::check_topology 校验（同名输出端口多 producer
      *  拒绝），这里只建索引供拓扑/继承周期用；先预建所有节点的一跳邻居条目（空集）→ ③ 拓扑序
@@ -440,21 +444,26 @@ namespace fins::rt {
     }
 
     /** @brief ② 超周期：lcm(全部显式周期节点 period)（无周期节点 → 返回 0 不回绕）。
+     *  整数毫秒 lcm（std::lcm）：period 就近取整为整数毫秒后参与整数 lcm——gcd 恒整数，无浮点
+     *  病态（旧 T+0.5 hack 会静默算错：lcm(1,100.5)=201 而非 100）。非整数毫秒 period 不拒绝，
+     *  FINS_LOG_WARN 提示后就近取整继续（周期小数毫秒按整数毫秒近似，实例数可能偏差，预警）。
      * @param nodes 解析态节点表（只读；只统计 info.period > 0 的节点）
      * @retval double 超周期长度（ms）；无周期节点返回 0
      */
     static double build_hyper_period(const std::vector<NodeInfo> &nodes) {
-      double hp = 1;
+      long long hp = 1;   // 整数毫秒 lcm 累乘
       bool any_periodic = false;
       for (const auto &info : nodes) {
-        const double T = info.period;   // 已由 parse 抽取
+        const double T = info.period;   // ms（已由 parse 抽取）
         if (T <= 0) continue;
         any_periodic = true;
-        double a = hp, b = T + 0.5;
-        while (b > 1e-9) { double r = fmod(a, b); a = b; b = r; }   // a = gcd(hp, T)
-        hp = (hp / a) * (T + 0.5);   // lcm(hp, T) = hp * T / gcd(hp, T)
+        const long long Ti = std::llround(T);   // 就近取整毫秒
+        if (std::abs(T - (double)Ti) > 1e-6)   // 非整数毫秒：不拒绝，WARN + 就近取整继续
+          FINS_LOG_WARN("[build_hyper_period] 节点 '{}' period 非整数毫秒: {}，就近取整为 {}ms",
+                        info.id, T, Ti);
+        hp = std::lcm(hp, Ti);   // 整数 lcm：gcd 恒整数，无浮点病态
       }
-      return any_periodic ? hp : 0.0;
+      return any_periodic ? static_cast<double>(hp) : 0.0;
     }
 
     /** @brief ③ 拓扑序：BFS 从源展开（生产者先于消费者）；环未覆盖的节点补入末尾。
@@ -731,8 +740,9 @@ namespace fins::rt {
           dag.mutate_vertex(vtx, [this, sinfo, algo, vtx, loop_w](Workload &v) {
             v.id = vtx;   // 顶点名现拼 {节点id}:{k} → Workload.id 实际填充（grab_ready_workload 返回 Workload* 含 id，装配点直做完成事件用）
             v.job = [this, sinfo, algo, vtx, loop_w]() {
-              // 状态修改移出 job：Running 由 grab_ready_workload() 拉取时置、Finished 由 on_execute 回调事务
-              // 回锁直做置（完成事件不在闭包内）；本闭包只执行（打包输入 → execute → 路由输出）。
+              // 状态修改移出 job：就绪/完成由 PrecedenceGraph 侧增量状态（pred_left_/done_/ready_）
+              // 判定，装配点 on_execute 回调事务回锁调 on_job_done(id)（完成事件不在闭包内）；
+              // 本闭包只执行（打包输入 → execute → 路由输出）。
               // 输入：按 NodeInfo输入端口序打包 array（算法按位置取，不碰端口名）
               std::vector<Message> inputs(sinfo->input_ports.size());
               for (size_t i = 0; i < inputs.size(); ++i) {
@@ -793,17 +803,22 @@ namespace fins::rt {
      *        ① 端口索引 build_port_index → ② 超周期 build_hyper_period →
      *        ③ 拓扑序 build_topo_order → ④ 实例化 build_instances → ⑤ 支配周期/实例数
      *        build_dominance → ⑥ 建顶点 build_vertex → ⑦ 建边 build_edge → ⑦.5 时间链
-     *        build_sync_points（同步时间点顶点 + 挂靠边）→ ⑧ 填 job 闭包 bind_job。超周期起点 = 当前
-     *        真实时钟；只清 mesg_hist_cap 容量表，message_hist_ 历史槽跨重建保留不清。空配置 → 空图。
+     *        build_sync_points（同步时间点顶点 + 挂靠边）→ ⑧ 填 job 闭包 bind_job → ⑨ 就绪增量
+     *        初始化（pred_left_/in_degree_ 入度基准）。超周期起点 = 当前真实时钟；开头清调度增量
+     *        状态（pred_left_/in_degree_/done_/ready_），只清 mesg_hist_cap 容量表，
+     *        message_hist_ 历史槽跨重建保留不清。空配置 → 空图（调度状态一致清空）。
      * @param pipeline 解析态 Pipeline（调用方传 pipeline_g 或局部，取其 nodes 快照）
      * @param library  算法定位 Library（调用方传 library_g，取其 so_ctx 快照）
      * @retval 无
      */
     void expand_hp(const Pipeline &pipeline, const Library &library) {
-      dag.clear();
-      hyper_period_ms = 0;
       hyper_start_ms = fins::util::now_ms();   // 新配置展开起点 = 当前真实时钟（勿残留上次回绕后的起点）
       mesg_hist_cap.clear();   // 只清容量表（新配置重算）；message_hist_ 历史槽跨重建保留不清（同 exec_us_hist_）
+      pred_left_.clear();   // 就绪增量状态：空配置早退也一致清空
+      in_degree_.clear();
+      done_.clear();
+      ready_.clear();
+      dag.clear();
 
       const auto nodes = pipeline.nodes;   // 入参快照（拷贝，防外部改）
       const auto so_ctx = library.so_ctx;
@@ -841,89 +856,104 @@ namespace fins::rt {
 
       // ⑧ job 闭包
       bind_job(nodes, hyper_period_ms, by_id, node_count);
+
+      // ⑨ 就绪增量初始化：入度基准 + 初始就绪（两趟规避 range 内嵌套 accessor）——
+      //    有效配置源节点必显式 period → 必有 tp 门 → pred_left≥1，初始就绪为空，图启动由
+      //    timer 释放 tp:0（offset 0 ≈ hyper_start 立即）触发；此趟为无 tp 门顶点兜底。
+      std::vector<std::string> ids;
+      dag.for_each_vertex([&](const std::string &id, const Workload &) { ids.push_back(id); });
+      for (const auto &id : ids) {
+        const size_t deg = dag.in_nodes(id).size();
+        in_degree_[id] = deg;
+        pred_left_[id] = deg;
+      }
+      for (const auto &id : ids)
+        if (id.rfind("tp:", 0) != 0 && pred_left_[id] == 0)
+          ready_.push_back(id);
     }
 
     /**
      * @brief 超周期回绕（**无锁原语，前提调用方持 mtx**；主线程调度循环图静止时调用）：
-     *        起点更新为当前真实时钟 + **全部顶点**（job 任务 + 延迟时间点）重置 Pending
-     *        （seq 边不闭合，回绕后 {id}:{0} 由 grab_ready_workload 重新拉取；时间点由
-     *        计时线程 grab_delay_workload 重新拉取释放；loop 数据槽跨周期保留不清；abs_deadline 由
-     *        主线程事件驱动 update_abs_deadline 滚动校正，非本函数职责）。
+     *        起点更新为当前真实时钟 + 调度增量状态重置（done_/ready_ 清空、pred_left_ 重置回
+     *        in_degree_ 基准，不 clear dag——顶点对象存活）。回绕后全部顶点未完成：job 顶点由
+     *        前序完成事件（on_job_done 传播）逐级释放，源节点由其 tp 门被计时线程
+     *        grab_delay_workload 重新拉取释放（tp job 实时读 hyper_start_ms → 平移自动对齐新起点）；
+     *        loop 数据槽跨周期保留不清；abs_deadline 由主线程事件驱动 update_abs_deadline 滚动
+     *        校正，非本函数职责。
      * @retval 无
      */
     void rollover_hp() {
       hyper_start_ms = fins::util::now_ms();   // 起点更新为当前真实时钟
-      dag.for_each_vertex([&](const std::string &, Workload &v) {
-        v.state = Workload::State::Pending;   // 全部顶点（含时间点）重置待执行/待释放
-      });
+      done_.clear();
+      ready_.clear();   // 图静止时应空，防御清
+      for (auto &[id, pl] : pred_left_) pl = in_degree_.at(id);   // pred_left 重置回入度基准
     }
 
     /**
-     * @brief 图静止判定（**无锁原语，前提调用方持 mtx**；range 遍历只读 state，无嵌套 accessor）：
-     *        全部 job 顶点是否 Finished（无 Pending/Ready/Running 的执行体）。主线程调度循环
-     *        持锁调本原语，图静止后决定 expand_hp / rollover_hp / wait。
-     * @retval bool true = 图静止（全部执行体 Finished / 空图）
+     * @brief 图静止判定（**无锁原语，前提调用方持 mtx**）：已完成顶点数（含 tp 全计）== dag
+     *        顶点数。每顶点每超周期恰完成一次（on_job_done 幂等防御）→ done_.size() ≤ dag.size()；
+     *        主线程调度循环持锁调本原语，图静止后决定 expand_hp / rollover_hp / wait。
+     * @retval bool true = 图静止（全部顶点完成 / 空图 0==0）
      */
-    bool is_hp_done() {
-      bool idle = true;
-      dag.for_each_vertex([&](const std::string &id, const Workload &w) {
-        if (id.rfind("tp:", 0) == 0) return;   // 时间点不算执行体（图静止 = 计算任务链完成，tp 释放不阻塞回绕）
-        if (w.job && w.state != Workload::State::Finished) idle = false;
-      });
-      return idle;
-    }
+    bool is_hp_done() { return done_.size() == dag.size(); }
+
+    bool is_hp_empty() { return dag.size() == 0; }
 
     /**
-     * @brief 拉取最优先就绪顶点并置 Running（**无锁原语，前提调用方持 mtx**；装配点 on_execute
-     *        回调事务内部调用）。两趟扫描规避 TBBMap range 遍历锁内嵌套 accessor 死锁
-     *        （spin_rw_mutex 不可重入）：① for_each_vertex 只收集候选 id（Pending + 有执行体），
-     *        不嵌套 accessor；② 逐个候选查前序（in_nodes const_accessor）全 Finished 且
-     *        priority 最大者。
-     * @retval Workload* 图内顶点指针（含 id/job，state 已置 Running；图静止期间 expand/rollover
-     *                   不重建 → 稳定不悬垂）；nullptr = 无就绪顶点
+     * @brief 拉取就绪顶点（**无锁原语，前提调用方持 mtx**；装配点 on_execute 回调事务内部调用）：
+     *        FIFO 就绪集（ready_，pred_left 减到 0 时 on_job_done 入队）队首出 → mutate_vertex
+     *        回调取图内可变指针（无状态标记，pop 即隐式运行中）。ddl/priority 由主线程
+     *        update_abs_deadline / priority_updater 集中维护，非本函数职责。
+     * @retval Workload* 图内顶点指针（含 id/job；图静止期间 expand/rollover 不重建 → 稳定不悬垂）；
+     *                   nullptr = 无就绪顶点
      */
     Workload *grab_ready_workload() {
-      std::vector<std::string> cand;
-      dag.for_each_vertex([&](const std::string &id, const Workload &w) {
-        if (id.rfind("tp:", 0) == 0) return;   // 时间点由 timer 拉（延迟不能在线程池执行），worker 不碰
-        if (w.state == Workload::State::Pending && w.job) cand.push_back(id);
-      });
-      std::optional<std::string> best;
-      int best_p = std::numeric_limits<int>::min();
-      for (const auto &id : cand) {
-        if (dag.vertex(id).state != Workload::State::Pending) continue;
-        bool ok = true;
-        for (const auto &from : dag.in_nodes(id))
-          if (dag.vertex(from).state != Workload::State::Finished) { ok = false; break; }
-        if (ok && dag.vertex(id).priority > best_p) { best_p = dag.vertex(id).priority; best = id; }
-      }
-      if (!best) return nullptr;
-      Workload *picked = nullptr;   // vertex(id) 是 const 读取，须经 mutate_vertex 回调取可变指针
-      dag.mutate_vertex(*best, [&picked](Workload &x) { x.state = Workload::State::Running; picked = &x; });
-      return picked;   // 图内顶点指针（含 id/job；state 已是 Running；图静止期间 expand/rollover 不重建 → 稳定不悬垂）
+      if (ready_.empty()) return nullptr;
+      const std::string id = ready_.front();
+      ready_.pop_front();
+      Workload *picked = nullptr;
+      dag.mutate_vertex(id, [&picked](Workload &x) { picked = &x; });
+      return picked;
     }
 
     /**
      * @brief 拉取最近待释放时间点（**无锁原语，前提调用方持 mtx**；装配点计时线程调用，与
      *        grab_ready_workload 对称——worker 拿计算 job、timer 拿延迟时间点）：遍历 "tp:"
-     *        时间点顶点，找 Pending 中释放绝对时刻（hyper_start_ms + period）最近的一个返回
-     *        （图内指针；同超周期起点下 period 最小 = 最近释放）。timer 拿到后与 worker 对称：
-     *        置 Running → 锁外执行其 job（sleep_until 睡到释放时刻）→ 回锁置 Finished + notify。
-     *        无 Pending 时间点 → nullptr。
+     *        时间点顶点，找未完成（done_ 无此 id）中释放偏移（period = 相对 hyper_start_ms）最小的
+     *        一个返回（图内指针；同超周期起点下 period 最小 = 最近释放）。timer 拿到后与 worker
+     *        对称：锁外执行其 job（sleep_until 睡到释放时刻，job 内实时读 hyper_start_ms → rollover
+     *        平移自动对齐）→ 回锁 on_job_done + notify。全部已释放 → nullptr。
      * @retval Workload* 图内时间点顶点指针；nullptr = 无待释放时间点
      */
     Workload *grab_delay_workload() {
       double best_off = std::numeric_limits<double>::max();
       std::optional<std::string> best;
       dag.for_each_vertex([&](const std::string &id, const Workload &w) {
-        if (w.state != Workload::State::Pending) return;   // 仅 Pending 时间点
-        if (id.rfind("tp:", 0) != 0) return;               // id 前缀 "tp:" 识别时间点
+        if (id.rfind("tp:", 0) != 0 || done_.count(id)) return;   // 仅未释放时间点
         if (w.period < best_off) { best_off = w.period; best = id; }
       });
       if (!best) return nullptr;
-      Workload *picked = nullptr;   // mutate_vertex 回调取可变指针（同 grab_ready_workload）
+      Workload *picked = nullptr;
       dag.mutate_vertex(*best, [&picked](Workload &x) { picked = &x; });
       return picked;
+    }
+
+    /**
+     * @brief 完成事件（**无锁原语，前提调用方持 mtx**；装配点 worker/timer 回锁后调）：标记
+     *        id 完成（done_ 插入，幂等防御）→ 对每个后继 out_nodes 递减 pred_left_，减到 0 =
+     *        全部前序（含 seq/绑定/tp 挂靠边）完成 = 就绪，非 tp 者入 ready_ FIFO。job 完成与
+     *        tp 释放（tp 是 job 顶点前序，挂靠边）走同一传播路径。
+     * @param id 已完成顶点 id（job 顶点或 "tp:" 时间点顶点）
+     * @retval 无
+     */
+    void sign_done_workload(const std::string &id) {
+      if (!done_.insert(id).second) return;   // 幂等防御（正常每顶点恰完成一次）
+      for (const auto &s : dag.out_nodes(id)) {
+        auto it = pred_left_.find(s);
+        if (it == pred_left_.end() || it->second == 0) continue;   // 未知/已就绪 → 跳过（防重复递减）
+        if (--it->second == 0 && s.rfind("tp:", 0) != 0)   // 减到 0 = 恰好一次就绪
+          ready_.push_back(s);
+      }
     }
 
     /**

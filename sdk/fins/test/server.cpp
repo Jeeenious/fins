@@ -27,9 +27,11 @@
 // static const char *DEFAULT_CFG = "../cfg_usr_chain10.json";
 // static const char *DEFAULT_CFG = "../cfg_usr_chain100.json";
 // static const char *DEFAULT_CFG = "../cfg_usr_fork2.json";
-static const char *DEFAULT_CFG = "../cfg_usr_fork10.json";
+// static const char *DEFAULT_CFG = "../cfg_usr_fork10.json";
+// static const char *DEFAULT_CFG = "../cfg_usr_fork100.json";
 // static const char *DEFAULT_CFG = "../cfg_usr_join2.json";
-// static const char *DEFAULT_CFG = "../cfg_usr_join10.json";
+static const char *DEFAULT_CFG = "../cfg_usr_join10.json";
+// static const char *DEFAULT_CFG = "../cfg_usr_join100.json";
 
 static constexpr int DEFAULT_PORT = 18080;
 

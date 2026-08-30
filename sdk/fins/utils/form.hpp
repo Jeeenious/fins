@@ -189,6 +189,19 @@ namespace fins::util {
       return out;
     }
 
+    /** @brief 出边目标顶点 id 列表（完成事件增量递减后继 pred_left 用；on_job_done 持锁调）。
+     *  基于 adj_（Edge 含 to），const_accessor 读，不碰真数据。
+     * @param id 源顶点 id
+     * @retval std::vector<NodeId> 出边目标顶点 id 列表
+     */
+    std::vector<NodeId> out_nodes(const NodeId &id) const {
+      std::vector<NodeId> out;
+      typename TBBMap<std::vector<Edge>>::const_accessor a;
+      if (adj_.find(a, id))
+        for (const auto &e : a->second) out.push_back(e.to);
+      return out;
+    }
+
     /** @brief 该节点从某连接标识的入边数据引用（job 执行前从这些 Message 槽取输入帧）。
      *  经 rev_ 找 (from, tag)，再反查 adj_[from] 的真数据（引用与生产者写的是同一份）。
      * @param id  目标顶点 id
