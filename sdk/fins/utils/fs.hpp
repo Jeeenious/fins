@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <memory>
 #include <vector>
+#include <set>
 #include <mutex>
 #include <queue>
 #include <condition_variable>
@@ -204,6 +205,11 @@ namespace fins::util {
     Callback on_delete_ = nullptr;
     std::vector<std::string> pending_dirs_;
 
+    /// 已创建但尚未写完（IN_CREATE 已见、IN_CLOSE_WRITE 未到）的路径集合——
+    /// 防 scp/文件管理器非原子复制写中 dlopen 造成 SIGBUS。只在 run_linux_loop 事件处理里
+    /// 读写，均持 mtx_。
+    std::set<std::string> pending_new_;
+
     /// 统一事件派发：回调非空则投递线程池异步执行（Linux/Windows 共用）。
     /// which 为事件匹配到的回调（on_add_/on_modify_/on_delete_ 的拷贝），path 为完整路径。
     void dispatch(Callback which, std::string path) {
@@ -240,8 +246,10 @@ namespace fins::util {
       uint32_t mask = 0;
       {
         std::lock_guard<std::mutex> lock(mtx_);
+        // on_add 也需 CLOSE_WRITE：新建文件（IN_CREATE 先记 pending）在写入完成关闭后再派发，
+        // 杜绝 scp/文件管理器非原子复制写中 dlopen → SIGBUS
+        if (on_add_ || on_modify_) mask |= IN_CLOSE_WRITE;
         if (on_add_)    mask |= IN_CREATE | IN_MOVED_TO;
-        if (on_modify_) mask |= IN_CLOSE_WRITE;
         if (on_delete_) mask |= IN_DELETE | IN_MOVED_FROM;
 
         if (mask) {
@@ -250,6 +258,7 @@ namespace fins::util {
           }
         }
         pending_dirs_.clear();
+        pending_new_.clear();   // 重启监听时清空，防跨会话残留
       }
 
       alignas(inotify_event) char buf[4096];
@@ -301,9 +310,26 @@ namespace fins::util {
               if (sub_wd >= 0) wd_to_dir_[sub_wd] = path;
             }
 
-            if      (ev->mask & (IN_CREATE | IN_MOVED_TO))   which = on_add_;
-            else if (ev->mask & (IN_DELETE | IN_MOVED_FROM)) which = on_delete_;
-            else if (ev->mask & IN_CLOSE_WRITE)              which = on_modify_;
+            // 目录事件保持原语义（不进 pending_new_；含上面子目录动态补监听）
+            if (ev->mask & IN_ISDIR) {
+              if      (ev->mask & (IN_CREATE | IN_MOVED_TO))   which = on_add_;
+              else if (ev->mask & (IN_DELETE | IN_MOVED_FROM)) which = on_delete_;
+              else if (ev->mask & IN_CLOSE_WRITE)              which = on_modify_;
+            } else if (ev->mask & IN_CREATE) {
+              // 非原子新建（scp/文件管理器粘贴/拖拽）：文件可能仍在写入，先记 pending 不派发，
+              // 等 IN_CLOSE_WRITE（写入完成关闭）再 on_add_——杜绝写中 dlopen → SIGBUS
+              pending_new_.insert(path);
+            } else if (ev->mask & IN_MOVED_TO) {
+              // rename/mv 原子，文件已完整 → 直接派发 on_add_
+              which = on_add_;
+            } else if (ev->mask & (IN_DELETE | IN_MOVED_FROM)) {
+              pending_new_.erase(path);   // 未写完即被删/移走 → 清 pending 防泄漏
+              which = on_delete_;
+            } else if (ev->mask & IN_CLOSE_WRITE) {
+              // 写入完成关闭：曾在 pending（新文件写完）→ on_add_；否则已有文件被改写 → on_modify_
+              if (pending_new_.erase(path)) which = on_add_;
+              else                          which = on_modify_;
+            }
           }
 
           dispatch(std::move(which), std::move(path));

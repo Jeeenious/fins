@@ -30,8 +30,10 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <dlfcn.h>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
