@@ -155,7 +155,7 @@ int main(int argc, char **argv) {
 
         lk.lock();
 
-        graph_g.set_workload_done(w->id);   // 回锁直做完成事件：置 done + 传播 pred_left + 入 ready
+        graph_g.trigger_workload_ready(w->id);   // 回锁直做完成事件：置 done + 传播 pred_left + 入 ready
 
         graph_g.cv.notify_all();
 
@@ -190,7 +190,7 @@ int main(int argc, char **argv) {
         tl.unlock();
         tp->job();                              // 锁外执行：sleep_until 睡到释放时刻（延迟实现）
         tl.lock();
-        graph_g.set_workload_done(tp->id);   // 回锁直做完成事件：置 done + 传播 pred_left（释放后继 job 顶点）
+        graph_g.trigger_workload_ready(tp->id);   // 回锁直做完成事件：置 done + 传播 pred_left（释放后继 job 顶点）
         graph_g.cv.notify_all();
         continue;
       }
@@ -201,11 +201,6 @@ int main(int argc, char **argv) {
   {
     std::unique_lock lk(graph_g.mtx);
     while (!graph_g.stopped.load()) {
-      // 状态与优先级更新：每次事件（worker 完成 / 时间点释放 / pending）唤醒后集中做一次，
-      // 不回固定 1ms 轮询。priority_updater 读 update_abs_deadline 的最新 ddl。
-      graph_g.update_abs_deadline();
-      if (wcet_updater) wcet_updater(graph_g);   // 每次事件唤醒 → wcet 更新一次（滚动排期后刷新）
-      if (priority_updater) priority_updater(graph_g);  // 每次事件唤醒 → 优先级更新一次（滚动排期后刷新）
       if (graph_g.is_hp_done() && graph_g.pending.load()) {
 
 #if FINS_TIMING
@@ -248,7 +243,6 @@ int main(int argc, char **argv) {
         try {
           graph_g.expand_hp(pipeline_g, library_g);
           FINS_LOG_INFO("[agent] pipeline applied: {} vertices", graph_g.dag.size());
-          if (wcet_updater) wcet_updater(graph_g);   // 超周期开始（新图）：wcet 更新一次
         } catch (const std::exception &e) {
           FINS_LOG_ERROR("[agent] pipeline apply failed: {}", e.what());
         }

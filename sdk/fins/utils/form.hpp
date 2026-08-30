@@ -89,6 +89,46 @@ namespace fins::util {
     std::atomic<int> active_{0};
   };
 
+  /** @brief 懒维护最大堆（std::vector 承载 + make_heap/pop_heap）：push 只入队不做 push_heap
+   *  （堆失效期允许），rebuild() 一次性 make_heap 重建，pop_max() pop_heap+pop_back 取堆顶。
+   *  适用"排序键批量改写后需整体重排"——入队 O(1)、重建 O(n)、取顶 O(log n)。典型 = 就绪堆：
+   *  完成事件 O(1) 入队，grab 前键函数现算 priority 后 rebuild 重排。
+   * @tparam T 元素类型
+   * @tparam Compare 比较器（默认 std::less）；最大堆 = 按 < 序"最大"者在顶 */
+  template<typename T, typename Compare = std::less<T>>
+  class LazyMaxHeap {
+  public:
+    void clear() { data_.clear(); }
+    bool empty() const { return data_.empty(); }
+    size_t size() const { return data_.size(); }
+    /** @brief 懒入队：仅追加，不维护堆序（堆序仅 rebuild() 后成立）。
+     * @param v 元素
+     * @retval 无
+     */
+    void push(T v) { data_.push_back(std::move(v)); }
+    /** @brief 底层数据（批量改写排序键用；改写后须 rebuild()）。
+     * @retval T& 底层 vector
+     */
+    std::vector<T> &data() { return data_; }
+    const std::vector<T> &data() const { return data_; }
+    /** @brief 排序键变更后一次性重建堆序（O(n)）。
+     * @retval 无
+     */
+    void rebuild() { std::make_heap(data_.begin(), data_.end(), cmp_); }
+    /** @brief 取堆顶（O(log n)）；前置：非空且已 rebuild。
+     * @retval T 堆顶元素（排序键最高者）
+     */
+    T pop_max() {
+      std::pop_heap(data_.begin(), data_.end(), cmp_);
+      T v = std::move(data_.back());
+      data_.pop_back();
+      return v;
+    }
+  private:
+    std::vector<T> data_;
+    [[no_unique_address]] Compare cmp_;
+  };
+
   /** @brief 通用有向无环图容器（dataflow DAG 结构骨架，类模板）：顶点载荷 VertexT（如 Workload）+
    *  边载荷 EdgeT（如 Message 槽，生产者写/消费者读共享帧）；顶点表 + 出边邻接表 + 入边引用表，
    *  均为 TBB 并发容器；clear() 全清重建。边连接标识 = 端口名（同名直连）/ 'seq:' 边名（同节点
@@ -189,7 +229,7 @@ namespace fins::util {
       return out;
     }
 
-    /** @brief 出边目标顶点 id 列表（完成事件增量递减后继 pred_left 用；on_job_done 持锁调）。
+    /** @brief 出边目标顶点 id 列表（完成事件增量递减后继 pred_left 用；trigger_workload_ready 持锁调）。
      *  基于 adj_（Edge 含 to），const_accessor 读，不碰真数据。
      * @param id 源顶点 id
      * @retval std::vector<NodeId> 出边目标顶点 id 列表
