@@ -30,17 +30,13 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
-#include <cstring>
 #include <deque>
 #include <dlfcn.h>
-#include <fstream>
 #include <functional>
-#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
-#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -401,7 +397,7 @@ namespace fins::rt {
     // ── 就绪增量调度状态（私有；持 mtx 访问，装配点经无锁原语间接使用）──
     std::map<std::string, size_t> pred_left_;   // 剩余未完成前序数（含 seq/绑定/tp 挂靠边）
     std::map<std::string, size_t> in_degree_;   // 入度基准（expand 填；rollover 重置 pred_left_ 用）
-    std::set<std::string> done_;                // 已完成顶点集（job+tp 全计；is_hp_done 计数 + tp 防重拉）
+    std::set<std::string> done_;        // 已完成顶点集（job+tp 全计；is_hp_done 计数 + tp 防重拉）
 
     struct ReadyItem {                          // 就绪集元素：id + 入队序号 + 排序键
       std::string id;
@@ -665,6 +661,63 @@ namespace fins::rt {
       }
     }
 
+    /** @brief ⑦.5 时间链：解析同步时间点（显式周期节点释放时刻并集）→ 建时间点顶点（job = 延迟
+     *  （sleep_until 绝对释放时刻，timer 拿到 w 直接 job() 即实现延迟）、period=相对 hyper_start_ms
+     *  的释放偏移）+ 挂靠边 tp:s → {id}:{k}（释放约束：时间点 Finished 任务才就绪）。仅显式周期
+     *  节点（info.period>0）产生同步点并挂靠；继承周期节点仍纯数据流驱动。时间点按绝对释放时刻聚合
+     *  ——多任务共享同一时间点（如两个 50ms 任务与一个 100ms 任务同时刻释放共用该点），锚定真实
+     *  时钟消除旧 delay 的漂移。注意顺序：须在 build_edge 之后调用（其挂靠边引用的任务顶点已由
+     *  build_vertex 建好、时间点顶点自建）。
+     * @param nodes 解析态节点表（只读）
+     * @param node_count 节点 id → 实例数（只读）
+     * @retval 无
+     */
+    void bind_sync(const std::vector<NodeInfo> &nodes,
+                  const std::map<std::string, size_t> &node_count) {
+      std::set<double> sync_points;   // 同步点集合：显式周期节点释放时刻并集（去重升序）
+      for (const auto &info : nodes) {
+        if (info.period <= 0) continue;
+        const size_t N = node_count.at(info.id);
+        for (size_t k = 0; k < N; ++k) sync_points.insert((double)k * info.period);
+      }
+
+      std::map<double, std::string> tp_id;   // 偏移 → 时间点顶点 id（序号化，无精度碰撞）
+      size_t seq = 0;
+      for (const double off : sync_points) tp_id[off] = "tp:" + std::to_string(seq++);
+
+      for (const auto &[off, id] : tp_id) {
+        tp_order_.push_back(id);   // 升序 offset = 释放顺序（grab_delay_workload 按序取，与原 min-period 扫描等价）
+      }
+
+      double prev_off = 0.0;   // 理论延迟基准：相对前一个同步点的间隔（首个 tp:0 = 0，立即释放）
+      for (const auto &[off, id] : tp_id) {
+        Workload v;
+        v.id     = id;
+        v.name   = "time";
+        v.wcet   = off - prev_off;
+        v.job    = [this, off]() {
+          const double at = hyper_start_ms + off;
+          const auto until = std::chrono::steady_clock::now()
+              + std::chrono::microseconds((long long)(at - fins::util::now_ms()) * 1000ll);
+          while (!stopped.load() && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        };
+        dag.add_node(id, std::move(v));
+
+        prev_off = off;
+      }
+
+      for (const auto &info : nodes) {
+        if (info.period <= 0) continue;
+
+        const size_t N = node_count.at(info.id);
+        for (size_t k = 0; k < N; ++k) {
+          const double off = (double)k * info.period;
+          dag.add_edge(tp_id.at(off), info.id + ":" + std::to_string(k), "time", Message{});
+        }
+      }
+    }
+
     /** @brief ⑨a 入度基准（**无锁原语，前提调用方持 mtx**；仅 expand_hp 尾部调用）：先收集全部
      *  顶点 id 再遍历填 in_degree_/pred_left_ 基准（初始值 = 入度）——两趟规避 range 内嵌套
      *  accessor（for_each_vertex 遍历期间勿嵌套 in_nodes 的 accessor）。
@@ -677,56 +730,6 @@ namespace fins::rt {
         const size_t deg = dag.in_nodes(id).size();
         in_degree_[id] = deg;
         pred_left_[id] = deg;
-      }
-    }
-
-    /** @brief ⑦.5 时间链：解析同步时间点（显式周期节点释放时刻并集）→ 建时间点顶点（job = 延迟
-     *  （sleep_until 绝对释放时刻，timer 拿到 w 直接 job() 即实现延迟）、period=相对 hyper_start_ms
-     *  的释放偏移）+ 挂靠边 tp:s → {id}:{k}（释放约束：时间点 Finished 任务才就绪）。仅显式周期
-     *  节点（info.period>0）产生同步点并挂靠；继承周期节点仍纯数据流驱动。时间点按绝对释放时刻聚合
-     *  ——多任务共享同一时间点（如两个 50ms 任务与一个 100ms 任务同时刻释放共用该点），锚定真实
-     *  时钟消除旧 delay 的漂移。注意顺序：须在 build_edge 之后调用（其挂靠边引用的任务顶点已由
-     *  build_vertex 建好、时间点顶点自建）。
-     * @param nodes 解析态节点表（只读）
-     * @param node_count 节点 id → 实例数（只读）
-     * @retval 无
-     */
-    void pin_sync(const std::vector<NodeInfo> &nodes,
-                  const std::map<std::string, size_t> &node_count) {
-      std::set<double> S;   // 同步点集合：显式周期节点释放时刻并集（去重升序）
-      for (const auto &info : nodes) {
-        if (info.period <= 0) continue;
-        const size_t N = node_count.at(info.id);
-        for (size_t k = 0; k < N; ++k) S.insert((double)k * info.period);
-      }
-      std::map<double, std::string> tp_id;   // 偏移 → 时间点顶点 id（序号化，无精度碰撞）
-      size_t seq = 0;
-      for (const double off : S) tp_id[off] = "tp:" + std::to_string(seq++);
-      for (const auto &[off, id] : tp_id) {
-        tp_order_.push_back(id);   // 升序 offset = 释放顺序（grab_delay_workload 按序取，与原 min-period 扫描等价）
-        Workload v;
-        v.id     = id;
-        v.name   = "time";
-        v.period = off;   // 相对 hyper_start_ms 的释放偏移（timer grab_delay_workload 读，非周期）
-        v.job = [this, off]() {   // 延迟执行体：timer 拿到 w 直接 job() 即睡到绝对释放时刻；
-                                  // job 内实时读 hyper_start_ms → rollover 平移后自动对齐新起点，无漂移；
-                                  // 1ms 步进轮询 stopped → 停止信号下最多 ~1ms 退出，不被长延迟拖住 join
-          const double at = hyper_start_ms + off;
-          const auto until = std::chrono::steady_clock::now()
-              + std::chrono::microseconds((long long)(at - fins::util::now_ms()) * 1000ll);
-          while (!stopped.load() && std::chrono::steady_clock::now() < until)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        };
-        dag.add_node(id, std::move(v));
-      }
-
-      for (const auto &info : nodes) {
-        if (info.period <= 0) continue;
-        const size_t N = node_count.at(info.id);
-        for (size_t k = 0; k < N; ++k) {
-          const double off = (double)k * info.period;
-          dag.add_edge(tp_id.at(off), info.id + ":" + std::to_string(k), "time", Message{});
-        }
       }
     }
 
@@ -748,83 +751,99 @@ namespace fins::rt {
     void bind_job(const std::vector<NodeInfo> &nodes, double hyper_period,
                     const std::map<std::string, std::shared_ptr<AlgoBase>> &by_id,
                     const std::map<std::string, size_t> &node_count) {
+      // loop 端口 → 聚合窗口帧数（显式端口补充定义：Pipeline::NodeInfo.loop_step / loop_timer 两 map；
+      // step 定长迭代步 N；timer 观测周期/节点周期 → 窗口帧数 ceil）。
+      auto calc_loop_window = [](const NodeInfo &info, size_t n, double hyper_period) {
+        std::map<std::string, size_t> w;
+        if (info.loop_step.empty() && info.loop_timer.empty()) return w;
+        const double Tnode = (n > 0 && hyper_period > 0) ? hyper_period / (double)n : 0.0;
+        for (const auto &[port, arg] : info.loop_step)  w[port] = (size_t)arg;   // "step"：迭代步 N（定长窗口）
+        for (const auto &[port, arg] : info.loop_timer) w[port] = (size_t)std::ceil(arg / Tnode);   // "timer"：观测周期/节点周期 → 窗口帧数
+        return w;
+      };
+
+      // ── 段 1：loop 反馈历史容量表（mesg_hist_cap[loop端口] = producer 节点 cap，只对 loop 端口建槽）──
       for (const auto &info : nodes) {
-        for (const auto &[port, _] : info.loop_step)
-          mesg_hist_cap[port] = info.cap;
-        for (const auto &[port, _] : info.loop_timer)
-          mesg_hist_cap[port] = info.cap;
+        for (const auto &[port, _] : info.loop_step)  mesg_hist_cap[port] = info.cap;
+        for (const auto &[port, _] : info.loop_timer) mesg_hist_cap[port] = info.cap;
       }
+
+      // ── 段 2：每个节点 → 每实例填 job 闭包（闭包捕获稳定解析态 + 算法实例 + loop 聚合窗口）──
       for (const auto &info : nodes) {
-        auto sinfo = std::make_shared<const NodeInfo>(info);   // 闭包捕获稳定共享解析态
+        auto sinfo = std::make_shared<const NodeInfo>(info);           // 闭包捕获稳定共享解析态
         const auto &algo = by_id.at(info.id);
         const size_t n = node_count.at(info.id);
-        // Loop 聚合窗口：显式端口补充定义（Pipeline::NodeInfo.loop_step / loop_timer 两 map）——
-        // step 定长迭代步 N；timer 观测周期/节点周期 → 窗口帧数（ceil）。
-        std::map<std::string, size_t> loop_w;   // loop 端口 → 聚合窗口（帧数，恒长定长）
-        if (!info.loop_step.empty() || !info.loop_timer.empty()) {
-          const double Tnode = (n > 0 && hyper_period > 0) ? hyper_period / (double)n : 0.0;
-          for (const auto &[port, arg] : info.loop_step)
-            loop_w[port] = (size_t)arg;   // "step"：迭代步 N（定长窗口）
-          for (const auto &[port, arg] : info.loop_timer)
-            loop_w[port] = (size_t)std::ceil(arg / Tnode);   // "timer"：观测周期/节点周期 → 窗口帧数
-        }
+        const auto loop_w = calc_loop_window(info, n, hyper_period);   // loop 端口 → 聚合窗口帧数
         for (size_t k = 0; k < n; ++k) {
           const std::string vtx = info.id + ":" + std::to_string(k);   // 顶点名现拼（无 JobInst）
           dag.mutate_vertex(vtx, [this, sinfo, algo, vtx, loop_w](Workload &v) {
-            v.id = vtx;   // 顶点名现拼 {节点id}:{k} → Workload.id 实际填充（grab_ready_workload 返回 Workload* 含 id，装配点直做完成事件用）
+            v.id = vtx;   // Workload.id 实际填充（grab_ready_workload 返回 Workload* 含 id，装配点直做完成事件用）
+            // 状态修改移出 job：就绪/完成由 PrecedenceGraph 侧增量状态（pred_left_/done_/ready_）
+            // 判定，装配点 on_execute 回调事务回锁调 trigger_workload_ready(id)（完成事件不在闭包内）；
+            // 本闭包只执行 = 打包输入 → execute+计时 → 路由输出（三个功能段各一 lambda）。
             v.job = [this, sinfo, algo, vtx, loop_w]() {
-              // 状态修改移出 job：就绪/完成由 PrecedenceGraph 侧增量状态（pred_left_/done_/ready_）
-              // 判定，装配点 on_execute 回调事务回锁调 trigger_workload_ready(id)（完成事件不在闭包内）；
-              // 本闭包只执行（打包输入 → execute → 路由输出）。
-              // 输入：按 NodeInfo输入端口序打包 array（算法按位置取，不碰端口名）
-              std::vector<Message> inputs(sinfo->input_ports.size());
-              for (size_t i = 0; i < inputs.size(); ++i) {
-                const std::string &pn = sinfo->input_ports[i];
-                if (loop_w.count(pn)) {
-                  // Loop 反馈：从滑动窗口历史槽聚合——最近 w 帧真实历史（message_hist_[pn]，seq
-                  // 边保证前序 job 已执行压入；窗口跨周期保留、跨重建保留，回绕不清，满丢最旧）。
-                  // 恒长 w 契约：窗口未满（刚启动/超周期初期）开头补空 Message 0 值占位
-                  // （frame=nullptr，算法须判断 .frame 跳过/当 0，勿 sub——sub 空帧抛异常）。
-                  const size_t w = loop_w.at(pn);
-                  std::vector<Message> frames(w);   // 恒长 w：默认占位（空 Message 0 值）→ 尾部覆盖真实帧
-                  { // TBBMap const_accessor 只锁本端口历史槽字段（与 record_mesg 同端口写互斥；不同端口并发读）
-                    util::TBBMap<std::deque<Message>>::const_accessor a;
-                    if (message_hist_.find(a, pn)) {
-                      const auto &h = a->second;
-                      const size_t take = std::min(w, h.size());
-                      for (size_t j = 0; j < take; ++j)
-                        frames[w - take + j] = h[h.size() - take + j];
-                    }
-                    // find 失败（理论不发生：seq 边保证 producer 已先执行压槽）→ 全占位，等价原空槽
+              // ── 功能 1a：loop 端口 → 滑动窗口历史槽聚合最近 w 帧（恒长 w、窗口未满开头补空
+              //      Message 占位，frame=nullptr，算法须判断 .frame 跳过/当 0，勿 sub）──
+              auto collect_loop_window = [this](const std::string &pn, size_t w) {
+                std::vector<Message> frames(w);   // 恒长 w：默认占位（空 Message 0 值）→ 尾部覆盖真实帧
+                { // TBBMap const_accessor 只锁本端口历史槽（与 record_mesg 同端口写互斥；不同端口并发读）
+                  util::TBBMap<std::deque<Message>>::const_accessor a;
+                  if (message_hist_.find(a, pn)) {
+                    const auto &h = a->second;
+                    const size_t take = std::min(w, h.size());
+                    for (size_t j = 0; j < take; ++j)
+                      frames[w - take + j] = h[h.size() - take + j];
                   }
-                  Message m;
-                  auto vv = m.pub<std::vector<Message>>();
-                  *vv = std::move(frames);
-                  inputs[i] = std::move(m);
-                } else {
-                  auto es = dag.edges_to(vtx, pn);
-                  if (!es.empty()) inputs[i] = es[0].get();  // 绑定边唯一 → 该 producer job 帧
+                  // find 失败（理论不发生：seq 边保证 producer 已先执行压槽）→ 全占位，等价原空槽
                 }
-              }
-              // 输出：按 NodeInfo输出端口序预构造 array（算法按位置写）
-              std::vector<Message> outputs(sinfo->output_ports.size());
-              // 执行：配置已建图期注入 algo 实例（AlgoFunc configs_ 类型化帧，execute 零解析）。
+                Message m;
+                auto vv = m.pub<std::vector<Message>>();
+                *vv = std::move(frames);
+                return m;
+              };
 
-              // 耗时统计：execute 前后 steady_clock 计时（us）→ record_exec(节点 id, us)——仅
-              // execute 耗时，不含输入打包/输出路由；按节点环形队列，expand_hp 重建保留不清。
-              const auto _t0 = std::chrono::steady_clock::now();
-              algo->execute(inputs, outputs);
-              record_exec(sinfo->id, std::chrono::duration<double, std::micro>(
-                  std::chrono::steady_clock::now() - _t0).count());
+              // ── 功能 1b：普通端口 → 绑定边唯一帧（该 producer job 输出；无绑定边理论不发生 → 空帧占位）──
+              auto frame_from_edge = [this, vtx](const std::string &pn) {
+                auto es = dag.edges_to(vtx, pn);
+                return es.empty() ? Message{} : es[0].get();
+              };
 
-              for (size_t i = 0; i < outputs.size(); ++i) {
-                const std::string &pn = sinfo->output_ports[i];
-                for (auto &e : dag.edges_from(vtx, pn))
-                  e.get() = outputs[i];  // 写全部下游绑定边（生产者消费者共享帧）
-                const auto cap_it = mesg_hist_cap.find(pn);   // job 闭包锁外执行：operator[] 对缺键并发写 = std::map 并发写 UB，用 const 查找
-                if (cap_it != mesg_hist_cap.end() && cap_it->second > 0)   // 有 loop 消费者才存历史（cap>0）；record_mesg 满 cap 丢最旧
-                  record_mesg(pn, outputs[i]);
-              }
+              // ── 功能 1：打包输入 array（loop 端口走聚合、普通端口走绑定边；按端口序，算法按位置取不碰端口名）──
+              auto pack_inputs = [this, sinfo, loop_w, collect_loop_window, frame_from_edge]() {
+                std::vector<Message> inputs(sinfo->input_ports.size());
+                for (size_t i = 0; i < inputs.size(); ++i) {
+                  const std::string &pn = sinfo->input_ports[i];
+                  inputs[i] = loop_w.count(pn) ? collect_loop_window(pn, loop_w.at(pn)) : frame_from_edge(pn);
+                }
+                return inputs;
+              };
+
+              // ── 功能 2：execute + record_exec（耗时统计：execute 前后 steady_clock 计时 us，
+              //      不含输入打包/输出路由；按节点环形队列，expand_hp 重建保留不清）──
+              auto execute_and_time = [this, sinfo, algo](std::vector<Message> &inputs) {
+                std::vector<Message> outputs(sinfo->output_ports.size());   // 输出按端口序预构造 array（算法按位置写）
+                const auto _t0 = std::chrono::steady_clock::now();
+                algo->execute(inputs, outputs);   // 配置已建图期注入 algo 实例（AlgoFunc configs_ 类型化帧，execute 零解析）
+                record_exec(sinfo->id, std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - _t0).count());
+                return outputs;
+              };
+
+              // ── 功能 3：路由输出（写全部下游绑定边共享帧 + 有 loop 消费者才存历史槽）──
+              auto route_outputs = [this, sinfo, vtx](std::vector<Message> &outputs) {
+                for (size_t i = 0; i < outputs.size(); ++i) {
+                  const std::string &pn = sinfo->output_ports[i];
+                  for (auto &e : dag.edges_from(vtx, pn))
+                    e.get() = outputs[i];   // 写全部下游绑定边（生产者消费者共享帧）
+                  const auto cap_it = mesg_hist_cap.find(pn);   // 锁外执行：const 查找避 operator[] 并发写 UB
+                  if (cap_it != mesg_hist_cap.end() && cap_it->second > 0)   // 有 loop 消费者才存历史（cap>0）；record_mesg 满 cap 丢最旧
+                    record_mesg(pn, outputs[i]);
+                }
+              };
+
+              auto inputs  = pack_inputs();
+              auto outputs = execute_and_time(inputs);
+              route_outputs(outputs);
             };
           });
         }
@@ -865,11 +884,12 @@ namespace fins::rt {
       pred_left_.clear();   // 就绪增量状态：空配置早退也一致清空
       in_degree_.clear();
       done_.clear();
+      dag.clear();
+
       ready_.clear();
       ready_seq_ = 0;   // 入队序号随就绪集一并重置（新周期从头计序）
       tp_order_.clear();
       tp_released_ = 0;
-      dag.clear();
 
       const auto nodes = pipeline.nodes;   // 入参快照（拷贝，防外部改）
       const auto so_ctx = library.so_ctx;
@@ -903,13 +923,14 @@ namespace fins::rt {
       build_edge(dag, nodes, node_count);
 
       // ⑦.5 时间链：同步时间点顶点 + 挂靠边（图编辑好后钉时间约束）
-      pin_sync(nodes, node_count);
+      bind_sync(nodes, node_count);
+
+      // ⑨ 就绪增量初始化：入度基准（build_pred）→ 初始就绪（seed_ready，私有函数，见 bind_job 之后）
+      build_pred();
 
       // ⑧ job 闭包
       bind_job(nodes, hyper_period_ms, by_id, node_count);
 
-      // ⑨ 就绪增量初始化：入度基准（build_pred）→ 初始就绪（seed_ready，私有函数，见 bind_job 之后）
-      build_pred();
       seed_ready();
     }
 
@@ -925,10 +946,17 @@ namespace fins::rt {
      */
     void rollover_hp() {
       hyper_start_ms = fins::util::now_ms();   // 起点更新为当前真实时钟
+
+      if (false) {
+        update_wcet_estimation();
+      }
+
       done_.clear();
       ready_.clear();   // 图静止时应空，防御清
       ready_seq_ = 0;   // 入队序号随就绪集重置（新周期从头计序）
       tp_released_ = 0;   // tp 全部重新释放（tp_order_ 不清——同一批时间点按原序重放）
+
+
       for (auto &[id, pl] : pred_left_) pl = in_degree_.at(id);   // pred_left 重置回入度基准
     }
 
@@ -946,8 +974,8 @@ namespace fins::rt {
 
     /**
      * @brief 拉取就绪顶点（**无锁原语，前提调用方持 mtx**；装配点 on_execute 回调事务内部调用）：
-     *        就绪集（util::LazyMaxHeap 懒最大堆，pred_left 减到 0 时经 ready_push 入队，prio 入队
-     *        占位 0）中取优先级最高者 → mutate_vertex 回调取图内可变指针（无状态标记，拉走即隐式
+     *        就绪集（util::LazyMaxHeap 懒最大堆，pred_left 减到 0 时经 ready_.push({id, ready_seq_++, 0})
+     *        内联入队，prio 入队占位 0）中取优先级最高者 → mutate_vertex 回调取图内可变指针（无状态标记，拉走即隐式
      *        运行中）。优先级唯一来源 = 装配点注入的 priority_updater 键函数（顶点 → 调度优先级，
      *        可读 *this 全图状态如 hyper_start_ms/核心负载）：grab 前对每个就绪顶点现算覆盖占位 0；
      *        未注入回调 → prio 恒 0 → 就绪堆退化为纯 FIFO。再 rebuild() 按最新 prio 重建堆、
@@ -1013,6 +1041,7 @@ namespace fins::rt {
       }
     }
 
+  private:
     /**
      * @brief 滚动校正全部 job 顶点的 abs_deadline（**无锁原语，前提调用方持 mtx**；主线程调度
      *        循环事件驱动唤醒后调用）：基于当前真实时钟 now，从
@@ -1020,6 +1049,7 @@ namespace fins::rt {
      *        (k+1)·deadline——执行快慢不定时 deadline 始终对齐真实时间轴（供 priority 键函数/
      *        将来 EDF 消费），不再依赖回绕副作用。超周期内幂等；无超周期（hyper_period_ms<=0）
      *        不滚动（保持 expand 设置值）。
+     * @warning 调用时不可同时修改 dag 状态
      * @retval 无
      */
     void update_abs_deadline() {
@@ -1031,6 +1061,24 @@ namespace fins::rt {
         if (period > 0 && now > start + period)
           start += std::floor((now - start) / period) * period;
         v.ddl = start + (double)(v.k + 1) * v.deadline;
+      });
+    }
+
+    /**
+     * @brief 集中回写 wcet（无锁原语，前提调用方持 mtx；主线程调度循环每轮 update_abs_deadline 旁调用）：
+     *         遍历图顶点，对有执行历史的普通节点调 wcet_updater(该顶点历史 deque) 现算覆盖 v.wcet。
+     *         tp 顶点无 job → 跳过（wcet 建图期理论写死 = 相邻同步点间隔）；无历史顶点 → 跳过（保留建图期默认）。
+     * @warning 必须在所有 job 都结束时才能调用
+     * @retval 无
+     *
+     */
+    void update_wcet_estimation() {
+      dag.for_each_vertex([&](const std::string &, Workload &v) {
+        if (!v.job) return;
+        if (v.id.rfind("tp:", 0) != 0)
+          TBBMAP_READ(exec_us_hist_, v.id, [&](const auto &hist) {
+            if (!hist.empty() && wcet_updater) v.wcet = wcet_updater(hist);
+          });
       });
     }
   };

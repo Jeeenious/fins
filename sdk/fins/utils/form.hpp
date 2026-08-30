@@ -65,6 +65,14 @@ namespace fins::util {
     fn(a->second);                                               \
   } while (0)
 
+#define TBBMAP_READ(MAP, key, fn)                              \
+  do {                                                         \
+    using _M = std::decay_t<decltype(MAP)>;                    \
+    const auto &_k = (key);                                    \
+    _M::const_accessor a;                                      \
+    if ((MAP).find(a, _k)) fn(a->second);                      \
+  } while (0)
+
   /** @brief 双缓冲（单写多读，原子切换）：write() 拿非激活份填充 → commit() 原子翻转索引；
    *  read() 始终读激活份——读方要么旧版要么新版，绝不半写。典型 = 配置热更新
    *  （pipeline_g.cache：RPC 写缓冲份 → pending → 主线程调度循环图静止 commit+read+parse）。
