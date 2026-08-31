@@ -105,7 +105,12 @@
       "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && grep -n 'FINS_TIMING\\\\|exec\\\\|pipeline applied\\\\|pipeline modified' client.cpp | head -20\")",
       "Bash(wsl -e bash -lc \"cd /mnt/d/Desktop/fins/sdk/fins/test && rm -f exec_stats.csv main_loop_stats.csv /tmp/cl.log /tmp/cp.pid && nohup ./cmake-build-debug/client 18080 /mnt/d/Desktop/fins/sdk/fins/test/cmake-build-debug/plugins > /tmp/cl.log 2>&1 & echo \\\\$! > /tmp/cp.pid; sleep 2; ./cmake-build-debug/server cfg_usr_chain2.json 18080; sleep 6; kill -TERM \\\\$\\(cat /tmp/cp.pid\\); sleep 1; echo '=== LOG tail ==='; tail -20 /tmp/cl.log; echo '=== exec_stats.csv ==='; head -8 exec_stats.csv; wc -l exec_stats.csv; echo '=== main_loop_stats.csv ==='; head -10 main_loop_stats.csv; wc -l main_loop_stats.csv\")",
       "Bash(wsl -e bash -lc 'cd /mnt/d/Desktop/fins/sdk/fins/test; rm -f /tmp/cl.log; nohup ./cmake-build-debug/client 18080 /mnt/d/Desktop/fins/sdk/fins/test/cmake-build-debug/plugins > /tmp/cl.log 2>&1 & sleep 2; for cfg in cfg_usr_chain2.json cfg_usr_fork2.json cfg_usr_join2.json cfg_usr_loop.json cfg_illegal.json cfg_usr_chain2.json; do ./cmake-build-debug/server $cfg 18080; sleep 2; done; sleep 3; pkill -TERM -x client; sleep 1; echo '\\\\''=== LOG ==='\\\\''; grep -a '\\\\''pipeline applied\\\\|pipeline parse\\\\|pipeline apply\\\\|modified\\\\|bye'\\\\'' /tmp/cl.log')",
-      "Bash(wsl -e *)"
+      "Bash(wsl -e *)",
+      "Bash(find . -name main*.cpp -o -name *main*.cpp)",
+      "Bash(find /home/jenny/Desktop/fins -name performance_recorder* -o -name server.hpp)",
+      "mcp__exa__web_search_exa",
+      "Bash(cmake --build cmake-build-debug -j)",
+      "Bash(cmake --build cmake-build-debug --target client plugin -j)"
     ]
   }
 }

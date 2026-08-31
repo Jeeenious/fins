@@ -62,7 +62,9 @@ namespace fins::rt {
   inline std::function<double(std::deque<double>)> wcet_updater = nullptr;
   /// 外部回调槽（命名空间级 inline，装配点直接赋值注入；优先级唯一来源：键函数 → 顶点调度优先级，
   /// grab 决策点现算；nullptr = 就绪堆退化为纯 FIFO——优先级不可预设，须经此函数拿到）。
-  inline std::function<int(PrecedenceGraph&, const Workload&)> priority_updater = nullptr;
+  inline std::function<int(util::DirectedAcyclicGraph<Workload, Message>&, const Workload&)> priority_updater = nullptr;
+  /// 外部回调槽（求makespan）
+  inline std::function<double(util::DirectedAcyclicGraph<Workload, Message>&)> makespan_updater = nullptr;
 
   /** @brief .so 加载上下文（library_g.so_ctx 的元素）：构造=dlopen 装载 + dlsym 解析 C 工厂符号并
    *  填 loaded_keys，析构=dlclose 卸载，take_keys() 取定位键；装配点经 on_library_* 回调维护表。 */
@@ -974,7 +976,7 @@ namespace fins::rt {
 
     /**
      * @brief 拉取就绪顶点（**无锁原语，前提调用方持 mtx**；装配点 on_execute 回调事务内部调用）：
-     *        就绪集（util::LazyMaxHeap 懒最大堆，pred_left 减到 0 时经 ready_.push({id, ready_seq_++, 0})
+     *        就绪集（util::LazyMaxHeap 懒最大堆，pred_left 减到 0 时经 ready_.push({s, ready_seq_++, 0})
      *        内联入队，prio 入队占位 0）中取优先级最高者 → mutate_vertex 回调取图内可变指针（无状态标记，拉走即隐式
      *        运行中）。优先级唯一来源 = 装配点注入的 priority_updater 键函数（顶点 → 调度优先级，
      *        可读 *this 全图状态如 hyper_start_ms/核心负载）：grab 前对每个就绪顶点现算覆盖占位 0；
@@ -993,7 +995,7 @@ namespace fins::rt {
 
       if (priority_updater) {;
         for (auto &item : ready_.data())
-          item.prio = priority_updater(*this, dag.vertex(item.id));
+          item.prio = priority_updater(dag, dag.vertex(item.id));
       }
       ready_.rebuild();                                // 按最新 prio 重建堆（O(n)）
 
@@ -1037,7 +1039,7 @@ namespace fins::rt {
         auto it = pred_left_.find(s);
         if (it == pred_left_.end() || it->second == 0) continue;   // 未知/已就绪 → 跳过（防重复递减）
         if (--it->second == 0 && s.rfind("tp:", 0) != 0)   // 减到 0 = 恰好一次就绪
-          ready_.push({id, ready_seq_++, 0});
+          ready_.push({s, ready_seq_++, 0});   // 推刚就绪的后继 s（勿推已完成前序 id）
       }
     }
 
