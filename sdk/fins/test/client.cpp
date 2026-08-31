@@ -46,10 +46,13 @@
 using namespace fins::rt;
 namespace fs = std::filesystem;
 
-static fins::util::TBBMap<std::deque<long long>> exec_hist;
-static fins::util::TBBMap<std::deque<long long>> idle_hist;
-static std::deque<long long> expand_latency{};
-static std::deque<long long> rollover_latency{};
+static fins::util::TBBMap<std::deque<double>> wid_exec_hist;
+static fins::util::TBBMap<std::deque<double>> wid_idle_hist;
+
+static fins::util::TBBMap<std::deque<double>> algo_exec_hist;
+
+static std::deque<double> expand_latency{};
+static std::deque<double> rollover_latency{};
 
 int main(int argc, char **argv) {
   const int rpc_port = argc > 1 ? std::atoi(argv[1]) : 18080;
@@ -69,18 +72,15 @@ int main(int argc, char **argv) {
   } catch (...) {}
 
   // ── 装配 PluginLoader：loader 只做库机制（增量增/改/删事件回调注入），存量装载上面已做 ──
-  PluginLoader::instance().on_library_add([](const std::string &so, std::shared_ptr<Plugin> ctx) {
+  PluginLoader::instance().on_library_add([](const std::string &so, const std::shared_ptr<Plugin>& ctx) {
     // 新增 .so：ctx 已构造装载，直接 SET
     TBBMAP_SET(library_g.so_ctx, so, ctx);
     FINS_LOG_INFO("[agent] lib add: {}", so);
     graph_g.cv.notify_all();   // 库变更 → 唤醒主循环即时重查插件就绪（defer 自动恢复）
   });
-  PluginLoader::instance().on_library_modify([](const std::string &so, std::shared_ptr<Plugin> ctx) {
-    std::shared_ptr<Plugin> old;
-    {
-      typename fins::util::TBBMap<std::shared_ptr<Plugin>>::const_accessor ca;
-      if (library_g.so_ctx.find(ca, so)) old = ca->second;
-    }
+  PluginLoader::instance().on_library_modify([](const std::string &so, const std::shared_ptr<Plugin>& ctx) {
+    std::shared_ptr<Plugin> old;   // 局部拷贝：宏作用域外 shared_ptr 引用计数保活
+    TBBMAP_READ(library_g.so_ctx, so, [&](const auto &v) { old = v; });
     if (old) old->take_keys();
     TBBMAP_ERASE(library_g.so_ctx, so);
     TBBMAP_SET(library_g.so_ctx, so, ctx);
@@ -88,11 +88,8 @@ int main(int argc, char **argv) {
     graph_g.cv.notify_all();   // 库变更 → 唤醒主循环即时重查插件就绪（defer 自动恢复）
   });
   PluginLoader::instance().on_library_delete([](const std::string &so) {
-    std::shared_ptr<Plugin> old;
-    {
-      typename fins::util::TBBMap<std::shared_ptr<Plugin>>::const_accessor ca;
-      if (library_g.so_ctx.find(ca, so)) old = ca->second;
-    }
+    std::shared_ptr<Plugin> old;   // 局部拷贝：宏作用域外 shared_ptr 引用计数保活
+    TBBMAP_READ(library_g.so_ctx, so, [&](const auto &v) { old = v; });
     if (old) old->take_keys();
     TBBMAP_ERASE(library_g.so_ctx, so);
     FINS_LOG_INFO("[agent] lib delete: {}", so);
@@ -135,10 +132,10 @@ int main(int argc, char **argv) {
       if (graph_g.is_workload_ready()) {
 
 #if FINS_TIMING
-  const auto _t0 = std::chrono::steady_clock::now();   // 空闲段起点：完成上一任务 → 拉到下一任务（含 cv.wait）
+        const auto _t0 = std::chrono::steady_clock::now();   // 空闲段起点：完成上一任务 → 拉到下一任务（含 cv.wait）
 #endif
 
-        auto w = graph_g.grab_ready_workload();
+        const auto w = graph_g.grab_ready_workload();
 
         lk.unlock();
 
@@ -149,7 +146,7 @@ int main(int argc, char **argv) {
         w->job();
 
 #if FINS_TIMING
-      const long long exec_us = std::chrono::duration<double, std::micro>(
+        const auto exec_us = std::chrono::duration<double, std::micro>(
         std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（job 闭包总时长）
 #endif
 
@@ -160,10 +157,11 @@ int main(int argc, char **argv) {
         graph_g.cv.notify_all();
 
 #if FINS_TIMING
-      const long long idle_us = std::chrono::duration<double, std::micro>(
+        const auto idle_us = std::chrono::duration<double, std::micro>(
           std::chrono::steady_clock::now() - _t0).count() - exec_us;   // 本线程本次空闲（完成上一任务 → 拉到下一任务）
-      TBBMAP_UPDATE(exec_hist, std::to_string(wid), [&](auto &q) { q.push_back(exec_us); });
-      TBBMAP_UPDATE(idle_hist, std::to_string(wid), [&](auto &q) { q.push_back(idle_us); });
+        TBBMAP_UPDATE(wid_idle_hist, std::to_string(wid), [&](auto &q) { q.push_back(idle_us); });
+        TBBMAP_UPDATE(wid_exec_hist, std::to_string(wid), [&](auto &q) { q.push_back(exec_us); });
+        TBBMAP_UPDATE(algo_exec_hist, w->name, [&](auto &q) { q.push_back(exec_us); });
 #endif
 
         return true;
@@ -186,7 +184,7 @@ int main(int argc, char **argv) {
   std::thread timer_th([&] {
     std::unique_lock tl(graph_g.mtx);
     while (!graph_g.stopped.load()) {
-      if (auto tp = graph_g.grab_delay_workload()) {
+      if (const auto tp = graph_g.grab_delay_workload()) {
         tl.unlock();
         tp->job();                              // 锁外执行：sleep_until 睡到释放时刻（延迟实现）
         tl.lock();
@@ -231,7 +229,7 @@ int main(int argc, char **argv) {
           const auto lib_keys  = library_g.algo_keys();   // 全部已注册算法键（去重集合）
           bool ready = true;
           for (const auto &key : pipe_keys)
-            if (!lib_keys.count(key)) { ready = false; break; }
+            if (!lib_keys.contains(key)) { ready = false; break; }
           if (!ready) {
             FINS_LOG_INFO("[agent] algo not ready, defer (pending kept, wait plugin load)");
             graph_g.cv.wait_for(lk, std::chrono::milliseconds(500));   // 等热加载 notify 唤醒重试
@@ -251,7 +249,7 @@ int main(int argc, char **argv) {
         graph_g.cv.notify_all();
 
 #if FINS_TIMING
-        const long long expand_us = std::chrono::duration<double, std::micro>(
+        const auto expand_us = std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - _e0).count();
         expand_latency.push_back(expand_us);
 #endif
@@ -269,7 +267,7 @@ int main(int argc, char **argv) {
         graph_g.cv.notify_all();
 
 #if FINS_TIMING
-        const long long rollover_us = std::chrono::duration<double, std::micro>(
+        const auto rollover_us = std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - _r0).count();
         rollover_latency.push_back(rollover_us);
 #endif
@@ -298,20 +296,40 @@ int main(int argc, char **argv) {
   // ── CSV 导出：每 worker 的原始 exec/idle 样本序列（exec 与 idle 一一配对；供离线分析/绘图）──
   FINS_LOG_INFO("[agent] exporting timing data");
   {
-    std::ofstream ofs("exec_stats.csv");
-    ofs << "wid,idx,exec_us,idle_us\n";
-    for (auto it = exec_hist.begin(); it != exec_hist.end(); ++it) {
-      const std::string &wid = it->first;
-      const auto &eq = it->second;
-      typename fins::util::TBBMap<std::deque<long long>>::const_accessor ca;
-      const std::deque<long long> *iq = nullptr;
-      if (idle_hist.find(ca, wid)) iq = &ca->second;
-      const size_t n = iq ? std::min(eq.size(), iq->size()) : 0;
+    std::ofstream ofs("wid_exec_stats.csv");
+    ofs << "wid,idx,idle_us\n";
+    for (auto &[fst, snd] : wid_exec_hist) {
+      const std::string &wid = fst;
+      const auto &eq = snd;   // 本 wid 的 exec 序列（exec/idle 同回调同长记录 → 天然配对）
+      std::deque<double> iq;        // 局部拷贝：TBBMAP_READ 宏作用域外引用悬垂，须拷出
+      TBBMAP_READ(wid_idle_hist, wid, [&](const auto &q) { iq = q; });
+      const size_t n = iq.empty() ? 0 : std::min(eq.size(), iq.size());
       for (size_t i = 0; i < n; ++i)
-        ofs << wid << ',' << i << ',' << eq[i] << ',' << (*iq)[i] << '\n';
+        ofs << wid << ',' << i << ',' << iq[i] << '\n';
     }
     ofs.close();
   }
+
+  // ── CSV 导出：algo 开销差分（逐次 job：总执行 algo_exec − 纯函数 algo_func = 打包/路由/调度开销；
+  //    func 直接读 exec_us_hist_（算法键，ring 容量 exec_hist_cap 上限 → 尾部对齐）──
+  {
+    std::ofstream ofs("algo_exec_stats.csv");
+    ofs << "algo,idx,diff_us\n";
+    for (auto &[fst, snd] : algo_exec_hist) {
+      const std::string &algo = fst;
+      const auto &eq = snd;   // 本算法总执行耗时序列（逐次 job，无上限）
+      std::deque<double> fq;         // 纯函数耗时：exec_us_hist_ ring 丢头 → 只留最近 K 条
+      TBBMAP_READ(graph_g.exec_us_hist_, algo, [&](const auto &q) { fq = q; });
+      if (fq.empty()) continue;      // 该算法无 execute 计时（理论不发生）
+      const size_t K = fq.size();
+      const size_t m = eq.size();
+      const size_t start = K >= m ? 0 : (m - K);   // 尾部对齐：最近 K 条 exec 配 func K 条
+      for (size_t i = 0; i < K; ++i)
+        ofs << algo << ',' << i << ',' << (eq[start + i] - fq[i]) << '\n';
+    }
+    ofs.close();
+  }
+
   // ── CSV 导出：主线程 expand/rollover 耗时样本（kind: expand=建图 / rollover=超周期回绕）──
   {
     std::ofstream ofs("main_loop_stats.csv");

@@ -63,7 +63,7 @@ namespace fins::rt {
   /// 外部回调槽（命名空间级 inline，装配点直接赋值注入；优先级唯一来源：键函数 → 顶点调度优先级，
   /// grab 决策点现算；nullptr = 就绪堆退化为纯 FIFO——优先级不可预设，须经此函数拿到）。
   inline std::function<int(util::DirectedAcyclicGraph<Workload, Message>&, const Workload&)> priority_updater = nullptr;
-  /// 外部回调槽（求makespan）
+  /// 外部回调槽（求makespan）ms
   inline std::function<double(util::DirectedAcyclicGraph<Workload, Message>&)> makespan_updater = nullptr;
 
   /** @brief .so 加载上下文（library_g.so_ctx 的元素）：构造=dlopen 装载 + dlsym 解析 C 工厂符号并
@@ -386,7 +386,7 @@ namespace fins::rt {
       });
     }
     std::map<std::string, size_t> exec_hist_cap{};   // 环形队列容量（可配：每节点保留最近 N 次 execute 耗时；未配置节点由 record_exec count/at 兜底缺省 100）
-    util::TBBMap<std::deque<double>> exec_us_hist_;  // 节点 id → 最近 execute 耗时（us；TBBMap accessor 按节点锁，只锁本节点字段）
+    util::TBBMap<std::deque<double>> exec_us_hist_;  // 算法键 → 最近 execute 耗时（us；TBBMap accessor 按算法锁，只锁本算法字段）
 
     // ── 调度状态公开成员（装配点直接读写：worker on_execute 回调 / main 主线程调度循环
     //    持 mtx 调用下述无锁原语；std::mutex 不可重入——持锁期间勿再 lock()，会死锁）──
@@ -821,13 +821,13 @@ namespace fins::rt {
               };
 
               // ── 功能 2：execute + record_exec（耗时统计：execute 前后 steady_clock 计时 us，
-              //      不含输入打包/输出路由；按节点环形队列，expand_hp 重建保留不清）──
+              //      不含输入打包/输出路由；按算法键（info.name）环形队列，expand_hp 重建保留不清）──
               auto execute_and_time = [this, sinfo, algo](std::vector<Message> &inputs) {
                 std::vector<Message> outputs(sinfo->output_ports.size());   // 输出按端口序预构造 array（算法按位置写）
                 const auto _t0 = std::chrono::steady_clock::now();
                 algo->execute(inputs, outputs);   // 配置已建图期注入 algo 实例（AlgoFunc configs_ 类型化帧，execute 零解析）
-                record_exec(sinfo->id, std::chrono::duration<double, std::micro>(
-                    std::chrono::steady_clock::now() - _t0).count());
+                record_exec(sinfo->name, std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - _t0).count());   // 键 = 算法键（非节点 id：多实例/多节点同类算法归并聚合）
                 return outputs;
               };
 
@@ -951,6 +951,11 @@ namespace fins::rt {
 
       if (false) {
         update_wcet_estimation();
+      }
+
+      if (false) {
+        if (const double makespan = makespan_updater(dag); makespan > hyper_period_ms)
+          FINS_LOG_WARN("[rollover_hp] 超周期过载：makespan={:.2f}ms > hyper_period={:.2f}ms", makespan, hyper_period_ms);
       }
 
       done_.clear();
