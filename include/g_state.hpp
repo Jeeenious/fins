@@ -25,6 +25,22 @@
 #define FINS_TIMING 1
 #endif
 
+#ifndef FINS_STATIC_PRIORITY
+#define FINS_STATIC_PRIORITY 0
+#endif
+
+#ifndef FINS_DYNAMIC_PRIORITY
+#define FINS_DYNAMIC_PRIORITY 0
+#endif
+
+#ifndef FINS_CAL_MAKESPAN
+#define FINS_CAL_MAKESPAN 0
+#endif
+
+#ifndef FINS_CAL_WCET
+#define FINS_CAL_WCET 0
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -933,6 +949,7 @@ namespace fins::rt {
       // ⑧ job 闭包
       bind_job(nodes, hyper_period_ms, by_id, node_count);
 
+      // ⑨b 初始就绪（seed_ready，私有函数，见 bind_job 之后）
       seed_ready();
     }
 
@@ -949,20 +966,26 @@ namespace fins::rt {
     void rollover_hp() {
       hyper_start_ms = fins::util::now_ms();   // 起点更新为当前真实时钟
 
-      if (false) {
-        update_wcet_estimation();
-      }
+#ifdef FINS_CAL_WCET
+      update_wcet_estimation();
+#endif
 
-      if (false) {
-        if (const double makespan = makespan_updater(dag); makespan > hyper_period_ms)
-          FINS_LOG_WARN("[rollover_hp] 超周期过载：makespan={:.2f}ms > hyper_period={:.2f}ms", makespan, hyper_period_ms);
-      }
+
+#ifdef FINS_CAL_MAKESPAN
+      if (const double makespan = makespan_updater(dag); makespan > hyper_period_ms)
+        FINS_LOG_WARN("[rollover_hp] 超周期过载：makespan={:.2f}ms > hyper_period={:.2f}ms", makespan, hyper_period_ms);
+#endif
+
+#ifdef FINS_STATIC_PRIORITY
+      for (auto &item : ready_.data())
+        item.prio = priority_updater(dag, dag.vertex(item.id));
+      ready_.rebuild();   // 按最新 prio 重建堆（O(n)）
+#endif
 
       done_.clear();
       ready_.clear();   // 图静止时应空，防御清
       ready_seq_ = 0;   // 入队序号随就绪集重置（新周期从头计序）
       tp_released_ = 0;   // tp 全部重新释放（tp_order_ 不清——同一批时间点按原序重放）
-
 
       for (auto &[id, pl] : pred_left_) pl = in_degree_.at(id);   // pred_left 重置回入度基准
     }
@@ -994,14 +1017,13 @@ namespace fins::rt {
     Workload *grab_ready_workload() {
       if (ready_.empty()) return nullptr;
 
-      if (false) {
-        update_abs_deadline();
-      }
+#ifdef FINS_DYNAMIC_PRIORITY
+      update_abs_deadline();
 
-      if (priority_updater) {;
-        for (auto &item : ready_.data())
-          item.prio = priority_updater(dag, dag.vertex(item.id));
-      }
+      for (auto &item : ready_.data())
+        item.prio = priority_updater(dag, dag.vertex(item.id));
+#endif
+
       ready_.rebuild();                                // 按最新 prio 重建堆（O(n)）
 
       const ReadyItem item = ready_.pop_max();         // 取 prio 最高者；相等按 seq FIFO（O(log n)
