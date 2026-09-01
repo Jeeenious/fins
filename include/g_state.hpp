@@ -46,6 +46,7 @@
 #include "mesg/mesg.hpp"
 #include "third_party/json.hpp"
 #include "utils/time.hpp"
+#include "utils/tracing.hpp"
 
 namespace fins::rt {
   struct Library;
@@ -819,6 +820,7 @@ namespace fins::rt {
                 std::vector<Message> inputs(sinfo->input_ports.size());
                 for (size_t i = 0; i < inputs.size(); ++i) {
                   const std::string &pn = sinfo->input_ports[i];
+
                   if (loop_w.count(pn))
                     inputs[i] = collect_loop_window(pn, loop_w.at(pn));
                   else
@@ -831,10 +833,22 @@ namespace fins::rt {
               //      不含输入打包/输出路由；按算法键（info.name）环形队列，expand_hp 重建保留不清）──
               auto execute_and_time = [this, sinfo, algo](std::vector<Message> &inputs) {
                 std::vector<Message> outputs(sinfo->output_ports.size());   // 输出按端口序预构造 array（算法按位置写）
+
                 const auto _t0 = std::chrono::steady_clock::now();
+
+#ifdef FINS_EXPORT_TRACING_PATH
+                fins::util::trace_record(fins::util::TraceKind::EXECUTE, sinfo->id);   // 执行（job 开始）
+#endif
+
                 algo->execute(inputs, outputs);   // 配置已建图期注入 algo 实例（AlgoFunc configs_ 类型化帧，execute 零解析）
+
+#ifdef FINS_EXPORT_TRACING_PATH
+                fins::util::trace_record(fins::util::TraceKind::COMPLETE, sinfo->id);   // 执行（job 完成）
+#endif
+
                 record_exec(sinfo->name, std::chrono::duration<double, std::micro>(
                     std::chrono::steady_clock::now() - _t0).count());   // 键 = 算法键（非节点 id：多实例/多节点同类算法归并聚合）
+
                 return outputs;
               };
 
@@ -847,9 +861,6 @@ namespace fins::rt {
                   const auto cap_it = mesg_hist_cap.find(pn);   // 锁外执行：const 查找避 operator[] 并发写 UB
                   if (cap_it != mesg_hist_cap.end() && cap_it->second > 0)   // 有 loop 消费者才存历史（cap>0）；record_mesg 满 cap 丢最旧
                     record_mesg(pn, outputs[i]);
-
-#ifdef FINS_EXPORT_TRACING_PATH
-#endif
                 }
               };
 

@@ -43,6 +43,7 @@
 #include <thread>
 #include <vector>
 #include "utils/form.hpp"
+#include "utils/tracing.hpp"
 #include "utils/logger.hpp"
 #include "g_state.hpp"
 #include "RPC_listener.hpp"
@@ -52,14 +53,6 @@
 
 using namespace fins::rt;
 namespace fs = std::filesystem;
-
-static fins::util::TBBMap<std::deque<double>> wid_exec_hist;
-static fins::util::TBBMap<std::deque<double>> wid_idle_hist;
-
-static fins::util::TBBMap<std::deque<double>> algo_exec_hist;
-
-static std::deque<double> expand_latency{};
-static std::deque<double> rollover_latency{};
 
 int main(int argc, char **argv) {
   const int rpc_port = argc > 1 ? std::atoi(argv[1]) : 18080;
@@ -130,31 +123,29 @@ int main(int argc, char **argv) {
   HardwareMonitor::instance().start();
 
   // ── 装配 ThreadPool worker：带锁单步事务（拉取 → 锁外执行 → 回锁直做完成事件）──
-  ThreadPool::instance().on_execute([](const int wid) -> bool {
+  ThreadPool::instance().on_execute([]() -> bool {
 
     std::unique_lock lk(graph_g.mtx);
     for (;;) {
-      if (graph_g.stopped.load()) return false;
+      if (graph_g.stopped.load())
+        return false;
 
-      if (graph_g.is_workload_ready()) {
+      if (auto w = graph_g.grab_ready_workload()) {
 
 #ifdef FINS_EXPORT_TRACING_PATH
-        const auto _t0 = std::chrono::steady_clock::now();   // 空闲段起点：完成上一任务 → 拉到下一任务（含 cv.wait）
+        fins::util::trace_record(fins::util::TraceKind::WAKE);   // 唤醒（含首轮 = 线程启动）
 #endif
-
-        const auto w = graph_g.grab_ready_workload();
 
         lk.unlock();
 
 #ifdef FINS_EXPORT_TRACING_PATH
-        const auto _t1 = std::chrono::steady_clock::now();
+        fins::util::trace_record(fins::util::TraceKind::RELEASE, w->id);   // 执行（job 开始）
 #endif
 
         w->job();
 
 #ifdef FINS_EXPORT_TRACING_PATH
-        const auto exec_us = std::chrono::duration<double, std::micro>(
-        std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（job 闭包总时长）
+        fins::util::trace_record(fins::util::TraceKind::FINISHED, w->id);   // 结束（job 完成）
 #endif
 
         lk.lock();
@@ -164,15 +155,12 @@ int main(int argc, char **argv) {
         graph_g.cv.notify_all();
 
 #ifdef FINS_EXPORT_TRACING_PATH
-        const auto idle_us = std::chrono::duration<double, std::micro>(
-          std::chrono::steady_clock::now() - _t0).count() - exec_us;   // 本线程本次空闲（完成上一任务 → 拉到下一任务）
-        TBBMAP_UPDATE(wid_idle_hist, std::to_string(wid), [&](auto &q) { q.push_back(idle_us); });
-        TBBMAP_UPDATE(wid_exec_hist, std::to_string(wid), [&](auto &q) { q.push_back(exec_us); });
-        TBBMAP_UPDATE(algo_exec_hist, w->name, [&](auto &q) { q.push_back(exec_us); });
+        fins::util::trace_record(fins::util::TraceKind::SLEEP, w->id);   // 结束（job 完成）
 #endif
 
         return true;
       }
+
       graph_g.cv.wait_for(lk, std::chrono::milliseconds(1));   // 等完成/回绕/expand_hp/停止（notify 快路径 + 1ms 超时兜底 lost wakeup）
     }
   });
@@ -192,11 +180,31 @@ int main(int argc, char **argv) {
     std::unique_lock tl(graph_g.mtx);
     while (!graph_g.stopped.load()) {
       if (const auto tp = graph_g.grab_delay_workload()) {
+
+#ifdef FINS_EXPORT_TRACING_PATH
+        fins::util::trace_record(fins::util::TraceKind::WAKE, "timer");   // 结束（job 完成）
+#endif
+
         tl.unlock();
+
+#ifdef FINS_EXPORT_TRACING_PATH
+        fins::util::trace_record(fins::util::TraceKind::RELEASE, "timer");   // 结束（job 完成）
+#endif
+
         tp->job();                              // 锁外执行：sleep_until 睡到释放时刻（延迟实现）
+
+#ifdef FINS_EXPORT_TRACING_PATH
+        fins::util::trace_record(fins::util::TraceKind::FINISHED, "timer");   // 结束（job 完成）
+#endif
+
         tl.lock();
         graph_g.trigger_workload_ready(tp->id);   // 回锁直做完成事件：置 done + 传播 pred_left（释放后继 job 顶点）
         graph_g.cv.notify_all();
+
+#ifdef FINS_EXPORT_TRACING_PATH
+        fins::util::trace_record(fins::util::TraceKind::SLEEP, "timer");   // 结束（job 完成）
+#endif
+
         continue;
       }
       graph_g.cv.wait_for(tl, std::chrono::milliseconds(1));   // 无待释放时间点 → 等事件（notify 快路径 + 1ms 超时兜底 lost wakeup）
@@ -209,7 +217,8 @@ int main(int argc, char **argv) {
       if (graph_g.is_hp_done() && graph_g.pending.load()) {
 
 #ifdef FINS_EXPORT_TRACING_PATH
-        const auto _e0 = std::chrono::steady_clock::now();   // expand_hp 建图计时起点
+        fins::util::trace_record(fins::util::TraceKind::WAKE, "main::expand");   // 唤醒（含首轮 = 线程启动）
+        fins::util::trace_record(fins::util::TraceKind::RELEASE, "main::expand");   // 释放（取到 job）
 #endif
 
         nlohmann::json cfg;
@@ -256,9 +265,8 @@ int main(int argc, char **argv) {
         graph_g.cv.notify_all();
 
 #ifdef FINS_EXPORT_TRACING_PATH
-        const auto expand_us = std::chrono::duration<double, std::micro>(
-            std::chrono::steady_clock::now() - _e0).count();
-        expand_latency.push_back(expand_us);
+        fins::util::trace_record(fins::util::TraceKind::FINISHED, "main::expand");   // 释放（取到 job）
+        fins::util::trace_record(fins::util::TraceKind::SLEEP, "main::expand");   // 释放（取到 job）
 #endif
 
         continue;
@@ -266,17 +274,20 @@ int main(int argc, char **argv) {
       if (!graph_g.is_hp_empty() && graph_g.is_hp_done()) {   // 有超周期才回绕（一次性图保持静止，防清 done_ 后 is_hp_done 变 false → 新配置永不 apply）
 
 #ifdef FINS_EXPORT_TRACING_PATH
-        const auto _r0 = std::chrono::steady_clock::now();   // rollover_hp 回绕计时起点
+        fins::util::trace_record(fins::util::TraceKind::WAKE, "main::rollover");   // 唤醒（含首轮 = 线程启动
+        fins::util::trace_record(fins::util::TraceKind::RELEASE, "main::rollover");   // 释放（取到 job）
 #endif
 
         graph_g.rollover_hp();
 
+#ifdef FINS_EXPORT_TRACING_PATH
+        fins::util::trace_record(fins::util::TraceKind::FINISHED, "main::rollover");   // 紧贴 rollover_hp 后：量纯 rollover 用时（不含 notify_all）
+#endif
+
         graph_g.cv.notify_all();
 
 #ifdef FINS_EXPORT_TRACING_PATH
-        const auto rollover_us = std::chrono::duration<double, std::micro>(
-            std::chrono::steady_clock::now() - _r0).count();
-        rollover_latency.push_back(rollover_us);
+        fins::util::trace_record(fins::util::TraceKind::SLEEP, "main::rollover");
 #endif
 
         continue;
@@ -300,54 +311,7 @@ int main(int argc, char **argv) {
   HardwareMonitor::instance().stop();
 
 #ifdef FINS_EXPORT_TRACING_PATH
-  // ── CSV 导出：每 worker 的原始 exec/idle 样本序列（exec 与 idle 一一配对；供离线分析/绘图）──
-  FINS_LOG_INFO("[agent] exporting timing data");
-  {
-    std::ofstream ofs("wid_exec_stats.csv");
-    ofs << "wid,idx,idle_us\n";
-    for (auto &[fst, snd] : wid_exec_hist) {
-      const std::string &wid = fst;
-      const auto &eq = snd;   // 本 wid 的 exec 序列（exec/idle 同回调同长记录 → 天然配对）
-      std::deque<double> iq;        // 局部拷贝：TBBMAP_READ 宏作用域外引用悬垂，须拷出
-      TBBMAP_READ(wid_idle_hist, wid, [&](const auto &q) { iq = q; });
-      const size_t n = iq.empty() ? 0 : std::min(eq.size(), iq.size());
-      for (size_t i = 0; i < n; ++i)
-        ofs << wid << ',' << i << ',' << iq[i] << '\n';
-    }
-    ofs.close();
-  }
-
-  // ── CSV 导出：algo 开销差分（逐次 job：总执行 algo_exec − 纯函数 algo_func = 打包/路由/调度开销；
-  //    func 直接读 exec_us_hist_（算法键，ring 容量 exec_hist_cap 上限 → 尾部对齐）──
-  {
-    std::ofstream ofs("algo_exec_stats.csv");
-    ofs << "algo,idx,diff_us\n";
-    for (auto &[fst, snd] : algo_exec_hist) {
-      const std::string &algo = fst;
-      const auto &eq = snd;   // 本算法总执行耗时序列（逐次 job，无上限）
-      std::deque<double> fq;         // 纯函数耗时：exec_us_hist_ ring 丢头 → 只留最近 K 条
-      TBBMAP_READ(graph_g.exec_us_hist_, algo, [&](const auto &q) { fq = q; });
-      if (fq.empty()) continue;      // 该算法无 execute 计时（理论不发生）
-      const size_t K = fq.size();
-      const size_t m = eq.size();
-      const size_t start = K >= m ? 0 : (m - K);   // 尾部对齐：最近 K 条 exec 配 func K 条
-      for (size_t i = 0; i < K; ++i)
-        ofs << algo << ',' << i << ',' << (eq[start + i] - fq[i]) << '\n';
-    }
-    ofs.close();
-  }
-
-  // ── CSV 导出：主线程 expand/rollover 耗时样本（kind: expand=建图 / rollover=超周期回绕）──
-  {
-    std::ofstream ofs("main_loop_stats.csv");
-    ofs << "kind,idx,us,extra\n";
-    for (size_t i = 0; i < expand_latency.size(); ++i)
-      ofs << "expand," << i << ',' << expand_latency[i] << ",\n";
-    for (size_t i = 0; i < rollover_latency.size(); ++i)
-      ofs << "rollover," << i << ',' << rollover_latency[i] << ",\n";
-    ofs << "\n";
-    ofs.close();
-  }
+  fins::util::trace_export(FINS_EXPORT_TRACING_PATH);
 #endif
 
   FINS_LOG_INFO("[agent] bye");
