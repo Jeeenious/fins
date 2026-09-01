@@ -38,7 +38,10 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
+#include <queue>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -50,6 +53,7 @@
 #include "hardware_monitor.hpp"
 #include "plugin_loader.hpp"
 #include "thread_pool.hpp"
+#include "schedule/makespan_updater.hpp"
 
 using namespace fins::rt;
 namespace fs = std::filesystem;
@@ -59,6 +63,11 @@ int main(int argc, char **argv) {
   const std::string plugin_dir = argc > 2 ? argv[2] : "./plugins";
   int num_workers = argc > 3 ? std::atoi(argv[3]) : 2;   // 线程池 worker 数；非法/≤0 回落默认 2
   if (num_workers < 1) num_workers = 2;
+
+  // ── 装配 makespan_updater：mpb_makespan(dag, m) ──
+  makespan_updater = [num_workers](fins::util::DirectedAcyclicGraph<Workload, Message> &dag) {
+    return fins::sched::mpb_makespan(dag, num_workers);
+  };
 
   // ── 临时：插件加载：全局插件初始化（存量扫描装载）──
   try {
