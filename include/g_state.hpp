@@ -355,7 +355,7 @@ namespace fins::rt {
     double ddl{0};                // 绝对截止期（ms；滚动排期 = 主线程事件驱动 update_abs_deadline 按当前
     double wcet{1};               // 最坏执行时间（ms；缺省 1）
 
-    std::function<void()> job;    // 执行体（闭包捕获实例 + 节点配置，执行时现查边取帧/发布）
+    std::function<void()> job;    // 执行体（闭包捕获实例 + 预解析绑定边引用，运行时零查找取帧/发布）
   };
 
   /** @brief PrecedenceGraph — 数据流图 + 调度依据（单份运行图 graph_g）。公开成员 = 调度状态
@@ -799,7 +799,18 @@ namespace fins::rt {
             // 状态修改移出 job：就绪/完成由 PrecedenceGraph 侧增量状态（pred_left_/done_/ready_）
             // 判定，装配点 on_execute 回调事务回锁调 trigger_workload_ready(id)（完成事件不在闭包内）；
             // 本闭包只执行 = 打包输入 → execute+计时 → 路由输出（三个功能段各一 lambda）。
-            v.job = [this, sinfo, algo, vtx, loop_w]() {
+            // ── 预解析绑定边引用（绑定期一次性，热路径零查找）：输入逐普通端口取入边唯一帧槽，
+            //    输出逐端口取全部下游边槽（fork 共享帧）。图静止期间不重建（并发假设：
+            //    expand/rollover 不悬垂），引用跨整轮运行稳定——100 端口打包/路由从 ~240us 降到 ~us 级。
+            std::vector<std::vector<std::reference_wrapper<Message>>> in_refs(sinfo->input_ports.size());
+            for (size_t i = 0; i < in_refs.size(); ++i)
+              if (!loop_w.count(sinfo->input_ports[i]))
+                in_refs[i] = dag.edges_to(vtx, sinfo->input_ports[i]);   // 非 loop 端口：单写者约束 → 至多一条
+            std::vector<std::vector<std::reference_wrapper<Message>>> out_refs(sinfo->output_ports.size());
+            for (size_t i = 0; i < out_refs.size(); ++i)
+              out_refs[i] = dag.edges_from(vtx, sinfo->output_ports[i]);
+            v.job = [this, sinfo, algo, loop_w,
+                     in_refs = std::move(in_refs), out_refs = std::move(out_refs)]() {
               // ── 功能 1a：loop 端口 → 滑动窗口历史槽聚合最近 w 帧（恒长 w、窗口未满开头补空
               //      Message 占位，frame=nullptr，算法须判断 .frame 跳过/当 0，勿 sub）──
               auto collect_loop_window = [this](const std::string &pn, size_t w) {
@@ -820,18 +831,15 @@ namespace fins::rt {
                 return m;
               };
 
-              // ── 功能 1b：普通端口 → 绑定边唯一帧（该 producer job 输出；无绑定边理论不发生 → 空帧占位）──
-              auto frame_from_edge = [this, vtx](const std::string &pn) {
-                auto es = dag.edges_to(vtx, pn);
-                return es.empty() ? Message{} : es[0].get();
-              };
-
-              // ── 功能 1：打包输入 array（loop 端口走聚合、普通端口走绑定边；按端口序，算法按位置取不碰端口名）──
-              auto pack_inputs = [this, sinfo, loop_w, collect_loop_window, frame_from_edge]() {
+              // ── 功能 1：打包输入 array（loop 端口走聚合、普通端口走预解析 in_refs；按端口序，算法按位置取不碰端口名）──
+              auto pack_inputs = [this, sinfo, loop_w, collect_loop_window, &in_refs]() {
                 std::vector<Message> inputs(sinfo->input_ports.size());
                 for (size_t i = 0; i < inputs.size(); ++i) {
                   const std::string &pn = sinfo->input_ports[i];
-                  inputs[i] = loop_w.count(pn) ? collect_loop_window(pn, loop_w.at(pn)) : frame_from_edge(pn);
+                  if (loop_w.count(pn))
+                    inputs[i] = collect_loop_window(pn, loop_w.at(pn));
+                  else
+                    inputs[i] = in_refs[i].empty() ? Message{} : in_refs[i][0].get();   // 预解析引用，零查找
                 }
                 return inputs;
               };
@@ -847,12 +855,12 @@ namespace fins::rt {
                 return outputs;
               };
 
-              // ── 功能 3：路由输出（写全部下游绑定边共享帧 + 有 loop 消费者才存历史槽）──
-              auto route_outputs = [this, sinfo, vtx](std::vector<Message> &outputs) {
+              // ── 功能 3：路由输出（写预解析下游引用共享帧 + 有 loop 消费者才存历史槽）──
+              auto route_outputs = [this, sinfo, &out_refs](std::vector<Message> &outputs) {
                 for (size_t i = 0; i < outputs.size(); ++i) {
-                  const std::string &pn = sinfo->output_ports[i];
-                  for (auto &e : dag.edges_from(vtx, pn))
+                  for (auto &e : out_refs[i])
                     e.get() = outputs[i];   // 写全部下游绑定边（生产者消费者共享帧）
+                  const std::string &pn = sinfo->output_ports[i];
                   const auto cap_it = mesg_hist_cap.find(pn);   // 锁外执行：const 查找避 operator[] 并发写 UB
                   if (cap_it != mesg_hist_cap.end() && cap_it->second > 0)   // 有 loop 消费者才存历史（cap>0）；record_mesg 满 cap 丢最旧
                     record_mesg(pn, outputs[i]);
@@ -966,17 +974,17 @@ namespace fins::rt {
     void rollover_hp() {
       hyper_start_ms = fins::util::now_ms();   // 起点更新为当前真实时钟
 
-#ifdef FINS_CAL_WCET
+#if FINS_CAL_WCET
       update_wcet_estimation();
 #endif
 
 
-#ifdef FINS_CAL_MAKESPAN
+#if FINS_CAL_MAKESPAN
       if (const double makespan = makespan_updater(dag); makespan > hyper_period_ms)
         FINS_LOG_WARN("[rollover_hp] 超周期过载：makespan={:.2f}ms > hyper_period={:.2f}ms", makespan, hyper_period_ms);
 #endif
 
-#ifdef FINS_STATIC_PRIORITY
+#if FINS_STATIC_PRIORITY
       for (auto &item : ready_.data())
         item.prio = priority_updater(dag, dag.vertex(item.id));
       ready_.rebuild();   // 按最新 prio 重建堆（O(n)）
@@ -1017,7 +1025,7 @@ namespace fins::rt {
     Workload *grab_ready_workload() {
       if (ready_.empty()) return nullptr;
 
-#ifdef FINS_DYNAMIC_PRIORITY
+#if FINS_DYNAMIC_PRIORITY
       update_abs_deadline();
 
       for (auto &item : ready_.data())
