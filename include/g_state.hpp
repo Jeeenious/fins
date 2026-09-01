@@ -784,14 +784,20 @@ namespace fins::rt {
           dag.mutate_vertex(vtx, [this, sinfo, algo, vtx, loop_w](Workload &v) {
             v.id = vtx;   // Workload.id 实际填充（grab_ready_workload 返回 Workload* 含 id，装配点直做完成事件用）
 
+            // 按 tag 分组一次性解析（O(边数) 替代 O(端口×边数) 的逐端口 edges_to/from）
+            auto in_groups  = dag.edges_to_grouped(vtx);
+            auto out_groups = dag.edges_from_grouped(vtx);
             std::vector<std::vector<std::reference_wrapper<Message>>> in_refs(sinfo->input_ports.size());
             for (size_t i = 0; i < in_refs.size(); ++i)
-              if (!loop_w.count(sinfo->input_ports[i]))
-                in_refs[i] = dag.edges_to(vtx, sinfo->input_ports[i]);   // 非 loop 端口：单写者约束 → 至多一条
-
+              if (!loop_w.count(sinfo->input_ports[i])) {   // 非 loop 端口：查分组表（单写者 → 至多一条）
+                const auto it = in_groups.find(sinfo->input_ports[i]);
+                if (it != in_groups.end()) in_refs[i] = it->second;
+              }
             std::vector<std::vector<std::reference_wrapper<Message>>> out_refs(sinfo->output_ports.size());
-            for (size_t i = 0; i < out_refs.size(); ++i)
-              out_refs[i] = dag.edges_from(vtx, sinfo->output_ports[i]);
+            for (size_t i = 0; i < out_refs.size(); ++i) {
+              const auto it = out_groups.find(sinfo->output_ports[i]);
+              if (it != out_groups.end()) out_refs[i] = it->second;
+            }
 
             v.job = [this,
               sinfo,

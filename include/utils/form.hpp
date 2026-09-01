@@ -10,6 +10,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <tbb/concurrent_hash_map.h>
@@ -270,6 +271,37 @@ namespace fins::util {
                   break;
                 }
           }
+      return out;
+    }
+
+    /** @brief 该节点全部出边按 tag 分组（O(出度) 一次遍历；bind_job 预解析用，
+     *  替代逐端口多次 edges_from 的 O(出度×端口) 扫描）。
+     * @param id 源顶点 id
+     * @retval std::unordered_map<tag, vector<EdgeT 引用>> 出边数据引用按 tag 分组
+     */
+    std::unordered_map<std::string, std::vector<std::reference_wrapper<EdgeT>>> edges_from_grouped(const NodeId &id) {
+      std::unordered_map<std::string, std::vector<std::reference_wrapper<EdgeT>>> out;
+      typename TBBMap<std::vector<Edge>>::accessor a;
+      if (adj_.find(a, id))
+        for (auto &e : a->second) out[e.tag].push_back(e.data);
+      return out;
+    }
+
+    /** @brief 该节点全部入边按 tag 分组（经 rev_ 反查 adj_ 真数据；单写者约束保证 (to,tag)
+     *  至多一条 → 每组至多 1 个引用）。bind_job 预解析用，替代逐端口多次 edges_to。
+     * @param id 目标顶点 id
+     * @retval std::unordered_map<tag, vector<EdgeT 引用>> 入边数据引用按 tag 分组
+     */
+    std::unordered_map<std::string, std::vector<std::reference_wrapper<EdgeT>>> edges_to_grouped(const NodeId &id) {
+      std::unordered_map<std::string, std::vector<std::reference_wrapper<EdgeT>>> out;
+      typename TBBMap<std::vector<StreamRef>>::accessor ra;
+      if (rev_.find(ra, id))
+        for (const auto &ref : ra->second) {
+          typename TBBMap<std::vector<Edge>>::accessor a;
+          if (adj_.find(a, ref.from))
+            for (auto &e : a->second)
+              if (e.to == id && e.tag == ref.tag) { out[ref.tag].push_back(e.data); break; }
+        }
       return out;
     }
 
