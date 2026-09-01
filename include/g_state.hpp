@@ -37,6 +37,7 @@
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <unordered_map>
 #include <string>
 #include <thread>
 #include <utility>
@@ -398,7 +399,9 @@ namespace fins::rt {
     // ── 就绪增量调度状态（私有；持 mtx 访问，装配点经无锁原语间接使用）──
     std::map<std::string, size_t> pred_left_;   // 剩余未完成前序数（含 seq/绑定/tp 挂靠边）
     std::map<std::string, size_t> in_degree_;   // 入度基准（expand 填；rollover 重置 pred_left_ 用）
-    std::set<std::string> done_;        // 已完成顶点集（job+tp 全计；is_hp_done 计数 + tp 防重拉）
+    std::unordered_map<std::string, uint64_t> done_;   // 顶点 id → 完成世代号（世代化 clear：rollover O(1) 重置，免释放节点）
+    uint64_t done_gen_{0};                              // 当前世代号（rollover/expand 递增；done_[id]==gen ⇒ 本世代已完成）
+    size_t done_count_{0};                              // 本世代已完成顶点数（is_hp_done 用；rollover 归零）
 
     struct ReadyItem {                          // 就绪集元素：id + 入队序号 + 排序键
       std::string id;
@@ -906,8 +909,10 @@ namespace fins::rt {
       mesg_hist_cap.clear();   // 只清容量表（新配置重算）；message_hist_ 历史槽跨重建保留不清（同 exec_us_hist_）
       pred_left_.clear();   // 就绪增量状态：空配置早退也一致清空
       in_degree_.clear();
-      done_.clear();
+      done_.clear();                 // 新配置全量清（map 释放）；世代号一并归零
       dag.clear();
+      done_count_ = 0;
+      done_gen_ = 0;
 
       ready_.clear();
       ready_seq_ = 0;   // 入队序号随就绪集一并重置（新周期从头计序）
@@ -991,12 +996,17 @@ namespace fins::rt {
       ready_.rebuild();   // 按最新 prio 重建堆（O(n)）
 #endif
 
-      done_.clear();
-      ready_.clear();   // 图静止时应空，防御清
+      ++done_gen_;   // 世代化 clear：O(1) 重置，免释放 done_ 的 unordered_map 节点（原 std::set::clear 每顶点一次释放）
+      done_count_ = 0;
+      ready_.clear();   // 图静止时应空，防御清（LazyMaxHeap 为 vector，clear 保容量 O(1)）
       ready_seq_ = 0;   // 入队序号随就绪集重置（新周期从头计序）
       tp_released_ = 0;   // tp 全部重新释放（tp_order_ 不清——同一批时间点按原序重放）
 
-      for (auto &[id, pl] : pred_left_) pl = in_degree_.at(id);   // pred_left 重置回入度基准
+      // pred_left 重置回入度基准：两 map 键集相同且均按键有序 → 锁步遍历，O(n) 免逐顶点 at() 查找
+      {
+        auto it_deg = in_degree_.begin();
+        for (auto &[id, pl] : pred_left_) { pl = it_deg->second; ++it_deg; }
+      }
     }
 
     /**
@@ -1005,7 +1015,7 @@ namespace fins::rt {
      *        主线程调度循环持锁调本原语，图静止后决定 expand_hp / rollover_hp / wait。
      * @retval bool true = 图静止（全部顶点完成 / 空图 0==0）
      */
-    bool is_hp_done() { return done_.size() == dag.size(); }
+    bool is_hp_done() { return done_count_ == dag.size(); }
 
     bool is_hp_empty() { return dag.size() == 0; }
 
@@ -1069,7 +1079,13 @@ namespace fins::rt {
      * @retval 无
      */
     void trigger_workload_ready(const std::string &id) {
-      if (!done_.insert(id).second) return;   // 幂等防御（正常每顶点恰完成一次）
+      {   // 幂等防御（世代化 done_：本世代已完成 → 跳过；正常每顶点每超周期恰完成一次）
+        auto it = done_.find(id);
+        if (it != done_.end() && it->second == done_gen_) return;
+        if (it == done_.end()) done_.emplace(id, done_gen_);
+        else it->second = done_gen_;
+        ++done_count_;
+      }
 
       for (const auto &s : dag.out_nodes(id)) {
         auto it = pred_left_.find(s);
