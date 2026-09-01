@@ -20,6 +20,11 @@ find_package(Threads REQUIRED)
 #   ${SDK_ROOT}/include/utils  utils 内裸名 include（logger.hpp / form.hpp）
 #   ${SDK_ROOT}                仓库根（RPC_listener.hpp 等内 third_party/... 引用）
 set(SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+# 输出目录（现代变量；LIBRARY_OUTPUT_PATH/EXECUTABLE_OUTPUT_PATH 是遗留变量）：
+#   client/server  → 仓库根 build/（run_client.sh / run_server.sh 默认查找仓库根 client / server）
+#   plugin.so      → 仓库根 plugins/（client 默认 plugin_dir=./plugins 从这加载）
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+set(LIBRARY_OUTPUT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
 
 include_directories(
     ${SDK_ROOT}/include
@@ -36,14 +41,11 @@ include_directories(
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/example/plugins.cpp")
     add_library(plugin SHARED example/plugins.cpp)
     target_include_directories(plugin PRIVATE
-        ${SDK_ROOT}/include
         ${SDK_ROOT}/include/utils
+        ${SDK_ROOT}/include
         ${SDK_ROOT}
     )
-    set_target_properties(plugin PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/plugins"
-        PREFIX ""
-    )
+    set_target_properties(plugin PROPERTIES PREFIX "")
 endif()
 
 # =================================================================

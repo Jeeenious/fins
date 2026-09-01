@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 # ============================================================================
-# run.sh — 核心独占一键脚本：RT 授权 + cpuset v2 隔离分区 + 启动 client
+# client.sh — 核心独占脚本：RT 授权 + cpuset v2 隔离分区 + 启动 client
 #
 # 用法：
-#   sudo ./run.sh -g                          # 授 RT 优先级（一次性，写 limits.d）
-#   sudo ./run.sh <核范围>                     # 独占核 + 启动 client（worker=2 默认）
-#   sudo ./run.sh <核范围> <worker数>          # 同上，指定 worker 数
-#   sudo ./run.sh <核范围> <命令...>           # 独占核 + 启动任意命令（透传）
-#   sudo ./run.sh -a <核范围> <pid>            # 把已运行进程移入独占分区
-#   sudo ./run.sh -r                          # 删除独占分区、放回核心
+#   sudo ./client.sh -g                          # 授 RT 优先级（一次性，写 limits.d）
+#   sudo ./client.sh <核范围>                     # 独占核 + 启动 client（worker=2 默认）
+#   sudo ./client.sh <核范围> <worker数>          # 同上，指定 worker 数
+#   sudo ./client.sh <核范围> <命令...>           # 独占核 + 启动任意命令（透传）
+#   sudo ./client.sh -a <核范围> <pid>            # 把已运行进程移入独占分区
+#   sudo ./client.sh -r                          # 删除独占分区、放回核心
 #
-# 封装 client 模式选项：
+# client 模式选项：
 #   -p <port>      RPC 端口（默认 18080）
 #   -d <dir>       插件目录（默认 ./plugins）
-#   环境变量 CLIENT_BIN 可覆盖 client 二进制路径（默认 cmake-build-debug/client）
+#   环境变量 CLIENT_BIN 可覆盖 client 二进制路径（默认仓库根 client）
 #
 # 示例：
-#   sudo ./run.sh 1-2                 # 独占核 1-2，起 client（2 worker）
-#   sudo ./run.sh 1-4 4 -p 19090      # 独占核 1-4，4 worker，端口 19090
-#   sudo ./run.sh 1-2 ./client 18080 ./plugins   # 任意命令透传
+#   sudo ./client.sh 1-4 4                # 独占核 1-4，4 worker 起 client
+#   ./server.sh pipeline/cfg_usr_fork100.json   # 另开终端发配置（无需 sudo）
+#   sudo ./client.sh 1-2 ./client 18080 ./plugins   # 任意命令透传
 #
 # 注意：
 #   - 核范围须覆盖 client worker 要绑的核（start(n) → 核 1..n）。
@@ -31,7 +31,7 @@ CG=$CGBASE/fins_exclusive
 RT_CONF=/etc/security/limits.d/50-fins-rt.conf
 RT_PRIO=95
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLIENT_BIN="${CLIENT_BIN:-$SCRIPT_DIR/cmake-build-debug/client}"
+CLIENT_BIN="${CLIENT_BIN:-$SCRIPT_DIR/client}"
 
 # -g：写 limits.d 授 RT（需 root，幂等覆盖）
 grant_rt() {

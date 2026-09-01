@@ -42,8 +42,11 @@ code_collector.md
 # Compiled Object files
 *.slo
 *.lo
+*.so
 *.o
 *.obj
+client
+server
 
 # Precompiled Headers
 *.gch
