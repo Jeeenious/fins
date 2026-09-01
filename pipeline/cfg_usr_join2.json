@@ -1,7 +1,7 @@
 [
   {"id": "a", "name": "usr_src", "version": "1.0.0", "period": 100,
    "outputs": ["fa"], "parameters": [{"value": 3}]},
-  {"id": "b", "name": "usr_src", "version": "1.0.0", "period": 100,
+  {"id": "b", "name": "usr_src", "version": "1.0.0", "period": 50,
    "outputs": ["fb"], "parameters": [{"value": 3}]},
   {"id": "g", "name": "usr_join", "version": "1.0.0",
    "inputs": ["fa", "fb"], "outputs": ["out"], "parameters": [{"value": 2}]},
