@@ -16,7 +16,7 @@
 //   server <cfg.json> [rpc_port=18080]  — 可选覆盖：路径 / 端口
 // ============================================================================
 
-#include "../third_party/httplib.h"
+#include "third_party/httplib.h"
 #include <cstdio>
 #include <fstream>
 #include <sstream>

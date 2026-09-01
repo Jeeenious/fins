@@ -35,13 +35,13 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <form.hpp>
-#include "../RPC_listener.hpp"
-#include "../g_state.hpp"
-#include "../hardware_monitor.hpp"
-#include "../plugin_loader.hpp"
-#include "../thread_pool.hpp"
-#include "../utils/logger.hpp"
+#include "utils/form.hpp"
+#include "utils/logger.hpp"
+#include "g_state.hpp"
+#include "RPC_listener.hpp"
+#include "hardware_monitor.hpp"
+#include "plugin_loader.hpp"
+#include "thread_pool.hpp"
 
 using namespace fins::rt;
 namespace fs = std::filesystem;

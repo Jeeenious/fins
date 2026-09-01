@@ -23,6 +23,7 @@ __pycache__/
 
 # Dataset images
 *.png
+*.csv
 *.jpg
 !logo.png
 pyconfig.json
@@ -68,3 +69,7 @@ log/
 build/
 resource/
 test/
+/memory/
+/memory/FACT.md
+/memory/JOURNAL.jsonl
+/plugins/

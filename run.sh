@@ -13,7 +13,7 @@
 # 封装 client 模式选项：
 #   -p <port>      RPC 端口（默认 18080）
 #   -d <dir>       插件目录（默认 ./plugins）
-#   环境变量 CLIENT_BIN 可覆盖 client 二进制路径（默认 sdk/fins/test/cmake-build-debug/client）
+#   环境变量 CLIENT_BIN 可覆盖 client 二进制路径（默认 cmake-build-debug/client）
 #
 # 示例：
 #   sudo ./run.sh 1-2                 # 独占核 1-2，起 client（2 worker）
@@ -31,7 +31,7 @@ CG=$CGBASE/fins_exclusive
 RT_CONF=/etc/security/limits.d/50-fins-rt.conf
 RT_PRIO=95
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLIENT_BIN="${CLIENT_BIN:-$SCRIPT_DIR/sdk/fins/test/cmake-build-debug/client}"
+CLIENT_BIN="${CLIENT_BIN:-$SCRIPT_DIR/cmake-build-debug/client}"
 
 # -g：写 limits.d 授 RT（需 root，幂等覆盖）
 grant_rt() {
@@ -55,6 +55,14 @@ create_partition() {
     echo "== 清理上次残留分区"
     rmdir "$CG" 2>/dev/null || { echo "!! 分区内仍有进程，先 sudo $0 -r" >&2; exit 1; }
   fi
+  # cgroup v2：子 cgroup 只会出现父级 subtree_control 已启用的控制器文件。
+  # root 默认只挂了 memory pids，不先启用 cpuset 的话 fins_exclusive 里根本没有
+  # cpuset.cpus / cpuset.mems，写入会报"权限不够"。根 cgroup 豁免"内部进程约束"
+  # （root 有内核线程也无妨），echo +cpuset 即可。已启用则跳过（幂等）。
+  if ! grep -qw cpuset "$CGBASE/cgroup.subtree_control" 2>/dev/null; then
+    echo "+cpuset" > "$CGBASE/cgroup.subtree_control" || {
+      echo "!! 无法启用 cpuset 控制器：$CGBASE/cgroup.subtree_control" >&2; exit 1; }
+  fi
   mkdir -p "$CG"
   # v2 root 只暴露 cpuset.mems.effective（单 NUMA=0），失败兜底 0
   echo "$(cat "$CGBASE/cpuset.mems.effective" 2>/dev/null || echo 0)" > "$CG/cpuset.mems"
@@ -76,7 +84,7 @@ run_in_partition() {
   echo $$ > "$CG/cgroup.procs"
   if [ -n "${SUDO_USER:-}" ] && command -v setpriv >/dev/null; then
     # setpriv 降权不重放 PAM limits：rtprio 会继承 sudo root 的默认 0 → 先以 root 抬软硬限制，
-    # 子进程继承、setuid 后保留，jenny 才能设 SCHED_FIFO prio≤RT_PRIO（否则 Operation not permitted）。
+    # 子进程继承、setuid 后保留，usr 才能设 SCHED_FIFO prio≤RT_PRIO（否则 Operation not permitted）。
     prlimit --pid=$$ --rtprio="$RT_PRIO" 2>/dev/null \
       || { ulimit -Hr "$RT_PRIO" 2>/dev/null || true; ulimit -r "$RT_PRIO" 2>/dev/null || true; }
     exec setpriv --reuid="$SUDO_USER" --regid="$SUDO_USER" --init-groups "$@"
