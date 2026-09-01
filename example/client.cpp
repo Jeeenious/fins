@@ -54,6 +54,7 @@
 #include "plugin_loader.hpp"
 #include "thread_pool.hpp"
 #include "schedule/makespan_updater.hpp"
+#include "schedule/wcet_updater.hpp"
 
 using namespace fins::rt;
 namespace fs = std::filesystem;
@@ -67,6 +68,12 @@ int main(int argc, char **argv) {
   // ── 装配 makespan_updater：mpb_makespan(dag, m) ──
   makespan_updater = [num_workers](fins::util::DirectedAcyclicGraph<Workload, Message> &dag) {
     return fins::sched::mpb_makespan(dag, num_workers);
+  };
+
+  // ── 装配 wcet_updater：99% 分位 + 20% 裕度（FINS_CAL_WCET=1 时 rollover 用历史覆盖 v.wcet；
+  //     默认 0 关闭——历史 µs 量级 vs 配置 wcet ms 量级，开启会改 makespan 估计联动行为）──
+  wcet_updater = [](std::deque<double> hist) {
+    return fins::sched::wcet_pquantile(hist);
   };
 
   // ── 临时：插件加载：全局插件初始化（存量扫描装载）──

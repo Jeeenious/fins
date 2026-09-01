@@ -1136,7 +1136,7 @@ namespace fins::rt {
       dag.for_each_vertex([&](const std::string &, Workload &v) {
         if (!v.job) return;
         if (v.id.rfind("tp:", 0) != 0)
-          TBBMAP_READ(exec_us_hist_, v.id, [&](const auto &hist) {
+          TBBMAP_READ(exec_us_hist_, v.name, [&](const auto &hist) {   // 键 = 算法键（record_exec 用 info.name；v.id = {name}:{k} 对不上）
             if (!hist.empty() && wcet_updater) v.wcet = wcet_updater(hist);
           });
       });
