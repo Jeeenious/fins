@@ -394,6 +394,8 @@ namespace fins::rt {
     std::condition_variable cv;
     std::atomic<bool> stopped{false};
     std::atomic<bool> pending{false};
+    uint64_t graph_version{0};   // 图结构版本号（expand_hp 重建后 ++；main 线程持 mtx 写读）。
+                                 // makespan_updater 结构缓存的失效信号——结构只随重建变，与 wcet 无关
 
   private:
     // ── 就绪增量调度状态（私有；持 mtx 访问，装配点经无锁原语间接使用）──
@@ -927,7 +929,7 @@ namespace fins::rt {
 
       const auto nodes = pipeline.nodes;   // 入参快照（拷贝，防外部改）
       const auto so_ctx = library.so_ctx;
-      if (nodes.empty()) return;        // 空配置 → 空图（幂等，parse 已产空表）
+      if (nodes.empty()) { ++graph_version; return; }   // 空配置 → 空图（幂等；结构已清空，同样发失效信号）
 
       // ① 端口索引：producers/consumers + 一跳邻居
       std::map<std::string, std::vector<std::string>> producers, consumers;
@@ -967,6 +969,8 @@ namespace fins::rt {
 
       // ⑨b 初始就绪（seed_ready，私有函数，见 bind_job 之后）
       seed_ready();
+
+      ++graph_version;   // 结构重建完成 → makespan 结构缓存失效信号（须在全部建图步骤后）
 
 #ifdef FINS_EXPORT_DGRAPH_PATH
       std::ofstream(FINS_EXPORT_DGRAPH_PATH) << export_dag().dump(2);
