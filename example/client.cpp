@@ -24,11 +24,18 @@
 //                                     锁外执行 tp->job() 即 sleep_until 到点 → 回锁置 Finished + notify）
 // ============================================================================
 
+#define FINS_EXPORT_TRACING_PATH "./tmp/traing.csv"
+#define FINS_EXPORT_DGRAPH_PATH "./tmp/dag.json"
+
+#define FINS_STATIC_PRIORITY 0
+#define FINS_DYNAMIC_PRIORITY 0
+#define FINS_CAL_MAKESPAN 0
+#define FINS_CAL_WCET 0
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -131,7 +138,7 @@ int main(int argc, char **argv) {
 
       if (graph_g.is_workload_ready()) {
 
-#if FINS_TIMING
+#ifdef FINS_EXPORT_TRACING_PATH
         const auto _t0 = std::chrono::steady_clock::now();   // 空闲段起点：完成上一任务 → 拉到下一任务（含 cv.wait）
 #endif
 
@@ -139,13 +146,13 @@ int main(int argc, char **argv) {
 
         lk.unlock();
 
-#if FINS_TIMING
+#ifdef FINS_EXPORT_TRACING_PATH
         const auto _t1 = std::chrono::steady_clock::now();
 #endif
 
         w->job();
 
-#if FINS_TIMING
+#ifdef FINS_EXPORT_TRACING_PATH
         const auto exec_us = std::chrono::duration<double, std::micro>(
         std::chrono::steady_clock::now() - _t1).count();   // 本线程本次实测（job 闭包总时长）
 #endif
@@ -156,7 +163,7 @@ int main(int argc, char **argv) {
 
         graph_g.cv.notify_all();
 
-#if FINS_TIMING
+#ifdef FINS_EXPORT_TRACING_PATH
         const auto idle_us = std::chrono::duration<double, std::micro>(
           std::chrono::steady_clock::now() - _t0).count() - exec_us;   // 本线程本次空闲（完成上一任务 → 拉到下一任务）
         TBBMAP_UPDATE(wid_idle_hist, std::to_string(wid), [&](auto &q) { q.push_back(idle_us); });
@@ -201,7 +208,7 @@ int main(int argc, char **argv) {
     while (!graph_g.stopped.load()) {
       if (graph_g.is_hp_done() && graph_g.pending.load()) {
 
-#if FINS_TIMING
+#ifdef FINS_EXPORT_TRACING_PATH
         const auto _e0 = std::chrono::steady_clock::now();   // expand_hp 建图计时起点
 #endif
 
@@ -248,7 +255,7 @@ int main(int argc, char **argv) {
         graph_g.pending = false;   // 已应用（成功/失败均清除，勿残留导致 commit 翻到未写份交替重建）
         graph_g.cv.notify_all();
 
-#if FINS_TIMING
+#ifdef FINS_EXPORT_TRACING_PATH
         const auto expand_us = std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - _e0).count();
         expand_latency.push_back(expand_us);
@@ -258,7 +265,7 @@ int main(int argc, char **argv) {
       }
       if (!graph_g.is_hp_empty() && graph_g.is_hp_done()) {   // 有超周期才回绕（一次性图保持静止，防清 done_ 后 is_hp_done 变 false → 新配置永不 apply）
 
-#if FINS_TIMING
+#ifdef FINS_EXPORT_TRACING_PATH
         const auto _r0 = std::chrono::steady_clock::now();   // rollover_hp 回绕计时起点
 #endif
 
@@ -266,7 +273,7 @@ int main(int argc, char **argv) {
 
         graph_g.cv.notify_all();
 
-#if FINS_TIMING
+#ifdef FINS_EXPORT_TRACING_PATH
         const auto rollover_us = std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - _r0).count();
         rollover_latency.push_back(rollover_us);
@@ -292,7 +299,7 @@ int main(int argc, char **argv) {
   FINS_LOG_INFO("[agent] teardown: stop hardware monitor");
   HardwareMonitor::instance().stop();
 
-#if FINS_TIMING
+#ifdef FINS_EXPORT_TRACING_PATH
   // ── CSV 导出：每 worker 的原始 exec/idle 样本序列（exec 与 idle 一一配对；供离线分析/绘图）──
   FINS_LOG_INFO("[agent] exporting timing data");
   {

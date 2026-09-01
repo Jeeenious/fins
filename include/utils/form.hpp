@@ -320,6 +320,17 @@ namespace fins::util {
       for (auto &kv : nodes_.range()) fn(kv.first, kv.second);
     }
 
+    /** @brief 遍历全部边 (from, to, tag, EdgeT&) 并回调（图导出/调试遍历用：adj_ 邻接表
+     *  Edge 自带 from/to/tag/data，遍历自足无冗余）。
+     * @param fn 遍历回调 (const NodeId&, const NodeId&, const std::string&, EdgeT& → void)
+     * @retval 无
+     */
+    template<typename Fn>
+    void for_each_edge(Fn &&fn) {
+      for (auto &kv : adj_.range())
+        for (auto &e : kv.second) fn(e.from, e.to, e.tag, e.data);
+    }
+
   private:
     TBBMap<VertexT> nodes_;                 // node_id → 顶点载荷
     TBBMap<std::vector<Edge>> adj_;         // node_id → 出边列表（邻接表，含 data）

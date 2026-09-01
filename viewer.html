@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>数据流图可视化 · Dataflow Graph Viewer</title>
+<style>
+:root{
+  --bg:#f8fafc; --panel:#ffffff; --line:#e2e8f0; --line2:#cbd5e1;
+  --text:#1e293b; --muted:#64748b; --accent:#2563eb; --accent-soft:#eff6ff;
+}
+*{box-sizing:border-box; margin:0; padding:0;}
+html,body{height:100%;}
+body{ font-family:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  background:var(--bg); color:var(--text); overflow:hidden;
+  display:flex; flex-direction:column; }
+header{ display:flex; align-items:center; gap:12px; padding:10px 16px; flex-wrap:wrap;
+  background:var(--panel); border-bottom:1px solid var(--line); z-index:10; }
+header h1{ font-size:15px; font-weight:600; }
+header h1 small{ color:var(--muted); font-weight:400; margin-left:8px; font-size:12px; }
+.btn{ background:#fff; color:var(--text); border:1px solid var(--line2);
+  border-radius:8px; padding:6px 12px; font-size:13px; cursor:pointer; transition:.15s; }
+.btn:hover{ background:#f1f5f9; border-color:#94a3b8; }
+.btn.primary{ background:var(--accent); color:#fff; border-color:transparent; font-weight:600; }
+.btn.primary:hover{ background:#1d4ed8; }
+select{ background:#fff; color:var(--text); border:1px solid var(--line2);
+  border-radius:8px; padding:6px 8px; font-size:13px; }
+label.toggle{ font-size:13px; color:var(--muted); display:flex; align-items:center; gap:5px; cursor:pointer;}
+label.toggle select{ font-size:12.5px; padding:4px 6px; }
+input[type=checkbox]{ accent-color:var(--accent); }
+#stats{ color:var(--muted); font-size:12.5px; margin-left:auto; display:flex; gap:14px; white-space:nowrap; }
+#stats b{ color:var(--text); }
+main{ flex:1; display:flex; position:relative; }
+#svg{ width:100%; height:100%; display:block; cursor:grab; background:#fbfdff;
+  background-image:linear-gradient(#f1f5f9 1px, transparent 1px),
+                   linear-gradient(90deg, #f1f5f9 1px, transparent 1px);
+  background-size:26px 26px; }
+#svg:active{ cursor:grabbing; }
+#legend{ position:absolute; left:14px; bottom:14px; background:rgba(255,255,255,.92);
+  border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:12px;
+  display:grid; grid-template-columns:1fr 1fr; gap:4px 14px;
+  box-shadow:0 2px 8px rgba(15,23,42,.06); }
+#legend .item{ display:flex; align-items:center; gap:6px; color:var(--muted); }
+#legend .dot{ width:11px; height:11px; border-radius:3px; border:1px solid rgba(15,23,42,.15); }
+#hint{ position:absolute; right:14px; bottom:14px; color:var(--muted); font-size:12px; }
+#detail{ position:absolute; right:14px; top:14px; width:300px; max-height:calc(100% - 100px);
+  background:#fff; border:1px solid var(--line); border-radius:12px;
+  padding:14px; display:none; flex-direction:column; gap:10px; overflow:auto;
+  box-shadow:0 8px 28px rgba(15,23,42,.12); z-index:5; }
+#detail.open{ display:flex; }
+#detail h3{ font-size:14px; display:flex; align-items:center; justify-content:space-between; }
+#detail .close{ background:none; border:none; color:var(--muted); font-size:18px; cursor:pointer; }
+#detail .close:hover{ color:var(--text); }
+#detail .kv{ display:grid; grid-template-columns:78px 1fr; gap:4px 8px; font-size:12.5px; }
+#detail .kv dt{ color:var(--muted); }
+#detail pre{ background:#f8fafc; border:1px solid var(--line); border-radius:8px; padding:8px;
+  font-size:11px; overflow:auto; max-height:200px; color:#334155; }
+.modal{ position:fixed; inset:0; background:rgba(15,23,42,.35); display:none; align-items:center; justify-content:center; z-index:60; }
+.modal.open{ display:flex; }
+.modal .box{ width:min(560px,92vw); background:#fff; border:1px solid var(--line);
+  border-radius:14px; padding:16px; display:flex; flex-direction:column; gap:12px;
+  box-shadow:0 12px 40px rgba(15,23,42,.18); }
+.modal h3{ font-size:15px; }
+.modal textarea{ width:100%; height:220px; background:#f8fafc; color:var(--text);
+  border:1px solid var(--line); border-radius:8px; padding:10px; font:12px/1.5 monospace; resize:vertical; }
+.modal .actions{ display:flex; justify-content:flex-end; gap:8px; }
+#tooltip{ position:fixed; pointer-events:none; background:#fff; border:1px solid var(--line2);
+  border-radius:8px; padding:6px 10px; font-size:12px; z-index:50; display:none;
+  box-shadow:0 6px 18px rgba(15,23,42,.12); max-width:260px; }
+.node{ cursor:grab; transition:opacity .15s; }
+.node.dragging{ cursor:grabbing; }
+.node.dim{ opacity:.12; }
+.node rect{ stroke-width:1.4; filter:drop-shadow(0 1px 2px rgba(15,23,42,.08)); }
+.node text{ fill:#0f172a; text-anchor:middle; user-select:none; }
+.node .nid{ font-size:14px; font-weight:700; }
+.node .nname{ font-size:11px; opacity:.8; }
+.node .nmeta{ font-size:10px; opacity:.6; }
+.node .badge{ font-size:10px; fill:#fff; font-weight:700; }
+.edge{ transition:opacity .15s; }
+.edge.dim{ opacity:.08; }
+.edge.hl path{ stroke-width:3 !important; filter:drop-shadow(0 0 4px rgba(37,99,235,.5)); }
+.edge path{ fill:none; stroke:#94a3b8; stroke-width:1.6;
+  stroke-linejoin:round; stroke-linecap:round; }
+.edge.self path{ stroke:#f59e0b; stroke-dasharray:5 4; }
+.edge.external path{ stroke:#dc2626; stroke-dasharray:6 5; }
+.edge .elabel{ font-size:11px; fill:#334155; font-weight:700; paint-order:stroke;
+  stroke:#fff; stroke-width:3px; stroke-linejoin:round; }
+.edge.hl .elabel{ stroke:#dbeafe; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>数据流图可视化<small>Dataflow Graph Viewer</small></h1>
+  <button class="btn primary" id="btnOpen">打开 JSON…</button>
+  <input type="file" id="fileInput" accept=".json,application/json" multiple hidden />
+  <button class="btn" id="btnPaste">粘贴 JSON</button>
+  <select id="fileSelect"></select>
+  <label class="toggle"><input type="checkbox" id="toggleSignal" checked /> 连线信号名</label>
+  <label class="toggle">布线
+    <select id="edgeMode">
+      <option value="smooth" selected>平滑曲线</option>
+      <option value="ortho">正交管道</option>
+      <option value="classic">经典贝塞尔</option>
+    </select>
+  </label>
+  <span id="stats">
+    <span>节点 <b id="stNodes">0</b></span>
+    <span>连线 <b id="stEdges">0</b></span>
+    <span>信号 <b id="stSignals">0</b></span>
+    <span>深度 <b id="stDepth">0</b></span>
+  </span>
+  <button class="btn" id="btnFit">适应视图</button>
+  <button class="btn" id="btnZoomIn">＋</button>
+  <button class="btn" id="btnZoomOut">－</button>
+</header>
+
+<main>
+  <svg id="svg" viewBox="0 0 800 600">
+    <defs>
+      <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5"
+              orient="auto" markerUnits="strokeWidth">
+        <path d="M0,0 L8,4.5 L0,9 z" fill="#94a3b8"/>
+      </marker>
+    </defs>
+    <g id="viewport"></g>
+  </svg>
+
+  <div id="legend">
+    <div class="item"><span class="dot" style="background:#d1fae5"></span>源 usr_src</div>
+    <div class="item"><span class="dot" style="background:#dbeafe"></span>转发 usr_relay</div>
+    <div class="item"><span class="dot" style="background:#e2e8f0"></span>汇 usr_sink</div>
+    <div class="item"><span class="dot" style="background:#ede9fe"></span>分支 usr_fork</div>
+    <div class="item"><span class="dot" style="background:#ccfbf1"></span>汇聚 usr_join</div>
+    <div class="item"><span class="dot" style="background:#fef9c3"></span>时间点 time</div>
+    <div class="item"><span class="dot" style="background:#ffedd5"></span>反馈 usr_acc</div>
+  </div>
+  <div id="hint">拖拽节点移动 · 拖拽空白平移 · 滚轮缩放 · 悬停高亮 · 点击查看详情</div>
+
+  <div id="detail"></div>
+</main>
+
+<div id="tooltip"></div>
+
+<div class="modal" id="pasteModal">
+  <div class="box">
+    <h3>粘贴 JSON 配置（支持数组 / {vertices,edges} 两种格式）</h3>
+    <textarea id="pasteText" placeholder='[ {"id":"cam","name":"usr_src", ...} ]'></textarea>
+    <div class="actions">
+      <button class="btn" id="pasteClose">取消</button>
+      <button class="btn primary" id="pasteOk">渲染</button>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+const $ = s => document.querySelector(s);
+const NS = 'http://www.w3.org/2000/svg';
+
+const NODE_W = 180, NODE_H = 64, COL_GAP = 150, ROW_GAP = 36, PAD = 60;
+
+// 按 name 着色（白底素色）
+const TYPE_STYLE = [
+  [/time/ , {fill:'#fef9c3', stroke:'#facc15', text:'#854d0e'}],
+  [/src/  , {fill:'#d1fae5', stroke:'#34d399', text:'#065f46'}],
+  [/relay/, {fill:'#dbeafe', stroke:'#60a5fa', text:'#1e40af'}],
+  [/sink/ , {fill:'#e2e8f0', stroke:'#94a3b8', text:'#334155'}],
+  [/fork/ , {fill:'#ede9fe', stroke:'#a78bfa', text:'#5b21b6'}],
+  [/join/ , {fill:'#ccfbf1', stroke:'#2dd4bf', text:'#115e59'}],
+  [/acc/  , {fill:'#ffedd5', stroke:'#fb923c', text:'#9a3412'}],
+];
+function nodeStyle(name){
+  for (const [re,s] of TYPE_STYLE) if (re.test(name)) return s;
+  return {fill:'#f1f5f9', stroke:'#94a3b8', text:'#334155'};
+}
+
+// ---------- 解析：自动识别两种格式 -> 图 ----------
+function buildGraph(config){
+  let rawNodes, rawEdges;
+
+  if (Array.isArray(config)){
+    const producer = {};
+    config.forEach(n => (n.outputs||[]).forEach(s => producer[s] = n.id));
+    rawNodes = config.map(n => ({...n}));
+    rawEdges = [];
+    config.forEach(n => {
+      (n.inputs||[]).forEach(sig => {
+        const from = producer[sig];
+        rawEdges.push({ from: from ?? null, to: n.id, signal: sig, message: null,
+                        self: from === n.id, external: from === undefined });
+      });
+    });
+  } else if (config && Array.isArray(config.vertices) && Array.isArray(config.edges)){
+    rawNodes = config.vertices.map(v => ({
+      id: v.id, name: v.name, kind: v.kind, period: v.period, wcet: v.wcet,
+      deadline: v.deadline, ddl: v.ddl, has_job: v.has_job, k: v.k,
+      hyper_period_ms: config.hyper_period_ms, hyper_start_ms: config.hyper_start_ms,
+    }));
+    rawEdges = config.edges.map(e => ({
+      from: e.from, to: e.to, signal: e.tag, message: e.message,
+      self: e.from === e.to, external: false,
+    }));
+  } else {
+    throw new Error('无法识别的配置格式：期望 数组 或 {vertices, edges}');
+  }
+
+  const byId = {}; rawNodes.forEach(n => byId[n.id] = n);
+  rawEdges.forEach(e => { if (!byId[e.from]) e.external = true; });
+
+  // 平行边分道：同源同目标的边分配偏移索引
+  const group = {}, idx = {};
+  rawEdges.forEach(e => {
+    const key = (e.from ?? '∅') + '→' + e.to;
+    group[key] = (group[key] || 0) + 1;
+  });
+  rawEdges.forEach(e => {
+    const key = (e.from ?? '∅') + '→' + e.to;
+    e.offsetIndex = idx[key] = (idx[key] ?? 0);
+    e.offsetTotal = group[key];
+    idx[key]++;
+  });
+
+  // 最长路径分层（自环不计入深度）
+  const depth = {}; rawNodes.forEach(n => depth[n.id] = 0);
+  const adj = {}; rawNodes.forEach(n => adj[n.id] = []);
+  const indeg = {}; rawNodes.forEach(n => indeg[n.id] = 0);
+  rawEdges.forEach(e => { if (e.from && byId[e.from] && !e.self){ adj[e.from].push(e.to); indeg[e.to]++; } });
+  const q = rawNodes.filter(n => indeg[n.id]===0).map(n => n.id);
+  const order = [];
+  while (q.length){
+    const id = q.shift(); order.push(id);
+    adj[id].forEach(t => {
+      depth[t] = Math.max(depth[t], depth[id]+1);
+      if (--indeg[t]===0) q.push(t);
+    });
+  }
+  let extra = Math.max(0, ...order.map(id=>depth[id])) + 1;
+  rawNodes.forEach(n => { if (indeg[n.id] > 0) depth[n.id] = extra++; });
+
+  // —— 出边扇形索引：同一节点发出的多条边起点微错开 ——
+  const outG = {}; rawEdges.forEach(e => { if (e.from && byId[e.from]) outG[e.from] = (outG[e.from]||0)+1; });
+  const outI = {};
+  rawEdges.forEach(e => {
+    if (e.from && byId[e.from]){
+      e.outIdx = outI[e.from] = (outI[e.from] ?? 0);
+      e.outCnt = outG[e.from];
+      outI[e.from]++;
+    }
+  });
+  // —— 列对扇形索引：同一「源列→目标列」的多条边在管道中微错开 ——
+  const gutG = {}, gutI = {};
+  rawEdges.forEach(e => {
+    if (e.from && byId[e.from]){ const k = depth[e.from]+'>'+depth[e.to]; gutG[k]=(gutG[k]||0)+1; }
+  });
+  rawEdges.forEach(e => {
+    if (e.from && byId[e.from]){
+      const k = depth[e.from]+'>'+depth[e.to];
+      e.gutterIdx = gutI[k] = (gutI[k] ?? 0);
+      e.gutterCnt = gutG[k];
+      gutI[k]++;
+    }
+  });
+
+  const nb = {}; rawNodes.forEach(n => nb[n.id] = new Set());
+  rawEdges.forEach(e => { if (e.from && byId[e.from]){ nb[e.from].add(e.to); nb[e.to].add(e.from); } });
+
+  return { nodes: rawNodes, edges: rawEdges, byId, depth, nb };
+}
+
+function layout(g){
+  const levels = {};
+  g.nodes.forEach(n => { const d = g.depth[n.id]; (levels[d]=levels[d]||[]).push(n); });
+  const ds = Object.keys(levels).map(Number).sort((a,b)=>a-b);
+  let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+  ds.forEach(d => {
+    const arr = levels[d];
+    const x = PAD + d*(NODE_W+COL_GAP);
+    const span = (arr.length-1)*(NODE_H+ROW_GAP);
+    arr.forEach((n,i) => {
+      n.x = x; n.y = PAD + i*(NODE_H+ROW_GAP) - span/2;
+      minX=Math.min(minX,n.x); maxX=Math.max(maxX,n.x+NODE_W);
+      minY=Math.min(minY,n.y); maxY=Math.max(maxY,n.y+NODE_H);
+    });
+  });
+  if (!g.nodes.length){ minX=minY=0; maxX=maxY=200; }
+  return { x:minX, y:minY, w:maxX-minX, h:maxY-minY };
+}
+
+const colX = d => PAD + d*(NODE_W+COL_GAP);
+
+// ---------- 避障路径点：无论哪种布线模式都保证不穿节点 ----------
+function routeWaypoints(g, e){
+  const from = g.byId[e.from], to = g.byId[e.to];
+  const cSrc = g.depth[from.id], cTgt = g.depth[to.id];
+  const xSrc = from.x + NODE_W;
+  const ySrc = from.y + NODE_H/2 + (e.outIdx - (e.outCnt-1)/2) * 6;
+  const xTgt = to.x, yTgt = to.y + NODE_H/2;
+  const M = 8; // 安全边距
+
+  if (cTgt <= cSrc) return { pts: [[xSrc,ySrc],[xTgt,yTgt]], lx:(xSrc+xTgt)/2, ly:(ySrc+yTgt)/2-6 };
+
+  const gutterOff = (e.gutterIdx - (e.gutterCnt-1)/2) * 6;
+  const gxA = colX(cSrc) + NODE_W + COL_GAP/2 + gutterOff;
+  const gxB = colX(cTgt) - COL_GAP/2 + gutterOff;
+
+  const blocked = [];
+  for (let d=cSrc+1; d<cTgt; d++){
+    g.nodes.forEach(n => { if (g.depth[n.id]===d) blocked.push([n.y-M, n.y+NODE_H+M]); });
+  }
+
+  let yCross = yTgt;
+  if (blocked.length && blocked.some(r => yTgt>r[0] && yTgt<r[1])){
+    const cand = [];
+    blocked.forEach(r => cand.push(r[0], r[1]));
+    let top = Math.min(...g.nodes.map(n=>n.y)), bot = Math.max(...g.nodes.map(n=>n.y+NODE_H));
+    cand.push(top-M, bot+M);
+    const safe = cand.filter(y => !blocked.some(r => y>r[0] && y<r[1]));
+    if (safe.length) yCross = safe.reduce((b,y)=> Math.abs(y-yTgt)<Math.abs(b-yTgt)?y:b, safe[0]);
+  }
+
+  const pts = [[xSrc,ySrc],[gxA,ySrc],[gxA,yCross],[gxB,yCross],[gxB,yTgt],[xTgt,yTgt]];
+  const cpts = [pts[0]];
+  for (let i=1;i<pts.length;i++){
+    const p = pts[i], q = cpts[cpts.length-1];
+    if (Math.abs(p[0]-q[0])>0.5 || Math.abs(p[1]-q[1])>0.5) cpts.push(p);
+  }
+
+  let lx, ly;
+  if (Math.abs(gxB-gxA) > 0.5){ lx=(gxA+gxB)/2; ly=yCross-6; }
+  else { lx = gxA + 8; ly = (ySrc+yTgt)/2; }
+
+  return { pts: cpts, lx, ly };
+}
+
+// ---------- Catmull-Rom 样条 -> 三次贝塞尔（把折线平滑成曲线） ----------
+function catmullRom2Bezier(pts){
+  const n = pts.length;
+  if (n < 2) return '';
+  if (n === 2) return `M ${pts[0][0]} ${pts[0][1]} L ${pts[1][0]} ${pts[1][1]}`;
+  let d = `M ${pts[0][0].toFixed(1)} ${pts[0][1].toFixed(1)}`;
+  for (let i=0;i<n-1;i++){
+    const P0 = pts[i-1] || pts[i];
+    const P1 = pts[i];
+    const P2 = pts[i+1];
+    const P3 = pts[i+2] || P2;
+    const c1x = P1[0] + (P2[0]-P0[0])/6;
+    const c1y = P1[1] + (P2[1]-P0[1])/6;
+    const c2x = P2[0] - (P3[0]-P1[0])/6;
+    const c2y = P2[1] - (P3[1]-P1[1])/6;
+    d += ` C ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${c2x.toFixed(1)} ${c2y.toFixed(1)}, ${P2[0].toFixed(1)} ${P2[1].toFixed(1)}`;
+  }
+  return d;
+}
+
+// ---------- 单条边几何（自环/外部/三类布线统一入口） ----------
+function edgeGeometry(g, e, mode){
+  const to = g.byId[e.to];
+  let d, lx=0, ly=0;
+  if (e.self){
+    const x = to.x + NODE_W, y = to.y + NODE_H/2;
+    d  = `M ${x} ${y} C ${x+90} ${y-78}, ${x+90} ${y+78}, ${x} ${y}`;
+    lx = x + 64; ly = y;
+  } else if (e.external){
+    const yOff = (e.offsetIndex - (e.offsetTotal-1)/2) * 16;
+    const y1 = to.y + NODE_H/2 + yOff;
+    const x1 = to.x - 130;
+    d = `M ${x1} ${y1} L ${to.x} ${y1}`;
+    lx = (x1+to.x)/2; ly = y1 - 6;
+  } else {
+    const r = routeWaypoints(g, e);
+    if (mode === 'classic'){
+      const f = g.byId[e.from];
+      const x1 = f.x + NODE_W, y1 = f.y + NODE_H/2;
+      const dx = Math.max(40,(to.x-x1)/2);
+      d = `M ${x1} ${y1} C ${x1+dx} ${y1}, ${to.x-dx} ${to.y+NODE_H/2}, ${to.x} ${to.y+NODE_H/2}`;
+    } else if (mode === 'ortho'){
+      d = 'M ' + r.pts.map(p=>p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' L ');
+    } else {
+      d = catmullRom2Bezier(r.pts);
+    }
+    lx = r.lx; ly = r.ly;
+  }
+  return { d, lx, ly };
+}
+
+const S = {
+  graph: null,
+  view: { x:0, y:0, w:800, h:600 },
+  showSignalNames: true,
+  edgeMode: 'smooth',
+  files: {}, current: null,
+};
+
+// ---------- 拖拽 / 坐标工具（修复：不再用 transform，直接改坐标） ----------
+let dragState = null;
+let edgeRefreshQueued = false;
+
+function toSvgPoint(clientX, clientY){
+  const r = $('#svg').getBoundingClientRect();
+  return {
+    x: S.view.x + (clientX - r.left) / r.width * S.view.w,
+    y: S.view.y + (clientY - r.top) / r.height * S.view.h
+  };
+}
+
+function startNodeDrag(ev, n, group){
+  ev.preventDefault();
+  ev.stopPropagation();
+  const p = toSvgPoint(ev.clientX, ev.clientY);
+  dragState = {
+    kind:'node', node:n, group,
+    startX:p.x, startY:p.y,
+    baseX:n.x, baseY:n.y,
+    moved:false
+  };
+  group.classList.add('dragging');
+}
+
+function redrawEdgesNow(){
+  const g = S.graph; if (!g) return;
+  document.querySelectorAll('#edges .edge').forEach(el => {
+    const e = g.edges[+el.dataset.idx];
+    if (!e) return;
+    const geo = edgeGeometry(g, e, S.edgeMode);
+    const p = el.querySelector('path');
+    if (p) p.setAttribute('d', geo.d);
+    const t = el.querySelector('text.elabel');
+    if (t){ t.setAttribute('x', geo.lx); t.setAttribute('y', geo.ly); }
+  });
+}
+function scheduleRedrawEdges(){
+  if (edgeRefreshQueued) return;
+  edgeRefreshQueued = true;
+  requestAnimationFrame(() => { edgeRefreshQueued = false; redrawEdgesNow(); });
+}
+
+// 直接更新节点组内元素坐标（避免 transform 累积错位）
+function applyNodePosition(n, grp){
+  const nx = n.x, ny = n.y;
+  const rect = grp.querySelector('rect');
+  if (rect){ rect.setAttribute('x', nx); rect.setAttribute('y', ny); }
+  grp.querySelectorAll('text').forEach(t => {
+    const cls = t.getAttribute('class');
+    if (cls === 'nid'){ t.setAttribute('x', nx+NODE_W/2); t.setAttribute('y', ny+NODE_H/2-4); }
+    else if (cls === 'nname'){ t.setAttribute('x', nx+NODE_W/2); t.setAttribute('y', ny+NODE_H/2+14); }
+    else if (cls === 'nmeta'){ t.setAttribute('x', nx+NODE_W/2); t.setAttribute('y', ny+NODE_H/2+28); }
+  });
+  if (n.loop){
+    const c = grp.querySelector('circle');
+    if (c){ c.setAttribute('cx', nx+NODE_W-12); c.setAttribute('cy', ny+15); }
+    const b = grp.querySelector('text.badge');
+    if (b){ b.setAttribute('x', nx+NODE_W-12); b.setAttribute('y', ny+18); }
+  }
+}
+
+function drawGraph(){
+  const g = S.graph; if (!g) return;
+  const vp = $('#viewport'); vp.innerHTML = '';
+  const bbox = layout(g);
+
+  const many = g.edges.length > 60;
+  S.showSignalNames = !many; $('#toggleSignal').checked = !many;
+
+  // --- 边 ---
+  const eg = document.createElementNS(NS,'g'); eg.id='edges';
+  g.edges.forEach((e,i) => {
+    const geo = edgeGeometry(g, e, S.edgeMode);
+    const w = document.createElementNS(NS,'g');
+    w.className.baseVal = 'edge' + (e.self?' self':'') + (e.external?' external':'');
+    w.dataset.idx = i;
+    const p = document.createElementNS(NS,'path');
+    p.setAttribute('d', geo.d); p.setAttribute('marker-end','url(#arrow)');
+    w.appendChild(p);
+    if (S.showSignalNames && !e.self){
+      const t = document.createElementNS(NS,'text');
+      t.setAttribute('class','elabel'); t.setAttribute('x',geo.lx); t.setAttribute('y',geo.ly);
+      t.textContent = e.signal; w.appendChild(t);
+    }
+    w.addEventListener('mouseenter', ev => {
+      const ed = g.edges[i];
+      const rel = new Set([ed.from, ed.to]);
+      document.querySelectorAll('#nodes .node').forEach(el =>
+        el.classList.toggle('dim', !rel.has(el.dataset.id)));
+      document.querySelectorAll('#edges .edge').forEach(x => x.classList.remove('hl','dim'));
+      w.classList.add('hl');
+      let tip = `${ed.signal}  →  ${ed.to}`;
+      if (ed.self) tip += '（自反馈）';
+      if (ed.external) tip += '（外部输入）';
+      if (ed.message && ed.message.type) tip += `<br>类型: ${ed.message.type}${ed.message.has_frame ? ' · 带帧' : ''}`;
+      showTip(ev, tip);
+    });
+    w.addEventListener('mouseleave', resetHighlight);
+    eg.appendChild(w);
+  });
+  vp.appendChild(eg);
+
+  // --- 节点 ---
+  const ng = document.createElementNS(NS,'g'); ng.id='nodes';
+  g.nodes.forEach(n => {
+    const st = nodeStyle(n.name);
+    const w = document.createElementNS(NS,'g');
+    w.className.baseVal = 'node'; w.dataset.id = n.id;
+
+    const r = document.createElementNS(NS,'rect');
+    r.setAttribute('x',n.x); r.setAttribute('y',n.y);
+    r.setAttribute('width',NODE_W); r.setAttribute('height',NODE_H);
+    r.setAttribute('rx',10); r.setAttribute('fill',st.fill); r.setAttribute('stroke',st.stroke);
+    w.appendChild(r);
+
+    const t1 = document.createElementNS(NS,'text');
+    t1.setAttribute('class','nid'); t1.setAttribute('x',n.x+NODE_W/2); t1.setAttribute('y',n.y+NODE_H/2-4);
+    t1.setAttribute('fill',st.text); t1.textContent = n.id; w.appendChild(t1);
+
+    const t2 = document.createElementNS(NS,'text');
+    t2.setAttribute('class','nname'); t2.setAttribute('x',n.x+NODE_W/2); t2.setAttribute('y',n.y+NODE_H/2+14);
+    t2.setAttribute('fill',st.text); t2.textContent = n.name + (n.kind && n.kind!=='job' ? ' · '+n.kind : ''); w.appendChild(t2);
+
+    const meta = [];
+    if (n.kind === 'timepoint') meta.push('timepoint');
+    if (n.period) meta.push('period='+n.period);
+    if (n.wcet !== undefined) meta.push('wcet='+n.wcet);
+    if (n.deadline !== undefined) meta.push('dl='+n.deadline);
+    if (n.parameters && n.parameters.length) meta.push('p='+n.parameters[0].value);
+    if (meta.length){
+      const t3 = document.createElementNS(NS,'text');
+      t3.setAttribute('class','nmeta'); t3.setAttribute('x',n.x+NODE_W/2); t3.setAttribute('y',n.y+NODE_H/2+28);
+      t3.setAttribute('fill',st.text); t3.textContent = meta.join(' · '); w.appendChild(t3);
+    }
+    if (n.loop){
+      const c = document.createElementNS(NS,'circle');
+      c.setAttribute('cx',n.x+NODE_W-12); c.setAttribute('cy',n.y+15); c.setAttribute('r',10);
+      c.setAttribute('fill','#f59e0b'); w.appendChild(c);
+      const t4 = document.createElementNS(NS,'text');
+      t4.setAttribute('class','badge'); t4.setAttribute('x',n.x+NODE_W-12); t4.setAttribute('y',n.y+18);
+      t4.textContent = '↻'; w.appendChild(t4);
+    }
+
+    w.addEventListener('mouseenter', ev => {
+      const rel = new Set([n.id]);
+      g.edges.forEach(ed => { if (ed.from===n.id||ed.to===n.id){ rel.add(ed.from); rel.add(ed.to); } });
+      document.querySelectorAll('#nodes .node').forEach(el =>
+        el.classList.toggle('dim', !rel.has(el.dataset.id)));
+      document.querySelectorAll('#edges .edge').forEach(el => {
+        const ed = g.edges[+el.dataset.idx];
+        const on = ed.from===n.id || ed.to===n.id;
+        el.classList.toggle('dim', !on); el.classList.toggle('hl', on);
+      });
+      showTip(ev, `${n.id} · ${n.name}${n.kind ? ' · '+n.kind : ''}`);
+    });
+    w.addEventListener('mouseleave', resetHighlight);
+    w.addEventListener('mousedown', ev => startNodeDrag(ev, n, w));
+    ng.appendChild(w);
+  });
+  vp.appendChild(ng);
+
+  const sig = new Set(); g.edges.forEach(e => sig.add(e.signal));
+  $('#stNodes').textContent = g.nodes.length;
+  $('#stEdges').textContent = g.edges.length;
+  $('#stSignals').textContent = sig.size;
+  $('#stDepth').textContent = Math.max(0, ...g.nodes.map(n => g.depth[n.id]));
+
+  fit(bbox);
+  $('#detail').classList.remove('open');
+}
+
+// ---------- 视图：平移/缩放（基于 viewBox） ----------
+function applyView(){ $('#svg').setAttribute('viewBox', `${S.view.x} ${S.view.y} ${S.view.w} ${S.view.h}`); }
+function fit(bbox){
+  bbox = bbox || layout(S.graph);
+  const pad = 70;
+  S.view = { x:bbox.x-pad, y:bbox.y-pad, w:bbox.w+pad*2, h:bbox.h+pad*2 };
+  applyView();
+}
+function zoomAtCenter(k){
+  const ax = S.view.x + 0.5*S.view.w, ay = S.view.y + 0.5*S.view.h;
+  const nw = S.view.w*k, nh = S.view.h*k;
+  S.view.x = ax-0.5*nw; S.view.y = ay-0.5*nh; S.view.w=nw; S.view.h=nh; applyView();
+}
+
+// ---------- 交互辅助 ----------
+const tip = $('#tooltip');
+function showTip(e, html){ tip.innerHTML = html; tip.style.display='block';
+  tip.style.left=(e.clientX+14)+'px'; tip.style.top=(e.clientY+14)+'px'; }
+function hideTip(){ tip.style.display='none'; }
+function resetHighlight(){
+  document.querySelectorAll('.node,.edge').forEach(el => el.classList.remove('dim','hl'));
+  hideTip();
+}
+function openDetail(n){
+  const d = $('#detail'); d.innerHTML='';
+  const h = document.createElement('h3');
+  h.innerHTML = `<span>节点详情 <span style="color:var(--muted);font-weight:400;font-size:12px">${n.name}</span></span>`;
+  const cl = document.createElement('button'); cl.className='close'; cl.textContent='×';
+  cl.onclick = () => d.classList.remove('open'); h.appendChild(cl); d.appendChild(h);
+
+  const kv = document.createElement('dl'); kv.className='kv';
+  const rows = [
+    ['ID', n.id], ['Name', n.name], ['Kind', n.kind||'—'],
+    ['Version', n.version||'—'], ['Period', n.period ?? '—'],
+    ['WCET', n.wcet ?? '—'], ['Deadline', n.deadline ?? '—'],
+    ['DDL', n.ddl ?? '—'], ['k', n.k ?? '—'],
+    ['has_job', n.has_job === undefined ? '—' : n.has_job],
+    ['HyperPeriod', n.hyper_period_ms ?? '—'],
+    ['Inputs', (n.inputs||[]).join(', ')||'—'],
+    ['Outputs', (n.outputs||[]).join(', ')||'—'],
+    ['Parameters', (n.parameters||[]).map(p=>JSON.stringify(p)).join(', ')||'—'],
+    ['Loop', n.loop ? '有反馈回路' : '—'],
+  ];
+  rows.forEach(([k,v]) => {
+    if (v === '—' && !['ID','Name'].includes(k)) return;
+    const dt=document.createElement('dt'); dt.textContent=k;
+    const dd=document.createElement('dd'); dd.textContent=v;
+    kv.append(dt,dd);
+  });
+  d.appendChild(kv);
+  const pre = document.createElement('pre'); pre.textContent = JSON.stringify(n,null,2);
+  d.appendChild(pre);
+  d.classList.add('open');
+}
+
+// ---------- 文件管理 ----------
+function addFile(name, data){
+  S.files[name] = data;
+  const sel = $('#fileSelect');
+  const opt = document.createElement('option'); opt.value=name; opt.textContent=name;
+  sel.appendChild(opt); sel.value=name;
+  render(name);
+}
+function render(name){
+  if (!S.files[name]) return;
+  S.current = name;
+  S.graph = buildGraph(S.files[name]);
+  drawGraph();
+}
+
+// ---------- 初始化 ----------
+window.addEventListener('DOMContentLoaded', () => {
+  const svg = $('#svg');
+
+  $('#btnOpen').addEventListener('click', () => $('#fileInput').click());
+  $('#fileInput').addEventListener('change', e => {
+    [...e.target.files].forEach(f => {
+      const r = new FileReader();
+      r.onload = () => { try{ addFile(f.name, JSON.parse(r.result)); }catch(err){ alert(`解析 "${f.name}" 失败：${err.message}`); } };
+      r.readAsText(f);
+    });
+    e.target.value='';
+  });
+
+  window.addEventListener('dragover', e => e.preventDefault());
+  window.addEventListener('drop', e => {
+    e.preventDefault();
+    [...e.dataTransfer.files].forEach(f => {
+      if (!/\.json$/i.test(f.name) && f.type!=='application/json') return;
+      const r = new FileReader();
+      r.onload = () => { try{ addFile(f.name, JSON.parse(r.result)); }catch(err){ alert(`解析失败：${err.message}`); } };
+      r.readAsText(f);
+    });
+  });
+
+  $('#fileSelect').addEventListener('change', e => render(e.target.value));
+  $('#toggleSignal').addEventListener('change', e => { S.showSignalNames = e.target.checked; drawGraph(); });
+  $('#edgeMode').addEventListener('change', e => { S.edgeMode = e.target.value; drawGraph(); });
+  $('#btnFit').addEventListener('click', () => fit());
+  $('#btnZoomIn').addEventListener('click', () => zoomAtCenter(1/1.3));
+  $('#btnZoomOut').addEventListener('click', () => zoomAtCenter(1.3));
+
+  $('#btnPaste').addEventListener('click', () => $('#pasteModal').classList.add('open'));
+  $('#pasteClose').addEventListener('click', () => $('#pasteModal').classList.remove('open'));
+  $('#pasteOk').addEventListener('click', () => {
+    try{
+      const data = JSON.parse($('#pasteText').value);
+      addFile('粘贴配置 #' + (Object.keys(S.files).length+1), data);
+      $('#pasteText').value=''; $('#pasteModal').classList.remove('open');
+    }catch(err){ alert('JSON 解析失败：'+err.message); }
+  });
+
+  // 平移（拖空白）
+  svg.addEventListener('mousedown', e => {
+    if (e.target.closest('.node,.edge,.elabel')) return;
+    dragState = { kind:'pan', x:e.clientX, y:e.clientY, vx:S.view.x, vy:S.view.y };
+  });
+
+  // 统一处理：节点拖动 / 画布平移
+  window.addEventListener('mousemove', e => {
+    if (!dragState) return;
+    if (dragState.kind === 'node'){
+      const p = toSvgPoint(e.clientX, e.clientY);
+      const dx = p.x - dragState.startX, dy = p.y - dragState.startY;
+      if (Math.abs(dx)+Math.abs(dy) > 2) dragState.moved = true;
+      if (dragState.moved){
+        // 直接改写数据坐标 + 同步更新组内元素坐标（无 transform，无累积错位）
+        const n = dragState.node;
+        n.x = dragState.baseX + dx;
+        n.y = dragState.baseY + dy;
+        applyNodePosition(n, dragState.group);
+        scheduleRedrawEdges();
+      }
+    } else if (dragState.kind === 'pan'){
+      const r = svg.getBoundingClientRect();
+      S.view.x = dragState.vx - (e.clientX-dragState.x)/r.width*S.view.w;
+      S.view.y = dragState.vy - (e.clientY-dragState.y)/r.height*S.view.h;
+      applyView();
+    }
+  });
+  window.addEventListener('mouseup', () => {
+    if (dragState && dragState.kind === 'node'){
+      dragState.group.classList.remove('dragging');
+      if (!dragState.moved) openDetail(dragState.node); // 未移动视为点击
+    }
+    dragState = null;
+  });
+
+  svg.addEventListener('wheel', e => {
+    e.preventDefault();
+    const r = svg.getBoundingClientRect();
+    const k = e.deltaY>0 ? 1.18 : 1/1.18;
+    const mx=(e.clientX-r.left)/r.width, my=(e.clientY-r.top)/r.height;
+    const ax=S.view.x+mx*S.view.w, ay=S.view.y+my*S.view.h;
+    const nw=Math.max(10,S.view.w*k), nh=Math.max(10,S.view.h*k);
+    S.view.x=ax-mx*nw; S.view.y=ay-my*nh; S.view.w=nw; S.view.h=nh; applyView();
+  }, {passive:false});
+});
+</script>
+</body>
+</html>

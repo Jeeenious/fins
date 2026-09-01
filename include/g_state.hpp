@@ -21,25 +21,6 @@
 //   0       ：热路径零计时开销——record_exec 变空操作、bind_job 闭包与 worker 不量时钟
 // 关闭方式：编译期 -DFINS_TIMING=0（实时部署减负；功能验证期默认开，便于观察耗时）。
 // ============================================================================
-#ifndef FINS_TIMING
-#define FINS_TIMING 1
-#endif
-
-#ifndef FINS_STATIC_PRIORITY
-#define FINS_STATIC_PRIORITY 0
-#endif
-
-#ifndef FINS_DYNAMIC_PRIORITY
-#define FINS_DYNAMIC_PRIORITY 0
-#endif
-
-#ifndef FINS_CAL_MAKESPAN
-#define FINS_CAL_MAKESPAN 0
-#endif
-
-#ifndef FINS_CAL_WCET
-#define FINS_CAL_WCET 0
-#endif
 
 #include <algorithm>
 #include <atomic>
@@ -48,6 +29,7 @@
 #include <condition_variable>
 #include <deque>
 #include <dlfcn.h>
+#include <fstream>   // FINS_EXPORT_DAG_PATH 导出 dag JSON 用
 #include <functional>
 #include <map>
 #include <memory>
@@ -792,24 +774,25 @@ namespace fins::rt {
         const auto &algo = by_id.at(info.id);
         const size_t n = node_count.at(info.id);
         const auto loop_w = calc_loop_window(info, n, hyper_period);   // loop 端口 → 聚合窗口帧数
+
         for (size_t k = 0; k < n; ++k) {
           const std::string vtx = info.id + ":" + std::to_string(k);   // 顶点名现拼（无 JobInst）
           dag.mutate_vertex(vtx, [this, sinfo, algo, vtx, loop_w](Workload &v) {
             v.id = vtx;   // Workload.id 实际填充（grab_ready_workload 返回 Workload* 含 id，装配点直做完成事件用）
-            // 状态修改移出 job：就绪/完成由 PrecedenceGraph 侧增量状态（pred_left_/done_/ready_）
-            // 判定，装配点 on_execute 回调事务回锁调 trigger_workload_ready(id)（完成事件不在闭包内）；
-            // 本闭包只执行 = 打包输入 → execute+计时 → 路由输出（三个功能段各一 lambda）。
-            // ── 预解析绑定边引用（绑定期一次性，热路径零查找）：输入逐普通端口取入边唯一帧槽，
-            //    输出逐端口取全部下游边槽（fork 共享帧）。图静止期间不重建（并发假设：
-            //    expand/rollover 不悬垂），引用跨整轮运行稳定——100 端口打包/路由从 ~240us 降到 ~us 级。
+
             std::vector<std::vector<std::reference_wrapper<Message>>> in_refs(sinfo->input_ports.size());
             for (size_t i = 0; i < in_refs.size(); ++i)
               if (!loop_w.count(sinfo->input_ports[i]))
                 in_refs[i] = dag.edges_to(vtx, sinfo->input_ports[i]);   // 非 loop 端口：单写者约束 → 至多一条
+
             std::vector<std::vector<std::reference_wrapper<Message>>> out_refs(sinfo->output_ports.size());
             for (size_t i = 0; i < out_refs.size(); ++i)
               out_refs[i] = dag.edges_from(vtx, sinfo->output_ports[i]);
-            v.job = [this, sinfo, algo, loop_w,
+
+            v.job = [this,
+              sinfo,
+              algo,
+              loop_w,
                      in_refs = std::move(in_refs), out_refs = std::move(out_refs)]() {
               // ── 功能 1a：loop 端口 → 滑动窗口历史槽聚合最近 w 帧（恒长 w、窗口未满开头补空
               //      Message 占位，frame=nullptr，算法须判断 .frame 跳过/当 0，勿 sub）──
@@ -864,6 +847,9 @@ namespace fins::rt {
                   const auto cap_it = mesg_hist_cap.find(pn);   // 锁外执行：const 查找避 operator[] 并发写 UB
                   if (cap_it != mesg_hist_cap.end() && cap_it->second > 0)   // 有 loop 消费者才存历史（cap>0）；record_mesg 满 cap 丢最旧
                     record_mesg(pn, outputs[i]);
+
+#ifdef FINS_EXPORT_TRACING_PATH
+#endif
                 }
               };
 
@@ -959,6 +945,10 @@ namespace fins::rt {
 
       // ⑨b 初始就绪（seed_ready，私有函数，见 bind_job 之后）
       seed_ready();
+
+#ifdef FINS_EXPORT_DGRAPH_PATH
+      std::ofstream(FINS_EXPORT_DGRAPH_PATH) << export_dag().dump(2);
+#endif
     }
 
     /**
@@ -1117,6 +1107,44 @@ namespace fins::rt {
             if (!hist.empty() && wcet_updater) v.wcet = wcet_updater(hist);
           });
       });
+    }
+
+    /** @brief 导出 dag 为 JSON（调试/可视化：顶点集合 + 边集合 + 超周期参数）。
+     *  私有，供内部调试/导出调用（调用方持 mtx）。顶点含 id/name/k/period/deadline/wcet/ddl/
+     *  has_job/kind（"job" | "timepoint"）；边含 from/to/tag + message 槽状态（是否有帧/类型）。
+     * @retval nlohmann::json 图 JSON（调用方决定落盘 dump(2) 或消费）
+     */
+    nlohmann::json export_dag() {
+      nlohmann::json j;
+      j["hyper_start_ms"]  = hyper_start_ms;
+      j["hyper_period_ms"] = hyper_period_ms;
+
+      j["vertices"] = nlohmann::json::array();
+      dag.for_each_vertex([&](const std::string &id, const Workload &v) {
+        j["vertices"].push_back({
+          {"id", id},
+          {"name", v.name},
+          {"k", v.k},
+          {"period", v.period},
+          {"deadline", v.deadline},
+          {"wcet", v.wcet},
+          {"ddl", v.ddl},
+          {"has_job", static_cast<bool>(v.job)},
+          {"kind", id.rfind("tp:", 0) == 0 ? "timepoint" : "job"},
+        });
+      });
+
+      j["edges"] = nlohmann::json::array();
+      dag.for_each_edge([&](const std::string &from, const std::string &to,
+                            const std::string &tag, const Message &m) {
+        j["edges"].push_back({
+          {"from", from},
+          {"to", to},
+          {"tag", tag},
+          {"message", {{"has_frame", m.frame != nullptr}, {"type", m.type_name}}},
+        });
+      });
+      return j;
     }
   };
   inline PrecedenceGraph graph_g;
