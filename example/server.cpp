@@ -23,10 +23,9 @@
 #include <string>
 #include <unistd.h>
 
-static constexpr int DEFAULT_PORT = 18080;
-
-// 无参默认发的用例（相对仓库根 pipeline/）；换用例改这里一行。
 static const char *DEFAULT_CFG = "pipeline/cfg.json";
+static const char *DEFAULT_IP = "127.0.0.1";
+static constexpr int DEFAULT_PORT = 18080;
 
 /// 读本地 JSON 文件 → POST /update，打印 HTTP 状态码 + 响应体。失败返回 -1。
 static int post_json(httplib::Client &cli, const char *path, int port) {
@@ -48,8 +47,9 @@ static int post_json(httplib::Client &cli, const char *path, int port) {
 
 int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IOLBF, 0);  // 行缓冲，重定向到文件/管道时日志不丢
-  const std::string path = argc > 1 ? std::string(argv[1]) : DEFAULT_CFG;
-  const int port = argc > 2 ? std::atoi(argv[2]) : DEFAULT_PORT;
-  httplib::Client cli("127.0.0.1", port);
+  const auto path = argc > 1 ? std::string(argv[1]) : DEFAULT_CFG;
+  const auto port = argc > 2 ? std::atoi(argv[2]) : DEFAULT_PORT;
+
+  httplib::Client cli(DEFAULT_IP, port);
   return post_json(cli, path.c_str(), port) == 0 ? 0 : 1;
 }
