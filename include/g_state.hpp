@@ -354,7 +354,8 @@ namespace fins::rt {
     util::DirectedAcyclicGraph<Workload, Message> dag;  // 顶点带权、边=Message 槽
 
     double hyper_period_ms{0};       // 超周期长度（ms）
-    double hyper_start_ms{0};    // 当前超周期起点（ms；expand 初始化 = 当前真实时钟、rollover_hp 回绕更新 = 当前真实时钟）
+    double hyper_start_ms{0};        // 当前超周期起点（ms；expand 初始化 = 当前真实时钟、rollover_hp 回绕更新 = 当前真实时钟）
+    uint64_t graph_version{0};       // 图结构版本号（expand_hp 重建后 ++；main 线程持 mtx 写读）。
 
     /** @brief 记录一帧到 loop 反馈滑动窗口数据槽（满丢最旧；TBBMap accessor 按端口锁，
      *  只锁本端口历史槽字段）。
@@ -399,9 +400,6 @@ namespace fins::rt {
     // ── 就绪增量调度状态（私有；持 mtx 访问，装配点经无锁原语间接使用）──
     std::map<std::string, size_t> pred_left_;   // 剩余未完成前序数（含 seq/绑定/tp 挂靠边）
     std::map<std::string, size_t> in_degree_;   // 入度基准（expand 填；rollover 重置 pred_left_ 用）
-    std::unordered_map<std::string, uint64_t> done_;   // 顶点 id → 完成世代号（世代化 clear：rollover O(1) 重置，免释放节点）
-    uint64_t done_gen_{0};                              // 当前世代号（rollover/expand 递增；done_[id]==gen ⇒ 本世代已完成）
-    size_t done_count_{0};                              // 本世代已完成顶点数（is_hp_done 用；rollover 归零）
 
     struct ReadyItem {                          // 就绪集元素：id + 入队序号 + 排序键
       std::string id;
@@ -915,19 +913,22 @@ namespace fins::rt {
       mesg_hist_cap.clear();   // 只清容量表（新配置重算）；message_hist_ 历史槽跨重建保留不清（同 exec_us_hist_）
       pred_left_.clear();   // 就绪增量状态：空配置早退也一致清空
       in_degree_.clear();
-      done_.clear();                 // 新配置全量清（map 释放）；世代号一并归零
       dag.clear();
+
+      // 新配置全量清（map 释放）；世代号一并归零
+      done_.clear();
       done_count_ = 0;
       done_gen_ = 0;
 
+      // 入队序号随就绪集一并重置（新周期从头计序）
       ready_.clear();
-      ready_seq_ = 0;   // 入队序号随就绪集一并重置（新周期从头计序）
+      ready_seq_ = 0;
       tp_order_.clear();
       tp_released_ = 0;
 
       const auto nodes = pipeline.nodes;   // 入参快照（拷贝，防外部改）
       const auto so_ctx = library.so_ctx;
-      if (nodes.empty()) return;        // 空配置 → 空图（幂等，parse 已产空表）
+      if (nodes.empty()) { ++graph_version; return; }   // 空配置 → 空图（幂等；结构已清空，同样发失效信号）
 
       // ① 端口索引：producers/consumers + 一跳邻居
       std::map<std::string, std::vector<std::string>> producers, consumers;
@@ -968,6 +969,8 @@ namespace fins::rt {
       // ⑨b 初始就绪（seed_ready，私有函数，见 bind_job 之后）
       seed_ready();
 
+      ++graph_version;   // 结构重建完成 → makespan 结构缓存失效信号（须在全部建图步骤后）
+
 #ifdef FINS_EXPORT_DGRAPH_PATH
       std::ofstream(FINS_EXPORT_DGRAPH_PATH) << export_dag().dump(2);
 #endif
@@ -992,13 +995,13 @@ namespace fins::rt {
 
 
 #if FINS_CAL_MAKESPAN
-      if (const double makespan = makespan_updater(dag); makespan > hyper_period_ms)
+      if (const double makespan = makespan_updater(dag, num_worker); makespan > hyper_period_ms)
         FINS_LOG_WARN("[rollover_hp] 超周期过载：makespan={:.2f}ms > hyper_period={:.2f}ms", makespan, hyper_period_ms);
 #endif
 
 #if FINS_STATIC_PRIORITY
       for (auto &item : ready_.data())
-        item.prio = priority_updater(dag, dag.vertex(item.id));
+        item.prio = priority_updater(dag, dag.vertex(item.id), num_worker);
       ready_.rebuild();   // 按最新 prio 重建堆（O(n)）
 #endif
 
@@ -1046,7 +1049,7 @@ namespace fins::rt {
       update_abs_deadline();
 
       for (auto &item : ready_.data())
-        item.prio = priority_updater(dag, dag.vertex(item.id));
+        item.prio = priority_updater(dag, dag.vertex(item.id), num_worker);
 #endif
 
       ready_.rebuild();                                // 按最新 prio 重建堆（O(n)）
@@ -1084,6 +1087,9 @@ namespace fins::rt {
      * @param id 已完成顶点 id（job 顶点或 "tp:" 时间点顶点）
      * @retval 无
      */
+    std::unordered_map<std::string, uint64_t> done_;   // 顶点 id → 完成世代号（世代化 clear：rollover O(1) 重置，免释放节点）
+    uint64_t done_gen_{0};                              // 当前世代号（rollover/expand 递增；done_[id]==gen ⇒ 本世代已完成）
+    size_t done_count_{0};                              // 本世代已完成顶点数（is_hp_done 用；rollover 归零）
     void trigger_workload_ready(const std::string &id) {
       {   // 幂等防御（世代化 done_：本世代已完成 → 跳过；正常每顶点每超周期恰完成一次）
         auto it = done_.find(id);

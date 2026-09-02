@@ -27,10 +27,15 @@
 #define FINS_EXPORT_TRACING_PATH "./tmp/traing.csv"
 #define FINS_EXPORT_DGRAPH_PATH "./tmp/dag.json"
 
-#define FINS_STATIC_PRIORITY 0
-#define FINS_DYNAMIC_PRIORITY 0
-#define FINS_CAL_MAKESPAN 0
-#define FINS_CAL_WCET 0
+#define FINS_STATIC_PRIORITY 0                                  // 1 = 静态优先级
+#define FINS_DYNAMIC_PRIORITY 0                                 // 1 = 动态优先级
+#define FINS_PRIORITY_POLICY fins::sched::Policy::EDF           // 换策略改这一行（RM/DM/SJF/LJF/DENSITY/DEPTH/HEIGHT/LLF...）
+
+#define FINS_CAL_MAKESPAN 0                                     // 1 = rollover 算 makespan 上界并告警过载
+#define FINS_MAKESPAN_METHOD fins::sched::MakespanMethod::MPB   // 估计方法（GRAHAM/MPB）
+
+#define FINS_CAL_WCET 0                                         // 1 = rollover 用执行历史自整定 wcet
+#define FINS_WCET_METHOD fins::sched::WcetMethod::PQUANTILE     // 估计方法（HWM/PQUANTILE）
 
 #include <atomic>
 #include <chrono>
@@ -38,9 +43,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <map>
 #include <memory>
-#include <queue>
 #include <set>
 #include <string>
 #include <thread>
@@ -55,6 +58,7 @@
 #include "thread_pool.hpp"
 #include "schedule/makespan_updater.hpp"
 #include "schedule/wcet_updater.hpp"
+#include "schedule/priority_updater.hpp"
 
 using namespace fins::rt;
 namespace fs = std::filesystem;
@@ -65,16 +69,17 @@ int main(int argc, char **argv) {
   int num_workers = argc > 3 ? std::atoi(argv[3]) : 2;   // 线程池 worker 数；非法/≤0 回落默认 2
   if (num_workers < 1) num_workers = 2;
 
-  // ── 装配 makespan_updater：mpb_makespan(dag, m) ──
-  makespan_updater = [num_workers](fins::util::DirectedAcyclicGraph<Workload, Message> &dag) {
-    return fins::sched::mpb_makespan(dag, num_workers);
-  };
+  // ── 装配 wcet_updater：FINS_WCET_METHOD 方法（PQUANTILE = 99% 分位 + 20% 裕度）。
+  wcet_updater = fins::sched::make_wcet_updater(FINS_WCET_METHOD);
+  // ── 装配 makespan_updater：FINS_MAKESPAN_METHOD 方法（MPB）。
+  makespan_updater = fins::sched::make_makespan_updater(FINS_MAKESPAN_METHOD,
+      [] { return graph_g.graph_version; },
+      [num_workers] { return num_workers; });
 
-  // ── 装配 wcet_updater：99% 分位 + 20% 裕度（FINS_CAL_WCET=1 时 rollover 用历史覆盖 v.wcet；
-  //     默认 0 关闭——历史 µs 量级 vs 配置 wcet ms 量级，开启会改 makespan 估计联动行为）──
-  wcet_updater = [](std::deque<double> hist) {
-    return fins::sched::wcet_pquantile(hist);
-  };
+  // ── 装配 priority_updater：FINS_PRIORITY_POLICY 策略（默认 EDF 动态优先级）。
+  priority_updater = fins::sched::make_priority(FINS_PRIORITY_POLICY,
+    [] { return graph_g.graph_version; },
+    [num_workers] { return num_workers; });
 
   // ── 临时：插件加载：全局插件初始化（存量扫描装载）──
   try {
