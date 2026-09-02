@@ -57,17 +57,16 @@ R ≤ min_{ j ∈ [0,k] } [ len(G) + ( vol(G) − Σ_{i=0..j} len(λ_i) ) / (m �
 
 独立头文件 `schedule/makespan_updater.hpp` 提供**两个自包含函数**:
 
-- `graham_makespan(dag, version, m)`:Graham's bound,`len(G) + (vol(G) − len(G)) / m`
-- `mpb_makespan(dag, version, m)`:Multi-Path Bound,用**贪心取最长路径**构造 generalized
-  path list(合法、安全上界;论文 §V 的最优路径表需最小费用流,见 §6),然后套公式 (9)。
+- `graham_makespan(dag, m)`:Graham's bound,`len(G) + (vol(G) − len(G)) / m`
+- `mpb_makespan(dag, m)`:Multi-Path Bound,用**贪心取最长路径**构造 generalized path list
+  (合法、安全上界;论文 §V 的最优路径表需最小费用流,见 §6),然后套公式 (9)。
   `j=0` 项即 Graham's bound,`j≥1` 更紧 → 支配前者。
 
 ```
-mpb_makespan(dag, version, m):
-  ① 结构缓存：job 顶点集(跳过 "tp:")+ 拓扑序(Kahn, 仅 job 间边)+ 前驱表 ——
-     纯结构量, 只在 version(g_state graph_version, expand_hp 重建后 ++)变化时重建一次
-  ② 每轮现读 wcet(经权重源指针, 零哈希) → 数组版 DP 算 len(G) 关键路径 + vol(G) 总负载
-  ③ 贪心路径表: 数组版, 反复在剩余顶点诱导子图上求最长路径, 移除其顶点, 直至取满 min(m, n) 条
+mpb_makespan(dag, m):
+  ① job 顶点集(跳过 "tp:" 时间点) + 拓扑序(Kahn, 仅 job 间边)
+  ② len(G) 关键路径 + vol(G) 总负载(拓扑序 DP, wcet 为顶点权)
+  ③ 贪心路径表: 反复在剩余顶点诱导子图上求最长路径, 移除其顶点, 直至取满 min(m, n) 条
   ④ 公式(9): 逐 j 算 R_j = len(G) + (vol − Σ_{i≤j} lenλ_i)/(m − j), 取 min
 ```
 
@@ -76,21 +75,12 @@ mpb_makespan(dag, version, m):
 时间点顶点的 `wcet` 是相邻释放间隔(如 100ms),**不是执行负载**;若计入会淹没真正的
 执行 makespan,故只统计 job 顶点(边也只在 job 顶点间计数)。
 
-### 结构缓存:为什么加权量不能缓存
-
-`len(G)`/`vol(G)`/路径表都是顶点权 `wcet` 的函数,而 `wcet` 每轮自整定(`FINS_CAL_WCET=1`
-时 `update_wcet_estimation` 用执行历史覆盖 `v.wcet`)——**每轮都会变,必须现算**。但拓扑序、
-稠密下标、前驱表是**纯结构量**,与权重无关、跨 rollover 不变,只在 `expand_hp` 重建时变;
-故用 `graph_version` 作失效信号,结构只重建一次,之后每轮只跑数组版 DP——消除了原先
-每次调用都有的 ~800 次并发哈希 find、~2000 次字符串比较、~500 次按值分配(见本文件
-早期性能讨论)。对外仍是两个函数,缓存结构藏在 `fins::sched::detail`。
-
 ### 接线与开关
 
 ```cpp
 // client.cpp main:
 makespan_updater = [num_workers](fins::util::DirectedAcyclicGraph<Workload, Message> &dag) {
-  return fins::sched::mpb_makespan(dag, graph_g.graph_version, num_workers);
+  return fins::sched::mpb_makespan(dag, num_workers);
 };
 ```
 
@@ -98,8 +88,6 @@ makespan_updater = [num_workers](fins::util::DirectedAcyclicGraph<Workload, Mess
 - 调用点:`g_state.hpp` `rollover_hp()` 中 `#if FINS_CAL_MAKESPAN` 分支——每次超周期回绕
   算一次,`makespan > hyper_period` 打 `超周期过载` 告警日志
 - `m` = 线程池 worker 数(函数槽签名不带 m,故闭包捕获 `num_workers`)
-- `version` = `graph_g.graph_version`(结构版本号;首次/换配置后的第一次 rollover 重建结构,
-  之后每次 rollover 仅数组 DP,~µs 级)
 
 ## 5. 验证结果(m=2,Debug 构建)
 
@@ -125,9 +113,6 @@ makespan_updater = [num_workers](fins::util::DirectedAcyclicGraph<Workload, Mess
 
 ## 7. 相关代码
 
-- `schedule/makespan_updater.hpp`:`fins::sched::graham_makespan()` + `mpb_makespan()`(独立头文件;
-  `detail::MakespanStructure` 结构缓存按 `version` 失效)
-- `example/client.cpp`:`#include "schedule/makespan_updater.hpp"` + `makespan_updater` 装配
-  (默认用 mpb,传 `graph_g.graph_version`)
-- `include/g_state.hpp`:`makespan_updater` 槽、`graph_version` 结构版本号(expand_hp 重建后 ++)、
-  `rollover_hp()` 的 `FINS_CAL_MAKESPAN` 分支
+- `schedule/makespan_updater.hpp`:`fins::sched::graham_makespan()` + `mpb_makespan()`(独立头文件)
+- `example/client.cpp`:`#include "schedule/makespan_updater.hpp"` + `makespan_updater` 装配(默认用 mpb)
+- `include/g_state.hpp`:`makespan_updater` 槽、`rollover_hp()` 的 `FINS_CAL_MAKESPAN` 分支

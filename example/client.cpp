@@ -65,10 +65,9 @@ int main(int argc, char **argv) {
   int num_workers = argc > 3 ? std::atoi(argv[3]) : 2;   // 线程池 worker 数；非法/≤0 回落默认 2
   if (num_workers < 1) num_workers = 2;
 
-  // ── 装配 makespan_updater：mpb_makespan(dag, graph_version, m) ──
-  //     结构缓存按 graph_version 失效（expand_hp 重建后 ++）；每轮仅数组版 DP 现算加权量。
+  // ── 装配 makespan_updater：mpb_makespan(dag, m) ──
   makespan_updater = [num_workers](fins::util::DirectedAcyclicGraph<Workload, Message> &dag) {
-    return fins::sched::mpb_makespan(dag, graph_g.graph_version, num_workers);
+    return fins::sched::mpb_makespan(dag, num_workers);
   };
 
   // ── 装配 wcet_updater：99% 分位 + 20% 裕度（FINS_CAL_WCET=1 时 rollover 用历史覆盖 v.wcet；
