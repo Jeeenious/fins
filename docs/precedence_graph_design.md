@@ -3,6 +3,33 @@
 > 状态：设计定稿。记录 expand_hp 从"节点级帧槽模型"演进为"job 实例级 precedence graph"的完整设计。
 > 图例：`A → B` 表示 precedence/数据绑定边。
 
+## 0. 现行语义速览（2026-09-02 定稿；与后文冲突处以此节为准）
+
+> 后文为演进记录，多处描述被取代的设计（seq 连续边、虚拟源顶点、delay 假节点、绑定边给全部周期任务等）；
+> 现行契约以代码注释（g_state.hpp / algo_func.hpp / mesg.hpp）与本节为准。
+
+任务按驱动方式分两类：
+
+- **显式周期（config `period>0`）= 时间触发**：按自身周期在时间点（`bind_sync` 的 `tp:`）释放；
+  **不建任何数据绑定/前序边**。它依赖的数据一律在**执行时**从 producer 输出端口的历史槽读
+  “最新一帧”（队列长度 1，`read_latest`）；producer 未产出则 0 占位。
+- **无显式周期（继承 period）= 数据驱动跟随**：按同名端口绑定边（`build_edge` 整数式
+  `((k+1)·Np-1)/Nc`）由 producer job 完成触发/排序；无 tp 释放门。
+
+边规则（`build_edge`）：
+
+- **全删 seq 连续边**（不再有 `{x}:{k}→{x}:{k+1}` 实例前序）；串行由释放时间点 / 数据源 job 完成传递。
+- 绑定边只给“无显式周期”节点的非 loop 输入端口；显式周期节点与 loop 端口不建绑定边。
+
+loop / 历史槽（`message_hist_` + `record_mesg`）：
+
+- loop = 自反馈：config `"loop": {端口: N}`（扁平，N = 迭代次数，正整数，N 在 pipeline 校验）；
+  job 从历史槽聚合最近 N 帧为 typed `std::vector<int>` 进输入（未满头部补 0）。
+- 显式周期“最新一帧”读：队列长度 1（仅保留 producer 最近一帧）。
+- 历史槽容量受限（`cap`，默认 10）；`record_mesg` 追加按 `Message.timestamp`（采集时间戳，写帧时置
+  `now_us`）**升序插入**、满 `cap` 丢最旧——尽量保留最新数据、队列恒按时间有序。
+- `Message` 类型方法已更名：`pub<T>()→p_mutable<T>()`（写新帧）、`sub<T>()→p_shared<T>()`（共享读帧）。
+
 ## 1. 背景与目标
 
 当前 `graph_g`（`g_state.hpp`）是**节点级**模型：每个算法节点 1 个 Vertex（1 个 job 闭包 + 多维权值），边 = stream 的 Message 帧槽，job 运行时从各入边 stream 取"最新帧"（latest-value 隐式语义）。每轮调度对每个就绪节点投递 1 次 job。
