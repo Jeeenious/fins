@@ -68,6 +68,40 @@ foreach(OCV_MOD core imgproc photo features2d imgcodecs videoio calib3d objdetec
   endif()
 endforeach()
 
+# ── PCL 模块化插件：按 PCL 库各一独立 .so（载荷 pcl::PointCloud<...>，跨 .so 的 ABI
+#    标签来自共享 libpcl_*（util::ABITag<PointCloud<PointT>>=PCL 版本）；每源文件先 include
+#    PCL 头再 include xmacro.hpp 以让 tag_ABI 生效。
+#    PCLConfig 会把整条 VTK/MPI/Qt 依赖链拖进来（本机 VTK 引用 MPI::MPI_C 等易碎），故
+#    绕开它：include 目录取自 pkg-config，链接只用手工解析出的核心非 VTK pcl 库 + FLANN。
+#    源文件单文件自包含，无共享私有头）──
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PCL_PC QUIET pcl_common)   # 仅取其 include 目录（pcl/eigen 路径）
+set(PCL_CORE_LIBS "")
+foreach(_pl common kdtree octree search sample_consensus filters ml features segmentation registration)
+  find_library(_pcl_lib_${_pl} NAMES pcl_${_pl})
+  if(_pcl_lib_${_pl})
+    list(APPEND PCL_CORE_LIBS "${_pcl_lib_${_pl}}")
+  endif()
+endforeach()
+find_library(PCL_FLANN_LIB NAMES flann)
+find_library(PCL_FLANN_CPP_LIB NAMES flann_cpp)
+foreach(PCL_MOD common filters segmentation features registration)
+  set(PCL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/example/plugins_pcl_${PCL_MOD}.cpp")
+  if(EXISTS "${PCL_SRC}")
+    add_library(fins_pcl_${PCL_MOD} SHARED "${PCL_SRC}")
+    target_include_directories(fins_pcl_${PCL_MOD} PRIVATE
+        ${SDK_ROOT}/include/utils
+        ${SDK_ROOT}/include
+        ${SDK_ROOT}
+        ${PCL_PC_INCLUDE_DIRS}
+    )
+    target_link_libraries(fins_pcl_${PCL_MOD} PRIVATE
+        ${PCL_CORE_LIBS} ${PCL_FLANN_LIB} ${PCL_FLANN_CPP_LIB})
+    set_target_properties(fins_pcl_${PCL_MOD} PROPERTIES PREFIX ""
+        OUTPUT_NAME "plugins_pcl_${PCL_MOD}")
+  endif()
+endforeach()
+
 # =================================================================
 # 8. 功能测试主程序 + 配置客户端（手动运行，不 POST_BUILD 自动跑）
 #    client [rpc_port] [plugin_dir] — 装配 RPC/loader/pool + 持续调度循环，收外部 JSON
