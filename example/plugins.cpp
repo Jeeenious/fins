@@ -123,9 +123,6 @@ void usr_join100(int cfg,
 //   （自反馈斜坡：每拍 +cfg·in，有界可观察）。printf 观察头部补位/顺序/闭环。
 void usr_acc(int cfg, int in, const std::vector<int> &hist, int &out) {
   out = cfg * in + (hist.empty() ? 0 : hist.back());
-  std::printf("[usr_acc] cfg=%d in=%d hist[%zu]=(", cfg, in, hist.size());
-  for (size_t i = 0; i < hist.size(); ++i) std::printf("%s%d", i ? " " : "", hist[i]);
-  std::printf(") -> out=%d\n", out);
   spin_cost_us(1000);
 }
 } // namespace
