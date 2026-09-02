@@ -3,5 +3,5 @@
    "outputs": ["feed"], "parameters": [{"value": 1}]},
   {"id": "acc", "name": "usr_acc", "version": "1.0.0", "period": 50,
    "inputs": ["feed", "acc_out"], "outputs": ["acc_out"],
-   "loop": {"step": {"acc_out": 3}}, "parameters": [{"value": 2}]}
+   "loop": {"acc_out": 3}, "parameters": [{"value": 2}]}
 ]

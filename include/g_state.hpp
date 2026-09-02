@@ -149,7 +149,7 @@ namespace fins::rt {
   inline Library library_g;
 
   /** @brief 节点解析态（Pipeline 内嵌，parse_pipeline 产物）：纯数据，字段含 id/name/version、
-   *  端口名数组、config_cache、loop_timer/loop_step、period/wcet/deadline/cap。 */
+   *  端口名数组、config_cache、loop、period/wcet/deadline/cap。 */
   struct NodeInfo {
     std::string id;                                      // 节点在图中的唯一标识（顶点名 id:{k} 前缀）
     std::string name;                                    // 算法名（[name:version] = so 表定位键）
@@ -164,8 +164,7 @@ namespace fins::rt {
     std::vector<std::string> output_ports;
     std::vector<nlohmann::json> config_cache;
 
-    std::map<std::string, double> loop_timer;                // loop 端口 → 定义（显式端口补充定义）
-    std::map<std::string, double> loop_step;                 // loop 端口 → 定义（显式端口补充定义）
+    std::map<std::string, size_t> loop;                      // loop 端口 → 迭代步 N（回喂过去 N 帧；窗口长度 = N）
 
     /** @brief 逐节点自解析：全部结构校验 + 字段抽取（Pipeline::parse 只拆封顶层后逐个调用
      *  本构造器）。parameters 为**位置式取值表** config_cache——只取 p["value"]、名字丢弃
@@ -225,13 +224,16 @@ namespace fins::rt {
         input_ports = n["inputs"].get<std::vector<std::string>>();
       if (n.contains("outputs") && n["outputs"].is_array())
         output_ports = n["outputs"].get<std::vector<std::string>>();
-      if (n.contains("loop") && n["loop"].is_object()) {
-        for (const auto &[mode, ports] : n["loop"].items()) {
-          if (!ports.is_object()) continue;
-          for (const auto &[port, arg] : ports.items()) {
-            if (mode == "timer") loop_timer[port] = arg.get<double>();  // 观测周期 ms
-            else                loop_step[port]  = arg.get<double>();  // 迭代步 N
-          }
+      if (n.contains("loop")) {
+        if (!n["loop"].is_object())
+          throw std::invalid_argument("[parse_dataflow] " + at + "loop 须为 object");
+        for (const auto &[port, arg] : n["loop"].items()) {
+          if (!arg.is_number())
+            throw std::invalid_argument("[parse_dataflow] " + at + "loop." + port + " 须为 number（迭代步 N）");
+          const double d = arg.get<double>();   // 迭代步 = 回溯最近 N 帧（须为正整数，窗口长度 = N）
+          if (d < 1.0 || d != std::floor(d))
+            throw std::invalid_argument("[parse_dataflow] " + at + "loop." + port + " 须为正整数迭代步 N（收到 " + std::to_string(d) + "）");
+          loop[port] = static_cast<size_t>(d);
         }
       }
     }
@@ -281,7 +283,8 @@ namespace fins::rt {
      *  expand_hp 之间显式调用（对全局 pipeline_g）：
      *  ① 单写者约束：同名输出端口至多一个生产者（数据流语义）；多写者直接拒绝，否则图侧
      *     expand_hp 绑定边对每个 producer 都建边、闭包读哪条取决于遍历顺序（不确定）；
-     *  ② 源周期：无输入节点（input_ports 空）无上游驱动，须主动周期执行，必填 period。
+     *  ② 源周期：无输入节点（input_ports 空）无上游驱动，须主动周期执行，必填 period；
+     *  ③ loop 自反馈：loop 端口须同时在本节点 inputs 与 outputs 中声明（否则静默失效）。
      * @retval 无（违反抛 std::invalid_argument）
      */
     void check_topology() const {
@@ -295,6 +298,21 @@ namespace fins::rt {
       for (size_t i = 0; i < nodes.size(); ++i)
         if (nodes[i].input_ports.empty() && nodes[i].period <= 0)
           throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) + "] 无输入节点必填 period");
+      // ③ loop 自反馈合法性：loop 端口须同时在本节点 inputs 与 outputs 中声明——反馈历史来自本
+      //    节点同名输出；缺 input → 闭包不喂它（pack_inputs 只遍历 input_ports），缺 output →
+      //    route_outputs 永不为它记历史，两者都会静默失效。
+      for (size_t i = 0; i < nodes.size(); ++i) {
+        const auto &ins  = nodes[i].input_ports;
+        const auto &outs = nodes[i].output_ports;
+        for (const auto &[pn, _] : nodes[i].loop) {
+          if (std::find(ins.begin(), ins.end(), pn) == ins.end())
+            throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) +
+                                        "] loop 端口 '" + pn + "' 须在本节点 inputs 中声明");
+          if (std::find(outs.begin(), outs.end(), pn) == outs.end())
+            throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) +
+                                        "] loop 端口 '" + pn + "' 须在本节点 outputs 中声明（自反馈）");
+        }
+      }
     }
 
     /** @brief 取本 pipeline 引用的全部算法定位键（[name]:[version] 列表，与 Plugin::loaded_keys 同构），
@@ -442,12 +460,12 @@ namespace fins::rt {
         for (const auto &pn : info.output_ports)
           producers[pn].push_back(info.id);
         for (const auto &pn : info.input_ports)
-          if (!info.loop_timer.count(pn) && !info.loop_step.count(pn))   // loop 端口：不构成消费者（无自环绑定边）
+          if (!info.loop.count(pn))   // loop 端口：不构成消费者（无自环绑定边）
             consumers[pn].push_back(info.id);
       }
       for (const auto &info : nodes) {
         for (const auto &pn : info.input_ports)
-          if (!info.loop_timer.count(pn) && !info.loop_step.count(pn))   // loop 端口：反馈 producer 是自身，不构成拓扑依赖
+          if (!info.loop.count(pn))   // loop 端口：反馈 producer 是自身，不构成拓扑依赖
             for (const auto &p : producers[pn])
               in_producers[info.id].insert(p);
         for (const auto &pn : info.output_ports)
@@ -578,7 +596,7 @@ namespace fins::rt {
           std::string trig;
           double best = 0;
           for (const auto &pn : info->input_ports)
-            if (!info->loop_timer.contains(pn) && !info->loop_step.contains(pn)) {  // loop 端口：反馈 producer 是自身，不参与继承
+            if (!info->loop.contains(pn)) {  // loop 端口：反馈 producer 是自身，不参与继承
               auto pit = producers.find(pn);
               if (pit == producers.end()) continue;   // 孤立输入端口（无 producer）→ 无继承源
               for (const auto &p : pit->second) {
@@ -628,7 +646,7 @@ namespace fins::rt {
      *  绑定边：consumer 每输入端口 pn 绑输出 pn 的唯一 producer 节点（单写者已由 check_topology
      *  保证唯一），整数式 pk=((k+1)·Np-1)/Nc 连 producer:{pk} → consumer:{k}（时段内最新已完成帧，
      *  同速率一一对应；快 producer→慢 consumer 绑末帧；慢 producer→快 consumer 共享帧；恒有边）。
-     *  loop 端口（loop_timer/loop_step 中）无绑定边——反馈走运行时数据槽 message_hist_（滑动窗口）。
+     *  loop 端口（loop 中）无绑定边——反馈走运行时数据槽 message_hist_（滑动窗口）。
      * @param dag 目标图（就地加边）
      * @param nodes 解析态节点表（只读）
      * @param node_count 节点 id → 实例数（只读）
@@ -650,7 +668,7 @@ namespace fins::rt {
       for (const auto &info : nodes) {
         const size_t Nc = node_count.at(info.id);
         for (const auto &pn : info.input_ports) {
-          if (info.loop_timer.count(pn) || info.loop_step.count(pn)) continue;   // loop 端口无绑定边
+          if (info.loop.count(pn)) continue;   // loop 端口无绑定边
           auto pit = producer_of.find(pn);
           if (pit == producer_of.end()) continue;   // 输入端口无生产者（孤立输入）→ 无边
           const std::string &p = pit->second;
@@ -739,35 +757,25 @@ namespace fins::rt {
      * @brief ⑧ 填 job 执行体闭包：按 NodeInfo 端口序打包输入/输出 array → AlgoBase execute →
      *        输出路由下游绑定边 + record_mesg 维护 loop 滑动窗口，运行时不再接触原始 JSON。
      *        闭包捕获稳定解析态（shared_ptr<const NodeInfo> 每节点 1 份按 k 共享）+ 算法实例 by_id；
-     *        输入逐输入端口取绑定边帧（loop 端口从 message_hist_ 聚合最近 w 帧，恒长 w、窗口未满
-     *        开头补空 Message 占位，pub<vector<Message>> 进对应下标）。hist 容量
+     *        输入逐输入端口取绑定边帧（loop 端口从 message_hist_ 聚合最近 N 帧——N = config 迭代步，
+     *        恒长 N、未满头部补 0，运行时直出 typed std::vector<int> 进对应下标（方案 A：AlgoFunc/
+     *        插件侧只声明 std::vector<int> 接收，不参与转换）。hist 容量
      *        mesg_hist_cap[输出端口] = 该端口作为 loop 反馈被消费时 producer 节点的 NodeInfo.cap
      *        （config 顶层 "cap"，默认 10），只对 loop 反馈输出端口建历史槽；单写者约束保证
      *        每输出端口唯一 producer → 直接赋值（非 max）；message_hist_ 跨重建保留不清。
      * @param nodes 解析态节点表（只读）
-     * @param hyper_period 超周期 ms（loop_timer 观测周期/节点周期 → 窗口帧数换算）
      * @param by_id 节点 id → 算法实例（只读）
      * @param node_count 节点 id → job 实例数（只读）
      * @retval 无
      */
-    void bind_job(const std::vector<NodeInfo> &nodes, double hyper_period,
+    void bind_job(const std::vector<NodeInfo> &nodes,
                     const std::map<std::string, std::shared_ptr<AlgoBase>> &by_id,
                     const std::map<std::string, size_t> &node_count) {
-      // loop 端口 → 聚合窗口帧数（显式端口补充定义：Pipeline::NodeInfo.loop_step / loop_timer 两 map；
-      // step 定长迭代步 N；timer 观测周期/节点周期 → 窗口帧数 ceil）。
-      auto calc_loop_window = [](const NodeInfo &info, size_t n, double hyper_period) {
-        std::map<std::string, size_t> w;
-        if (info.loop_step.empty() && info.loop_timer.empty()) return w;
-        const double Tnode = (n > 0 && hyper_period > 0) ? hyper_period / (double)n : 0.0;
-        for (const auto &[port, arg] : info.loop_step)  w[port] = (size_t)arg;   // "step"：迭代步 N（定长窗口）
-        for (const auto &[port, arg] : info.loop_timer) w[port] = (size_t)std::ceil(arg / Tnode);   // "timer"：观测周期/节点周期 → 窗口帧数
-        return w;
-      };
+      // loop 端口 → 聚合窗口帧数 = config 迭代步 N（扁平 loop map；无需换算，直取）
 
       // ── 段 1：loop 反馈历史容量表（mesg_hist_cap[loop端口] = producer 节点 cap，只对 loop 端口建槽）──
       for (const auto &info : nodes) {
-        for (const auto &[port, _] : info.loop_step)  mesg_hist_cap[port] = info.cap;
-        for (const auto &[port, _] : info.loop_timer) mesg_hist_cap[port] = info.cap;
+        for (const auto &[port, _] : info.loop)  mesg_hist_cap[port] = info.cap;   // 只对 loop 反馈端口建历史槽
       }
 
       // ── 段 2：每个节点 → 每实例填 job 闭包（闭包捕获稳定解析态 + 算法实例 + loop 聚合窗口）──
@@ -775,7 +783,7 @@ namespace fins::rt {
         auto sinfo = std::make_shared<const NodeInfo>(info);           // 闭包捕获稳定共享解析态
         const auto &algo = by_id.at(info.id);
         const size_t n = node_count.at(info.id);
-        const auto loop_w = calc_loop_window(info, n, hyper_period);   // loop 端口 → 聚合窗口帧数
+        const auto loop_w = info.loop;   // loop 端口 → 聚合窗口帧数（迭代步 N，直取 config）
 
         for (size_t k = 0; k < n; ++k) {
           const std::string vtx = info.id + ":" + std::to_string(k);   // 顶点名现拼（无 JobInst）
@@ -801,24 +809,23 @@ namespace fins::rt {
               sinfo,
               algo,
               loop_w,
-                     in_refs = std::move(in_refs), out_refs = std::move(out_refs)]() {
-              // ── 功能 1a：loop 端口 → 滑动窗口历史槽聚合最近 w 帧（恒长 w、窗口未满开头补空
-              //      Message 占位，frame=nullptr，算法须判断 .frame 跳过/当 0，勿 sub）──
+              in_refs = std::move(in_refs), out_refs = std::move(out_refs)]() {
+              // ── 功能 1a：loop 端口 → 滑动窗口历史槽聚合最近 N 帧为 typed std::vector<int>
               auto collect_loop_window = [this](const std::string &pn, size_t w) {
-                std::vector<Message> frames(w);   // 恒长 w：默认占位（空 Message 0 值）→ 尾部覆盖真实帧
+                std::vector<int> vals;   // 恒长 w；未满头部 0 占位，尾部覆盖最近真实帧
+                vals.resize(w);
                 { // TBBMap const_accessor 只锁本端口历史槽（与 record_mesg 同端口写互斥；不同端口并发读）
                   util::TBBMap<std::deque<Message>>::const_accessor a;
                   if (message_hist_.find(a, pn)) {
                     const auto &h = a->second;
                     const size_t take = std::min(w, h.size());
                     for (size_t j = 0; j < take; ++j)
-                      frames[w - take + j] = h[h.size() - take + j];
+                      vals[w - take + j] = *h[h.size() - take + j].sub<int>();   // 逐帧取真实值
                   }
-                  // find 失败（理论不发生：seq 边保证 producer 已先执行压槽）→ 全占位，等价原空槽
+                  // find 失败（理论不发生：seq 边保证 producer 已先执行压槽）→ 全 0 占位，等价原空槽
                 }
                 Message m;
-                auto vv = m.pub<std::vector<Message>>();
-                *vv = std::move(frames);
+                *m.pub<std::vector<int>>() = std::move(vals);
                 return m;
               };
 
@@ -964,7 +971,7 @@ namespace fins::rt {
       build_pred();
 
       // ⑧ job 闭包
-      bind_job(nodes, hyper_period_ms, by_id, node_count);
+      bind_job(nodes, by_id, node_count);
 
       // ⑨b 初始就绪（seed_ready，私有函数，见 bind_job 之后）
       seed_ready();

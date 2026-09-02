@@ -16,7 +16,7 @@
 | **Multi-hop** | 1 producer → 1 consumer | 线性流水线；consumer job 与 producer job 一一绑定，每帧恰好处理一次 |
 | **Fork** | 1 producer → N consumer | 一帧广播给全部下游；producer job 是每个 consumer job 的直接前驱（共享帧） |
 | **Join** | N producer → 1 consumer | latest-value 语义；**最短周期**的上游决定 release pattern 与 job 总数；每个 consumer job 绑定触发 producer job + 其余 stream 最近的 producer job |
-| **Loop** | 反馈（下游 → 上游） | 显式端口补充定义（config 顶层 `"loop"`：`{"step": {端口: 迭代步}}` / `{"timer": {端口: 观测周期}}`）；job k 从滑动窗口历史槽聚合最近 w 帧真实历史（恒长 w：step=迭代步 / timer=ceil(观测周期/节点周期)；未满 0 值占位，回绕不清，跨多超周期依赖可表达） |
+| **Loop** | 反馈（下游 → 上游） | 显式端口补充定义（config 顶层 `"loop"`：`{端口: N}`，扁平，N = 回溯迭代次数）；job k 从滑动窗口历史槽聚合最近 N 帧真实历史（恒长 N、未满头部 0 值占位、回绕不清、跨多超周期依赖可表达）。loop 输入参数在插件侧声明 `std::vector<int>`；运行时（bind_job）把最近 N 帧聚合为 typed `std::vector<int>` 直出（恒长 N、头部 0 补位），AlgoFunc/插件按普通 sub 接收、不做转换 |
 
 前三种与 Verucchi（RTAS 2020）"Latency-Aware Generation of Single-Rate DAGs from Multi-Rate Task Sets"的 Replication + 数据边绑定一致（前提全周期）。第四种 Loop 是扩充。
 
@@ -113,8 +113,8 @@ expand_hp(nodes, so_ctx) = 清空 + 顺序执行（①结构分析→②超周�
 ```
 ① 按 algo->get_input_ports()（闭包捕获具体算法实例 shared_ptr，本身即解析态：端口名 +
    loop 定义）逐端口读绑定边（edges_to(vtx, pn) 唯一 → 该 producer job 帧；连接键 = 端口名）；
-   loop 端口从滑动窗口历史槽 hist_[pn] 聚合最近 w 帧 std::vector<Message> → MsgBundle
-   （未满 0 值占位，见第 4 节 Loop）
+   loop 端口从滑动窗口历史槽 hist_[pn] 聚合最近 N 帧（config 迭代步）为 typed std::vector<int>
+   （恒长 N、未满头部补 0，见第 4 节 Loop）；运行时直出该 vector<int> 进对应输入帧交算法
 ② algo->execute(inputs, outputs)
 ③ 按 algo->get_output_ports() 逐端口写全部下游绑定边（edges_from(vtx, pn)，共享帧）+
    维护 loop 历史槽
@@ -137,10 +137,12 @@ job 实例级 precedence DAG（正常 job 顶点 + 绑定边，job 闭包携带�
 - **Join（触发者 = 最短周期）**：consumer 的 job 实例数由最短周期 producer 决定（其实例数最多），
   其余 stream 按上述时段映射就近绑定。
 - **同节点连续 job**：`{x}:{k} → {x}:{k+1}` 保证同一算法的多实例串行（Verucchi Replication）。
-- **Loop**：显式端口补充定义——step 回溯 N 帧（恒长 array）；timer 观测周期 T 窗口
-  w=ceil(T/节点周期) 帧。反馈不建图边（无自环），走滑动窗口数据槽 `message_hist_`（最近 w 帧
-  真实历史，容量 = producer 节点 `NodeInfo.cap`（config 顶层 "cap"，默认 10），回绕不清满丢
-  最旧、跨重建保留；未满 0 值占位）。
+- **Loop**：显式端口补充定义——`"loop": {端口: N}`，N = 回溯迭代次数（扁平；不再有
+  step/timer 双层与时间→帧数换算）。反馈不建图边（无自环），走滑动窗口数据槽 `message_hist_`
+  （最近 N 帧真实历史，容量 = producer 节点 `NodeInfo.cap`（config 顶层 "cap"，默认 10），
+  回绕不清满丢最旧、跨重建保留；未满头部补 0）。运行时（bind_job）直接把最近 N 帧聚合为
+  typed `std::vector<int>` 直出（当前元素固定 int；loop 入参声明 `std::vector<int>`，恒长 N、
+  头部 0 补位），AlgoFunc 与插件按普通 sub 接收、不做任何转换。
 
 ## 6. 数据生命周期
 
@@ -231,24 +233,24 @@ job 实例级 precedence DAG（正常 job 顶点 + 绑定边，job 闭包携带�
   topo 序保证前级已定），`attrs.period` 为真实周期；只有显式配置了 period 才与前级不同
   （multi-hop 速率变化）。HP 仍只统计显式配置周期（继承值必为某显式周期，整除 HP）。
   test_expand TEST 1 的 mon 未配置 → 继承 disp 的 50。
-- **Loop 落地（2026-08-25，显式端口补充定义；2026-08-26 hist 容量改 NodeInfo.cap）**：
-  节点 config 顶层 `"loop"` = `{"step": {端口: 迭代步}}` / `{"timer": {端口: 观测周期}}`
-  （不推导、必须显式定义）。loop 端口不参与拓扑依赖、支配周期继承与绑定边（无自环边）；
-  反馈走滑动窗口数据槽 `message_hist_[端口]`（最近 w 帧真实历史，容量 = producer 节点
-  `NodeInfo.cap`（config 顶层 "cap"，默认 10，2026-08-26 起从 JSON 解析）；回绕不清、满丢
-  最旧、跨重建保留，跨多超周期依赖可表达）。job 闭包对 loop 端口聚合恒长
-  `std::vector<Message>`（w 帧）进 `inputs[端口]`：
-  窗口未满（刚启动/超周期初期）开头补空 Message 0 值占位（frame=nullptr，算法须判断
-  `.frame` 跳过/当 0，勿 sub——sub 空帧抛异常）；尾部为最近真实帧。test_expand 重构为
-  test1..7（source 10ms 源头：multihop / fork / join / step-intra / step-cross /
-  timer-intra / timer-cross）。
+- **Loop 落地（2026-08-25，显式端口补充定义；2026-08-26 hist 容量改 NodeInfo.cap；
+  2026-09-02 扁平化 + 运行时 typed std::vector<int>）**：
+  节点 config 顶层 `"loop"` = `{端口: N}`（扁平，N = 回溯迭代次数；**timer 时间窗口模式已删**，
+  不再有时长→帧数换算；不推导、必须显式定义）。loop 端口不参与拓扑依赖、支配周期继承与
+  绑定边（无自环边）；反馈走滑动窗口数据槽 `message_hist_[端口]`（最近 N 帧真实历史，容量 =
+  producer 节点 `NodeInfo.cap`（config 顶层 "cap"，默认 10，2026-08-26 起从 JSON 解析）；
+  回绕不清、满丢最旧、跨重建保留，跨多超周期依赖可表达）。job 闭包对 loop 端口把最近 N 帧
+  聚合为 typed `std::vector<int>` 直出进 `inputs[端口]`（恒长 N：未满头部补 0、尾部 = 最近真实帧
+  逐帧 sub<int>；当前元素固定 int，AlgoFunc/插件声明 `std::vector<int>` 按普通 sub 接收、零转换）。
+  校验放 pipeline 侧：N 须正整数（NodeInfo 格式级）、loop 端口须同时在本节点 inputs/outputs 中
+  声明（check_topology 结构级 ③）。
 - **JSON 解析归 Pipeline + 解析态定型 Pipeline::NodeInfo（2026-08-26）**：图侧/运行时彻底剥离 JSON
   类型判断——Pipeline **两函数职责分离**（parse / check_topology 两层检查）：
   `Pipeline::parse(config)`（无返回）**拆封 script**（null/array/{nodes:[...]}/单节点）+ 逐个
   触发 **NodeInfo 构造器自解析**（每节点 1 个 **`Pipeline::NodeInfo`** 纯数据解析态：id/name/
   version、input_ports/output_ports（端口名数组，顺序 = AlgoFunc 参数顺序）、config_cache（位置式
-  值表 = config 的 parameters 元素 value，名字丢弃）、loop 拆 **loop_timer / loop_step 两个 map**
-  （弃 LoopDef："timer" 端口→观测周期 ms / "step" 端口→迭代步 N）、period/wcet/deadline 数值——
+  值表 = config 的 parameters 元素 value，名字丢弃）、loop 拆单个 map（端口 → 迭代步 N；扁平，
+  timer 模式已删）、period/wcet/deadline 数值——
   **无 config 原始 JSON 拷贝**（NodeInfo 纯结构化）），逐节点格式违反抛异常——同时充当
   **第一级 json 格式审查**（收包前调）；
   `check_topology()` = **第二级图结构审查**（无参读 nodes：① 单写者约束——同名输出端口多 producer
@@ -276,7 +278,7 @@ job 实例级 precedence DAG（正常 job 顶点 + 绑定边，job 闭包携带�
   expand_hp()（①结构分析→②超周期→③拓扑序→④实例化→⑤支配周期/实例数→⑥建顶点→⑦建边→
   ⑧填 job 闭包），删 BuildCtx struct 与私有函数声明——中间量全为 expand_hp 局部变量
   （producers/consumers/in_producers/out_consumers/topo/by_id/by_info/period_final/node_count/
-  producer_of/loop_w/loop_is_timer）。建图语义不变（顶点/边/绑定/loop 全部与拆分版一致），
+  producer_of/loop_w）。建图语义不变（顶点/边/绑定/loop 全部与拆分版一致），
   test_expand 结构断言（64/64）全过。
 
 未实现（设计步骤 6，见第 9 节）：

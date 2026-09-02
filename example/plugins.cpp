@@ -6,7 +6,8 @@
  *   进插件输出目录（PLUGIN_OUTPUT_DIR/plugins），装配点扫描目录 make_shared<Plugin>
  *   装载进 library_g.so_ctx（Plugin 构造 = dlopen + dlsym 5 个 C 符号 + 填 loaded_keys）。
  *   算法本体 = AlgoFunc 封装的用户裸函数 usr_*（configs-first 参数布局契约：配置段 +
- *   输入段 + 输出段，参数为具体载荷类型 int / std::vector<Message>，处理逻辑统一
+ *   输入段 + 输出段，参数为具体载荷类型 int；usr_acc 的 loop 反馈入参声明 std::vector<int>
+ *   （恒长 N、头部 0 补位，运行时 bind_job 直出 typed 容器，见 g_state.hpp）。处理逻辑统一
  *   "乘增益 gain"——配置注入 / 输入解包 / 输出路由任一环节错位最终值即错，可被通信
  *   测试断言捕获）。5 个 C 工厂符号由 FINS_ALGO_EXPORT 宏自动生成（X-macro 展开：
  *   名字表 = 函数名字符串化、计数、create_algo 按 [usr_*:1.0.0] 分发 AlgoFunc），
@@ -117,7 +118,16 @@ void usr_join100(int cfg,
         i91 + i92 + i93 + i94 + i95 + i96 + i97 + i98 + i99 + i100;
   spin_cost_us(1000);
 }
-void usr_acc(int cfg, int in, std::vector<fins::rt::Message> hist, int &out) { (void)hist; out = in * cfg; spin_cost_us(1000);}
+// acc：1 输入（feed）/ 1 loop 反馈输入（acc_out，config 迭代步 N=3）/ 1 输出（acc_out，写回历史槽）。
+//   hist = 运行时聚合出的最近 N 帧 std::vector<int>（旧→新，头部补 0）；out = cfg·in + 最近一帧
+//   （自反馈斜坡：每拍 +cfg·in，有界可观察）。printf 观察头部补位/顺序/闭环。
+void usr_acc(int cfg, int in, const std::vector<int> &hist, int &out) {
+  out = cfg * in + (hist.empty() ? 0 : hist.back());
+  std::printf("[usr_acc] cfg=%d in=%d hist[%zu]=(", cfg, in, hist.size());
+  for (size_t i = 0; i < hist.size(); ++i) std::printf("%s%d", i ? " " : "", hist[i]);
+  std::printf(") -> out=%d\n", out);
+  spin_cost_us(1000);
+}
 } // namespace
 
 // ── 算法列表（X-macro：算法名 = 函数名字符串化，版本 = FINS_ALGO_EXPORT 参数 "1.0.0"）──

@@ -171,6 +171,8 @@ enum class Policy { FIFO, RM, DM, SJF, LJF, DENSITY, DEPTH, HEIGHT, EDF, LLF };
  *  @param p          策略（Policy 枚举）
  *  @param version_of 结构版本号提供者（DEPTH/HEIGHT 用；其余策略不调用）。client 传
  *                    [&]{ return graph_g.graph_version; }
+ *  @param workers_of 线程池 worker 数提供者（DEPTH/HEIGHT 用；其余策略不调用）。client 传
+ *                    [&]{ return graph_g.num_workers; }
  *  @retval std::function<int(Dag&, const Workload&)> 与 g_state priority_updater 槽签名一致
  */
 inline std::function<int(Dag &, const fins::rt::Workload &)> make_priority(
