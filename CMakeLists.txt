@@ -48,6 +48,26 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/example/plugins.cpp")
     set_target_properties(plugin PROPERTIES PREFIX "")
 endif()
 
+# ── OpenCV 模块化插件：按 OpenCV 模块各一独立 .so（cv::Mat 为跨边载荷；同 .so 内
+#    typeid 自洽，cv::Mat 的 typeinfo/ABI 标签来自共享 libopencv_core，跨 .so 亦一致；
+#    每个源文件单文件自包含，dlopen 时自执行 cv::setNumThreads(0) 禁用其后台线程池）──
+find_package(OpenCV REQUIRED)
+foreach(OCV_MOD core imgproc photo features2d imgcodecs videoio calib3d objdetect video ml dnn)
+  set(OCV_SRC "${CMAKE_CURRENT_SOURCE_DIR}/example/plugins_opencv_${OCV_MOD}.cpp")
+  if(EXISTS "${OCV_SRC}")
+    add_library(fins_opencv_${OCV_MOD} SHARED "${OCV_SRC}")
+    target_include_directories(fins_opencv_${OCV_MOD} PRIVATE
+        ${SDK_ROOT}/include/utils
+        ${SDK_ROOT}/include
+        ${SDK_ROOT}
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(fins_opencv_${OCV_MOD} PRIVATE ${OpenCV_LIBS})
+    set_target_properties(fins_opencv_${OCV_MOD} PROPERTIES PREFIX ""
+        OUTPUT_NAME "plugins_opencv_${OCV_MOD}")
+  endif()
+endforeach()
+
 # =================================================================
 # 8. 功能测试主程序 + 配置客户端（手动运行，不 POST_BUILD 自动跑）
 #    client [rpc_port] [plugin_dir] — 装配 RPC/loader/pool + 持续调度循环，收外部 JSON
