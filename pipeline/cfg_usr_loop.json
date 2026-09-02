@@ -1,7 +1,7 @@
 [
-  {"id": "src", "name": "usr_src", "version": "1.0.0", "period": 100,
+  {"id": "src", "name": "usr_src", "version": "1.0.0", "period": 50,
    "outputs": ["feed"], "parameters": [{"value": 1}]},
-  {"id": "acc", "name": "usr_acc", "version": "1.0.0",
+  {"id": "acc", "name": "usr_acc", "version": "1.0.0", "period": 10,
    "inputs": ["feed", "acc_out"], "outputs": ["acc_out"],
-   "loop": {"acc_out": 3}, "parameters": [{"value": 2}]}
+   "loop": {"acc_out": 2}, "parameters": [{"value": 2}]}
 ]

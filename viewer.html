@@ -86,9 +86,11 @@ main{ flex:1; display:flex; position:relative; }
 .edge .elabel{ font-size:11px; fill:#334155; font-weight:700; paint-order:stroke;
   stroke:#fff; stroke-width:3px; stroke-linejoin:round; }
 .edge.hl .elabel{ stroke:#dbeafe; }
-#hedges{ pointer-events:none; }
 .hedge path{ fill:none; stroke:#d946ef; stroke-width:1.6; stroke-dasharray:7 5;
-  stroke-linejoin:round; stroke-linecap:round; opacity:.85; }
+  stroke-linejoin:round; stroke-linecap:round; opacity:.9; pointer-events:stroke; }
+.hedge.dim{ opacity:.12; }
+.hedge.hl path{ stroke-width:3; filter:drop-shadow(0 0 4px rgba(217,70,239,.6)); }
+.hedge.hl .hlabel{ stroke:#fae8ff; }
 .hedge .hlabel{ font-size:10.5px; fill:#a21caf; font-weight:700; paint-order:stroke;
   stroke:#fff; stroke-width:3px; }
 </style>
@@ -244,22 +246,49 @@ function buildGraph(config){
     idx[key]++;
   });
 
-  // 最长路径分层（自环不计入深度）
-  const depth = {}; rawNodes.forEach(n => depth[n.id] = 0);
-  const adj = {}; rawNodes.forEach(n => adj[n.id] = []);
-  const indeg = {}; rawNodes.forEach(n => indeg[n.id] = 0);
-  rawEdges.forEach(e => { if (e.from && byId[e.from] && !e.self){ adj[e.from].push(e.to); indeg[e.to]++; } });
-  const q = rawNodes.filter(n => indeg[n.id]===0).map(n => n.id);
-  const order = [];
-  while (q.length){
-    const id = q.shift(); order.push(id);
-    adj[id].forEach(t => {
-      depth[t] = Math.max(depth[t], depth[id]+1);
-      if (--indeg[t]===0) q.push(t);
-    });
+  // —— 算法列分层：同一算法(含全部 job 实例)占一列，不同算法按依赖拓扑依次排；
+  //    tp 时间轴 = 列 0。依赖源：job→job 真实数据边(跳过 tp 门/自环/外部) + hist「latest」(producer 列在左)。
+  const GROUP_TP = '::tp::';               // 特殊组键（时间轴），名字序必在最前
+  const grpIdx = {}, names = [];
+  const gkey = n => {
+    const k = (n.kind === 'timepoint') ? GROUP_TP : n.name;
+    if (!(k in grpIdx)){ grpIdx[k] = names.length; names.push(k); }
+    return grpIdx[k];
+  };
+  rawNodes.forEach(gkey);
+  const deps = names.map(() => new Set());
+  rawEdges.forEach(e => {
+    if (e.self || e.external) return;
+    const f = byId[e.from], t = byId[e.to];
+    if (!f || !t || f.kind === 'timepoint' || t.kind === 'timepoint') return;   // tp 门不是算法间依赖
+    const a = gkey(f), b = gkey(t);
+    if (a !== b) deps[a].add(b);
+  });
+  rawHistEdges.forEach(h => {
+    if (h.mode === 'latest' && byId[h.from] && byId[h.to]){
+      const a = gkey(byId[h.from]), b = gkey(byId[h.to]);
+      if (a !== b) deps[a].add(b);           // producer 须在 consumer 左侧
+    }
+  });
+  // Kahn 拓扑（名字序破平）→ 列号：tp=0，其余算法按拓扑依次 1,2,…（每算法唯一一列）
+  const indegN = names.map(() => 0);
+  names.forEach((_, i) => deps[i].forEach(d => indegN[d]++));
+  const nameLess = (i, j) => (names[i] < names[j] ? -1 : names[i] > names[j] ? 1 : 0);
+  const tq = [];
+  for (let i = 0; i < names.length; i++) if (indegN[i] === 0) tq.push(i);
+  tq.sort(nameLess);
+  const hasTp = GROUP_TP in grpIdx;
+  let colIdx = hasTp ? 1 : 0;
+  const col = names.map(() => -1);
+  while (tq.length){
+    const i = tq.shift();
+    col[i] = (names[i] === GROUP_TP) ? 0 : colIdx++;
+    deps[i].forEach(d => { if (--indegN[d] === 0) tq.push(d); });
+    tq.sort(nameLess);
   }
-  let extra = Math.max(0, ...order.map(id=>depth[id])) + 1;
-  rawNodes.forEach(n => { if (indeg[n.id] > 0) depth[n.id] = extra++; });
+  for (let i = 0; i < names.length; i++) if (col[i] < 0) col[i] = colIdx++;   // 兜底
+  const depth = {};
+  rawNodes.forEach(n => depth[n.id] = col[gkey(n)]);
 
   // —— 出边扇形索引：同一节点发出的多条边起点微错开 ——
   const outG = {}; rawEdges.forEach(e => { if (e.from && byId[e.from]) outG[e.from] = (outG[e.from]||0)+1; });
@@ -298,6 +327,14 @@ function layout(g){
   let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
   ds.forEach(d => {
     const arr = levels[d];
+    // 时间点(tp) 本质是时间轴：同层内 timepoint 排最前、随后按 (节点名, 实例号) 排，整齐且轴序正确
+    // （tp:0/tp:1/tp:10... 避免字符串序错乱；job 实例也按号升序排布）。
+    const rank = n => (n.kind === 'timepoint' ? 0 : 1);
+    const key  = n => {
+      const m = /:(\d+)$/.exec(n.id);
+      return m ? +m[1] : Infinity;
+    };
+    arr.sort((a,b) => (rank(a)-rank(b)) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) || (key(a)-key(b)));
     const x = PAD + d*(NODE_W+COL_GAP);
     const span = (arr.length-1)*(NODE_H+ROW_GAP);
     arr.forEach((n,i) => {
@@ -394,9 +431,10 @@ function edgeGeometry(g, e, mode){
     const r = routeWaypoints(g, e);
     if (mode === 'classic'){
       const f = g.byId[e.from];
-      const x1 = f.x + NODE_W, y1 = f.y + NODE_H/2;
-      const dx = Math.max(40,(to.x-x1)/2);
-      d = `M ${x1} ${y1} C ${x1+dx} ${y1}, ${to.x-dx} ${to.y+NODE_H/2}, ${to.x} ${to.y+NODE_H/2}`;
+      const x1 = f.x + NODE_W, y1 = f.y + NODE_H/2, y2 = to.y + NODE_H/2;
+      const a = x1 + STUB, b = to.x - STUB;          // 首/末水平 stub 端点
+      const dx = Math.max(30, (b - a)/2);
+      d = `M ${x1} ${y1} L ${a} ${y1} C ${a+dx} ${y1}, ${b-dx} ${y2}, ${b} ${y2} L ${to.x} ${y2}`;
     } else if (mode === 'ortho'){
       d = 'M ' + r.pts.map(p=>p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' L ');
     } else {
@@ -408,17 +446,25 @@ function edgeGeometry(g, e, mode){
 }
 
 // ---------- hist 隐式依赖几何（虚线；不参与布局，仅叠加） ----------
+// 保证首末段水平直进直出：出源右缘 → 水平 stub → 上拱弧 → 水平 stub → 入目标左缘
+const STUB = 22;
 function hedgePath(g, he){
   const f = g.byId[he.from], t = g.byId[he.to];
-  const yF = f.y + NODE_H/2, yT = t.y + NODE_H/2;
+  const xS = f.x + NODE_W, yF = f.y + NODE_H/2;
+  const xT = t.x, yT = t.y + NODE_H/2;
   if (he.self){
-    const x = f.x + NODE_W, y = yF;
+    const x = xS, y = yF;
     return { d: `M ${x+4} ${y} C ${x+70} ${y-66}, ${x+70} ${y+66}, ${x+4} ${y}`, lx: x+44, ly: y };
   }
-  const xF = f.x + NODE_W, xT = t.x, mid = (xF+xT)/2;
-  const bow = Math.max(28, Math.abs(xT-xF)/3);
-  const cy = Math.min(yF, yT) - bow;
-  return { d: `M ${xF} ${yF} C ${mid} ${cy}, ${mid} ${cy}, ${xT} ${yT}`, lx: mid, ly: cy - 6 };
+  const s1x = xS + STUB, s2x = xT - STUB, labelMid = (xS + xT)/2;
+  if (s2x > s1x){
+    const mid = (s1x + s2x)/2;
+    const bow = Math.max(24, Math.min(90, Math.abs(s2x - s1x)/2.2));
+    const cy = Math.min(yF, yT) - bow;
+    return { d: `M ${xS} ${yF} L ${s1x} ${yF} C ${mid} ${cy}, ${mid} ${cy}, ${s2x} ${yT} L ${xT} ${yT}`,
+             lx: mid, ly: cy - 6 };
+  }
+  return { d: `M ${xS} ${yF} L ${xT} ${yT}`, lx: labelMid, ly: (yF+yT)/2 - 8 };
 }
 
 const S = {
@@ -557,6 +603,16 @@ function drawGraph(){
       t.setAttribute('class','hlabel'); t.setAttribute('x', geo.lx); t.setAttribute('y', geo.ly);
       t.textContent = he.port + (he.mode === 'latest' ? '·最新' : '·win' + he.win);
       w.appendChild(t);
+      w.addEventListener('mouseenter', ev => {
+        const rel = new Set([he.from, he.to]);
+        document.querySelectorAll('#nodes .node').forEach(el =>
+          el.classList.toggle('dim', !rel.has(el.dataset.id)));
+        document.querySelectorAll('#edges .edge').forEach(el => el.classList.remove('hl','dim'));
+        document.querySelectorAll('#hedges .hedge').forEach(el => el.classList.toggle('dim', el !== w));
+        w.classList.add('hl');
+        showTip(ev, `${he.port} ${he.mode === 'latest' ? '读最新一帧' : '依赖前' + he.win + '帧'}（${he.from} → ${he.to}）`);
+      });
+      w.addEventListener('mouseleave', resetHighlight);
       hg.appendChild(w);
     });
     vp.appendChild(hg);
@@ -606,11 +662,17 @@ function drawGraph(){
     w.addEventListener('mouseenter', ev => {
       const rel = new Set([n.id]);
       g.edges.forEach(ed => { if (ed.from===n.id||ed.to===n.id){ rel.add(ed.from); rel.add(ed.to); } });
+      (g.histEdges||[]).forEach(h => { if (h.from===n.id||h.to===n.id){ rel.add(h.from); rel.add(h.to); } });
       document.querySelectorAll('#nodes .node').forEach(el =>
         el.classList.toggle('dim', !rel.has(el.dataset.id)));
       document.querySelectorAll('#edges .edge').forEach(el => {
         const ed = g.edges[+el.dataset.idx];
         const on = ed.from===n.id || ed.to===n.id;
+        el.classList.toggle('dim', !on); el.classList.toggle('hl', on);
+      });
+      document.querySelectorAll('#hedges .hedge').forEach(el => {
+        const h = g.histEdges && g.histEdges[+el.dataset.idx];
+        const on = !!h && (h.from===n.id || h.to===n.id);
         el.classList.toggle('dim', !on); el.classList.toggle('hl', on);
       });
       showTip(ev, `${n.id} · ${n.name}${n.kind ? ' · '+n.kind : ''}`);
@@ -652,7 +714,7 @@ function showTip(e, html){ tip.innerHTML = html; tip.style.display='block';
   tip.style.left=(e.clientX+14)+'px'; tip.style.top=(e.clientY+14)+'px'; }
 function hideTip(){ tip.style.display='none'; }
 function resetHighlight(){
-  document.querySelectorAll('.node,.edge').forEach(el => el.classList.remove('dim','hl'));
+  document.querySelectorAll('.node,.edge,.hedge').forEach(el => el.classList.remove('dim','hl'));
   hideTip();
 }
 function openDetail(n){
@@ -747,7 +809,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
   // 平移（拖空白）
   svg.addEventListener('mousedown', e => {
-    if (e.target.closest('.node,.edge,.elabel')) return;
+    if (e.target.closest('.node,.edge,.elabel,.hedge')) return;
     dragState = { kind:'pan', x:e.clientX, y:e.clientY, vx:S.view.x, vy:S.view.y };
   });
 

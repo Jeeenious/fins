@@ -931,7 +931,7 @@ namespace fins::rt {
       }
 
       // ── 段 3：hist 隐式依赖导出表（hist_export_；export_dag → hist_edges，独立于前序 edges）──
-      //  loop   ：consumer 读自身输出端口历史槽（自反馈窗口 N）；k>0 指回同节点上一实例，k=0 自环。
+      //  loop   ：consumer 依赖自身输出端口历史槽的前 win 帧（往前找 win 个更早实例；k=0 无更早帧不画）。
       //  latest ：显式周期节点读 producer 输出端口“最新一帧”（队列长 1），锚 producer 末实例。
       hist_export_.clear();
       std::map<std::string, std::string> producer_of;   // 输出端口名 → producer 节点 id（单写者保证唯一）
@@ -942,10 +942,14 @@ namespace fins::rt {
         const size_t n = node_count.at(info.id);
         for (size_t k = 0; k < n; ++k) {
           const std::string vtx = info.id + ":" + std::to_string(k);
-          for (const auto &[pn, win] : info.loop) {   // ① loop 自反馈（周期/非周期均可有）
-            const std::string from = (k > 0) ? (info.id + ":" + std::to_string(k - 1)) : vtx;
-            hist_export_.push_back({{"from", from}, {"to", vtx}, {"port", pn},
-                                    {"mode", "loop"}, {"win", win}});
+          for (const auto &[pn, win] : info.loop) {   // ① loop 自反馈：标注它实际依赖的历史帧
+            // “往前找 win 帧” = 本节点输出历史槽中该实例之前的最近 win 帧（同一超周期内为前 k 个实例；
+            // 跨超周期历史在本轮顶点集内不可见，不画）。k=0 首实例无更早帧 → 不画（也不画自环）。
+            const size_t mx = std::min<size_t>(win, k);
+            for (size_t w = 1; w <= mx; ++w)
+              hist_export_.push_back({{"from", info.id + ":" + std::to_string(k - w)},
+                                      {"to", vtx}, {"port", pn},
+                                      {"mode", "loop"}, {"win", win}});
           }
           if (info.period > 0) {   // ② 显式周期“最新一帧”读（非 loop 输入，且存在 producer）
             for (const auto &pn : info.input_ports) {
