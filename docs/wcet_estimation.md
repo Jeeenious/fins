@@ -45,7 +45,8 @@ wcet = q_p(hist) × (1 + margin)，q_p = 排序 + 线性插值分位数
 
 ## 4. 本实现(`schedule/wcet_updater.hpp`)
 
-独立头文件提供**两个自包含函数**(无复杂数据结构,仅标准库):
+独立头文件提供**状态模式**(同 priority/makespan):`WcetMethod` 枚举 + `make_wcet_updater`
+工厂一行选方法;底层**两个自包含函数**(无复杂数据结构,仅标准库):
 
 - `fins::sched::wcet_hwm(hist, margin=0.2)`——最高水位,`max(hist)·(1+margin)`
 - `fins::sched::wcet_pquantile(hist, p=0.99, margin=0.2)`——p 分位 + 裕度,`p≥1` 退化到 hwm
@@ -56,13 +57,17 @@ wcet = q_p(hist) × (1 + margin)，q_p = 排序 + 线性插值分位数
 ### 接线与开关
 
 ```cpp
-// client.cpp main：
-wcet_updater = [](std::deque<double> hist) {
-  return fins::sched::wcet_pquantile(hist);   // 99% 分位 + 20% 裕度
-};
+// client.cpp main（一行选方法；margin/p 可配，缺省 0.2/0.99）：
+wcet_updater = fins::sched::make_wcet_updater(FINS_WCET_METHOD);   // PQUANTILE（默认）
+// 切换：WcetMethod::HWM / PQUANTILE；带参数如 make_wcet_updater(PQUANTILE, 0.1, 0.95)
 ```
 
-- 开关:`#define FINS_CAL_WCET 1`(client.cpp 顶部;默认 0 关闭)
+```cpp
+// client.cpp 顶部宏：
+#define FINS_CAL_WCET 1                          // 开关；默认 0 关闭
+#define FINS_WCET_METHOD fins::sched::WcetMethod::PQUANTILE   // 换方法只改这行
+```
+
 - 调用点:`g_state.hpp` `rollover_hp()` 中 `#if FINS_CAL_WCET` 分支 →
   `update_wcet_estimation()`——遍历图顶点,对有执行历史的普通 job 节点调
   `wcet_updater(该顶点算法历史)` 现算覆盖 `v.wcet`
@@ -80,7 +85,9 @@ wcet_updater = [](std::deque<double> hist) {
 
 ## 6. 相关代码
 
-- `schedule/wcet_updater.hpp`:`fins::sched::wcet_hwm()` + `wcet_pquantile()`(独立头文件)
-- `example/client.cpp`:`#include "schedule/wcet_updater.hpp"` + `wcet_updater` 装配
+- `schedule/wcet_updater.hpp`:`fins::sched::wcet_hwm()` + `wcet_pquantile()` +
+  `WcetMethod` + `make_wcet_updater()`(独立头文件)
+- `example/client.cpp`:`#include "schedule/wcet_updater.hpp"` + `FINS_WCET_METHOD` 宏 +
+  `make_wcet_updater` 装配
 - `include/g_state.hpp`:`wcet_updater` 槽、`exec_us_hist_/record_exec`、`update_wcet_estimation()`、
   `rollover_hp()` 的 `FINS_CAL_WCET` 分支

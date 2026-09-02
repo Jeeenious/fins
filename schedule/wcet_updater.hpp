@@ -5,17 +5,20 @@
  *   —— 输入某顶点(算法)最近 N 次 execute 耗时（us，exec_us_hist_ 环形队列，键 = 算法键），
  *      输出估计 wcet（ms，直接覆盖 v.wcet 字段）。µs→ms 换算在函数内完成。
  *
- * 本头文件只提供两个自包含函数（无任何复杂数据结构）：
- *   wcet_hwm(hist, margin)          — 最高水位：max(hist)·(1+margin)，安全上界（不低于观测峰值）
- *   wcet_pquantile(hist, p, margin) — p 分位数·(1+margin)，统计估计，抗尖峰（忽略顶部 (1−p) 稀有超时）
+ * 状态模式（同 priority/makespan）：
+ *   WcetMethod 枚举 + make_wcet_updater(method, margin, p) → 与槽签名一致的 std::function，
+ *   装配点一行选方法。底层自包含函数（对外无复杂数据结构）：
+ *     wcet_hwm(hist, margin)          — 最高水位：max(hist)·(1+margin)，安全上界
+ *     wcet_pquantile(hist, p, margin) — p 分位数·(1+margin)，统计估计，抗尖峰
  *
  * 调用点：PrecedenceGraph::update_wcet_estimation()（rollover_hp 内 #if FINS_CAL_WCET）。
- * 依赖：仅标准库（<deque>/<algorithm>/<vector>），不依赖 g_state/form。
+ * 依赖：仅标准库（<deque>/<algorithm>/<vector>/<functional>），不依赖 g_state/form。
  ******************************************************************************/
 #pragma once
 
 #include <algorithm>
 #include <deque>
+#include <functional>
 #include <vector>
 
 namespace fins::sched {
@@ -48,6 +51,24 @@ namespace fins::sched {
     const size_t hi = std::min(lo + 1, v.size() - 1);
     const double q = v[lo] + (v[hi] - v[lo]) * (idx - (double)lo);   // 线性插值
     return q * (1.0 + margin) / 1000.0;   // us → ms
+  }
+
+  /** @brief wcet 估计方法（装配点一行选）。 */
+  enum class WcetMethod { HWM, PQUANTILE };
+
+  /** @brief 方法 → 装配函数槽（与 wcet_updater 槽签名 std::function<double(std::deque<double>)> 一致）。
+   *  @param method 估计方法
+   *  @param margin 安全裕度（缺省 0.2）
+   *  @param p      p 分位数（仅 PQUANTILE 用；缺省 0.99）
+   *  @retval std::function<double(std::deque<double>)> 槽函数（µs 历史 → ms wcet）
+   */
+  inline std::function<double(std::deque<double>)> make_wcet_updater(
+      WcetMethod method, double margin = 0.2, double p = 0.99) {
+    switch (method) {
+      case WcetMethod::HWM:       return [margin](std::deque<double> h) { return wcet_hwm(h, margin); };
+      case WcetMethod::PQUANTILE: return [margin, p](std::deque<double> h) { return wcet_pquantile(h, p, margin); };
+    }
+    return [](std::deque<double>) { return 0.0; };   // 防御：未知方法 → 0（无历史语义）
   }
 
 } // namespace fins::sched
