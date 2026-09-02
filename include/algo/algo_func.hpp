@@ -62,15 +62,15 @@ namespace fins::rt {
             // 全部按运行时边界定位（无端口名/计数）。
             if (Is < configs.size()) {
               // 配置段（前置）：类型化帧已由 configure 注入时预解码，直接 sub 取（零解析）
-              return *(configs[Is].sub<ParamType>());
+              return *(configs[Is].p_shared<ParamType>());
             } else if (Is < configs.size() + inputs.size()) {
               // 输入段：从输入数组对应序取帧（共享，只读）
               const size_t r = Is - configs.size();
-              return *(inputs[r].sub<ParamType>());
+              return *(inputs[r].p_shared<ParamType>());
             } else {
               // 输出段：在输出数组对应序 pub 分配帧传给用户函数写
               const size_t r = Is - configs.size() - inputs.size();
-              return *(output[r].pub<ParamType>());
+              return *(output[r].p_mutable<ParamType>());
             }
           }
         }() ...
@@ -86,7 +86,7 @@ namespace fins::rt {
           using CfgType = std::decay_t<std::tuple_element_t<Is, ArgsTuple>>;
           if constexpr (nlohmann::detail::has_from_json<nlohmann::json, CfgType>::value) {
             Message m;
-            *(m.pub<CfgType>()) = json.get<CfgType>();
+            *(m.p_mutable<CfgType>()) = json.get<CfgType>();
             return m;
           } else {
             throw std::runtime_error(

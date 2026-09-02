@@ -2,6 +2,7 @@
 
 #include <sstream>
 #include "../utils/tag_ABI.hpp"
+#include "../utils/time.hpp"
 
 namespace fins::rt {
 
@@ -25,9 +26,10 @@ namespace fins::rt {
     size_t type_hash{0};                        // 运行时类型硬核 Hash (用于校验基础类名)
     uint32_t abi_tag{0};                        // 第三方大库 ABI 版本号 (防御跨环境编译大库撕裂)
     const char* type_name{"void"};              // 发生异常时用于打印错误日志的可读类型名
+    double timestamp;                           // 采集时间戳
 
     template<typename T>
-    std::shared_ptr<T> pub() {
+    std::shared_ptr<T> p_mutable() {
       if (frame != nullptr) {
         throw std::runtime_error("[Fins Fatal] Attempting to publish a message frame that is already occupied.");
       }
@@ -38,12 +40,13 @@ namespace fins::rt {
       type_hash = typeid(RawT).hash_code();
       abi_tag = util::ABITag<RawT>::value();
       frame = std::make_shared<RawT>();
+      timestamp = util::now_us();
 
       return std::static_pointer_cast<T>(frame);
     }
 
     template<typename T>
-    std::shared_ptr<T> sub() const {
+    std::shared_ptr<T> p_shared() const {
       if (frame == nullptr) {
         throw std::runtime_error("[Fins Fatal] Attempting to subscribe to a null message frame.");
       }

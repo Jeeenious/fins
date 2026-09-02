@@ -23,4 +23,10 @@ namespace fins::util {
     return std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
   }
+
+  /// 单调时钟从 epoch 以来的流逝（µs，steady_clock 单调、不随校时跳变）——时间间隔/排期基准。
+  inline double now_us() {
+    return std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
 } // namespace fins::util
