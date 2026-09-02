@@ -93,16 +93,37 @@ main{ flex:1; display:flex; position:relative; }
 .hedge.hl .hlabel{ stroke:#fae8ff; }
 .hedge .hlabel{ font-size:10.5px; fill:#a21caf; font-weight:700; paint-order:stroke;
   stroke:#fff; stroke-width:3px; }
+.tabs{ display:flex; gap:4px; background:#f1f5f9; border:1px solid var(--line2);
+  border-radius:8px; padding:2px; }
+.tab{ border:none; background:transparent; padding:5px 12px; font-size:13px; border-radius:6px;
+  color:var(--muted); cursor:pointer; }
+.tab.active{ background:#fff; color:var(--text); font-weight:600; box-shadow:0 1px 3px rgba(15,23,42,.12); }
+.tab:disabled{ opacity:.4; cursor:not-allowed; }
+#loadHint{ color:var(--muted); font-size:11px; }
+.pin, .pout{ pointer-events:stroke; }
+.pin circle{ fill:#3b82f6; stroke:#fff; stroke-width:1; }
+.pout circle{ fill:#f97316; stroke:#fff; stroke-width:1; }
+.pin text, .pout text{ font-size:8.5px; fill:#475569; text-anchor:start; user-select:none; }
+.pout text{ text-anchor:end; }
+.pin.dim, .pout.dim{ opacity:.15; }
 </style>
 </head>
 <body>
 
 <header>
   <h1>数据流图可视化<small>Dataflow Graph Viewer</small></h1>
-  <button class="btn primary" id="btnOpen">打开 JSON…</button>
-  <input type="file" id="fileInput" accept=".json,application/json" multiple hidden />
+  <button class="btn primary" id="btnLoadMeta">载入 meta(可多)</button>
+  <button class="btn" id="btnLoadPipeline">载入 pipeline</button>
+  <button class="btn" id="btnLoadDag">载入 dag</button>
+  <input type="file" id="metaInput" accept=".json,application/json" multiple hidden />
+  <input type="file" id="pipelineInput" accept=".json,application/json" hidden />
+  <input type="file" id="dagInput" accept=".json,application/json" hidden />
   <button class="btn" id="btnPaste">粘贴 JSON</button>
-  <select id="fileSelect"></select>
+  <span class="tabs">
+    <button class="tab active" id="tabDesign">设计图</button>
+    <button class="tab" id="tabRun">运行图</button>
+  </span>
+  <span id="loadHint">可用上面按钮分别载入;也可直接拖入按内容自动识别</span>
   <label class="toggle"><input type="checkbox" id="toggleSignal" checked /> 连线信号名</label>
   <label class="toggle"><input type="checkbox" id="toggleHist" checked /> hist 依赖</label>
   <label class="toggle">布线
@@ -209,6 +230,7 @@ function buildGraph(config){
     rawNodes = config.vertices.map(v => ({
       id: v.id, name: v.name, kind: v.kind, period: v.period, wcet: v.wcet,
       deadline: v.deadline, ddl: v.ddl, has_job: v.has_job, k: v.k,
+      inputs: v.inputs, outputs: v.outputs, loop: v.loop,
       hyper_period_ms: config.hyper_period_ms, hyper_start_ms: config.hyper_start_ms,
     }));
     rawEdges = config.edges.map(e => ({
@@ -232,6 +254,29 @@ function buildGraph(config){
       });
     });
   }
+
+  // dag 运行图顶点补端口：若同时载入 pipeline，按节点 id 前缀(去 :k)匹配——不必让 agent 导出端口
+  if (!Array.isArray(config) && S.pipeline){
+    const pl = Array.isArray(S.pipeline) ? S.pipeline : (S.pipeline.nodes || []);
+    const pm = {}; pl.forEach(p => { pm[p.id] = p; });
+    rawNodes.forEach(n => {
+      if (Array.isArray(n.inputs) && Array.isArray(n.outputs)) return;
+      const i = n.id.lastIndexOf(':');
+      if (i <= 0) return;
+      const p = pm[n.id.slice(0, i)];
+      if (p){ n.inputs = p.inputs || []; n.outputs = p.outputs || []; n.loop = p.loop || {}; }
+    });
+  }
+
+  // 设计图(pipeline)节点：为数据端口算锚点（输入排除 loop 自反馈；过多退化中心式）
+  rawNodes.forEach(n => {
+    if (!Array.isArray(n.inputs) && !Array.isArray(n.outputs)) return;   // dag 顶点无端口表
+    const loopKeys = new Set(Object.keys(n.loop || {}));
+    n.inList  = (n.inputs || []).filter(p => !loopKeys.has(p));
+    n.outList = n.outputs || [];
+    n.anchorOk = n.inList.length <= MAX_PORTS && n.outList.length <= MAX_PORTS;
+    n.metaObj = S.meta[n.name] || null;
+  });
 
   // 平行边分道：同源同目标的边分配偏移索引
   const group = {}, idx = {};
@@ -413,11 +458,35 @@ function catmullRom2Bezier(pts){
   return d;
 }
 
+// ---------- 设计图端口锚点辅助 ----------
+function portIndexOf(list, name){ const i = list.indexOf(name); return i >= 0 ? i : null; }
+function portYAt(n, cnt, idx){
+  if (cnt <= 1) return n.y + NODE_H/2;
+  return n.y + 14 + idx * ((NODE_H - 28) / (cnt - 1));
+}
+// 数据边若两端节点都启用锚点且 tag 名命中各自端口表 → 返回端口级端点
+function anchoredEndpoints(g, e){
+  if (e.self || e.external) return null;
+  const f = g.byId[e.from], t = g.byId[e.to];
+  if (!f || !t || !f.anchorOk || !t.anchorOk) return null;
+  const oi = portIndexOf(f.outList || [], e.signal);
+  const ii = portIndexOf(t.inList  || [], e.signal);
+  if (oi == null || ii == null) return null;
+  return { ox: f.x + NODE_W, ys: portYAt(f, f.outList.length, oi),
+           ix: t.x,          yt: portYAt(t, t.inList.length, ii) };
+}
+
 // ---------- 单条边几何（自环/外部/三类布线统一入口） ----------
 function edgeGeometry(g, e, mode){
   const to = g.byId[e.to];
   let d, lx=0, ly=0;
-  if (e.self){
+  const ap = anchoredEndpoints(g, e);
+  if (ap){                                     // 端口锚点：水平切线贝塞尔连对应 in/out
+    const x1 = ap.ox, y1 = ap.ys, x2 = ap.ix, y2 = ap.yt;
+    const dx = Math.max(24, Math.abs(x2 - x1) * 0.35);
+    d  = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+    lx = (x1 + x2) / 2; ly = (y1 + y2) / 2 - 6;
+  } else if (e.self){
     const x = to.x + NODE_W, y = to.y + NODE_H/2;
     d  = `M ${x} ${y} C ${x+90} ${y-78}, ${x+90} ${y+78}, ${x} ${y}`;
     lx = x + 64; ly = y;
@@ -467,13 +536,17 @@ function hedgePath(g, he){
   return { d: `M ${xS} ${yF} L ${xT} ${yT}`, lx: labelMid, ly: (yF+yT)/2 - 8 };
 }
 
+const MAX_PORTS = 8;          // 单侧可见端口锚点上限（超过退化为中心式）
 const S = {
   graph: null,
   view: { x:0, y:0, w:800, h:600 },
   showSignalNames: true,
   showHist: true,
   edgeMode: 'smooth',
-  files: {}, current: null,
+  meta: {},          // 算法名 → {desc, params:[{name,role,type,desc}]}（可多文件合并）
+  pipeline: null,    // 设计 cfg（数组 或 {nodes:[]}）
+  dag: null,         // 运行图 {vertices,edges,hist_edges}
+  viewMode: 'design',// 'design' | 'run'
 };
 
 // ---------- 拖拽 / 坐标工具（修复：不再用 transform，直接改坐标） ----------
@@ -539,8 +612,19 @@ function applyNodePosition(n, grp){
     else if (cls === 'nname'){ t.setAttribute('x', nx+NODE_W/2); t.setAttribute('y', ny+NODE_H/2+14); }
     else if (cls === 'nmeta'){ t.setAttribute('x', nx+NODE_W/2); t.setAttribute('y', ny+NODE_H/2+28); }
   });
+  // 端口锚点随动（in 在左缘 / out 在右缘，仅 y 随节点、cx 随节点移动）
+  grp.querySelectorAll('.pin,.pout').forEach(el => {
+    const side = el.getAttribute('data-side');
+    const i = +el.getAttribute('data-i');
+    const list = side === 'in' ? (n.inList || []) : (n.outList || []);
+    const py = portYAt(n, list.length, i);
+    const c = el.querySelector('circle');
+    if (c){ c.setAttribute('cx', side === 'in' ? nx : nx + NODE_W); c.setAttribute('cy', py); }
+    const t = el.querySelector('text');
+    if (t){ t.setAttribute('x', side === 'in' ? nx - 4 : nx + NODE_W + 4); t.setAttribute('y', py + 3); }
+  });
   if (n.loop){
-    const c = grp.querySelector('circle');
+    const c = grp.querySelector('.badge-circle');
     if (c){ c.setAttribute('cx', nx+NODE_W-12); c.setAttribute('cy', ny+15); }
     const b = grp.querySelector('text.badge');
     if (b){ b.setAttribute('x', nx+NODE_W-12); b.setAttribute('y', ny+18); }
@@ -548,8 +632,13 @@ function applyNodePosition(n, grp){
 }
 
 function drawGraph(){
-  const g = S.graph; if (!g) return;
-  const vp = $('#viewport'); vp.innerHTML = '';
+  const vp = $('#viewport');
+  const g = S.graph;
+  if (!g){ vp.innerHTML = '';
+    $('#stNodes').textContent = 0; $('#stEdges').textContent = 0;
+    $('#stSignals').textContent = 0; $('#stHist').textContent = 0; $('#stDepth').textContent = 0;
+    return; }
+  vp.innerHTML = '';
   const bbox = layout(g);
 
   const many = g.edges.length > 60;
@@ -652,11 +741,42 @@ function drawGraph(){
     }
     if (n.loop){
       const c = document.createElementNS(NS,'circle');
+      c.setAttribute('class','badge-circle');
       c.setAttribute('cx',n.x+NODE_W-12); c.setAttribute('cy',n.y+15); c.setAttribute('r',10);
       c.setAttribute('fill','#f59e0b'); w.appendChild(c);
       const t4 = document.createElementNS(NS,'text');
       t4.setAttribute('class','badge'); t4.setAttribute('x',n.x+NODE_W-12); t4.setAttribute('y',n.y+18);
       t4.textContent = '↻'; w.appendChild(t4);
+    }
+
+    // 设计图端口锚点（数据 in/out 独立小圆点 + 名称；meta 提供说明 tooltip）
+    if (n.anchorOk){
+      (n.inList || []).forEach((name, ii) => {
+        const py = portYAt(n, n.inList.length, ii);
+        const pg = document.createElementNS(NS,'g'); pg.setAttribute('class','pin');
+        pg.setAttribute('data-side','in'); pg.setAttribute('data-i', ii);
+        const c = document.createElementNS(NS,'circle'); c.setAttribute('cx', n.x); c.setAttribute('cy', py); c.setAttribute('r', 3.5);
+        pg.appendChild(c);
+        const tt = document.createElementNS(NS,'text'); tt.setAttribute('x', n.x - 4); tt.setAttribute('y', py + 3);
+        tt.textContent = name; pg.appendChild(tt);
+        const m = n.metaObj && n.metaObj.params ? n.metaObj.params.filter(p => p.role === 'in')[ii] : null;
+        pg.addEventListener('mouseenter', ev => showTip(ev, 'IN ' + name + (m ? ' · ' + m.name + (m.desc ? ' · ' + m.desc : '') : '')));
+        pg.addEventListener('mouseleave', resetHighlight);
+        w.appendChild(pg);
+      });
+      (n.outList || []).forEach((name, oo) => {
+        const py = portYAt(n, n.outList.length, oo);
+        const pg = document.createElementNS(NS,'g'); pg.setAttribute('class','pout');
+        pg.setAttribute('data-side','out'); pg.setAttribute('data-i', oo);
+        const c = document.createElementNS(NS,'circle'); c.setAttribute('cx', n.x + NODE_W); c.setAttribute('cy', py); c.setAttribute('r', 3.5);
+        pg.appendChild(c);
+        const tt = document.createElementNS(NS,'text'); tt.setAttribute('x', n.x + NODE_W + 4); tt.setAttribute('y', py + 3);
+        tt.textContent = name; pg.appendChild(tt);
+        const m = n.metaObj && n.metaObj.params ? n.metaObj.params.filter(p => p.role === 'out')[oo] : null;
+        pg.addEventListener('mouseenter', ev => showTip(ev, 'OUT ' + name + (m ? ' · ' + m.name + (m.desc ? ' · ' + m.desc : '') : '')));
+        pg.addEventListener('mouseleave', resetHighlight);
+        w.appendChild(pg);
+      });
     }
 
     w.addEventListener('mouseenter', ev => {
@@ -749,34 +869,59 @@ function openDetail(n){
   d.classList.add('open');
 }
 
-// ---------- 文件管理 ----------
-function addFile(name, data){
-  S.files[name] = data;
-  const sel = $('#fileSelect');
-  const opt = document.createElement('option'); opt.value=name; opt.textContent=name;
-  sel.appendChild(opt); sel.value=name;
-  render(name);
+// ---------- 会话式文件：按形状分类装载（meta ×N / pipeline / dag） ----------
+function classifyShape(cfg){
+  if (!cfg || typeof cfg !== 'object') return null;
+  if (Array.isArray(cfg)) return 'pipeline';
+  if (Array.isArray(cfg.vertices) && Array.isArray(cfg.edges)) return 'dag';
+  if (Array.isArray(cfg.nodes)) return 'pipeline';
+  if (cfg.name && Array.isArray(cfg.inputs)) return 'pipeline';
+  const keys = Object.keys(cfg);
+  if (keys.length && keys.every(k => cfg[k] && typeof cfg[k] === 'object' && Array.isArray(cfg[k].params)))
+    return 'meta';
+  return 'pipeline';
 }
-function render(name){
-  if (!S.files[name]) return;
-  S.current = name;
-  S.graph = buildGraph(S.files[name]);
+function addTyped(kind, data){
+  if (kind === 'meta')      { Object.assign(S.meta, data); }
+  else if (kind === 'dag')  { S.dag = data; }
+  else if (kind === 'pipeline'){ S.pipeline = data; }
+  renderAll();
+}
+function addFile(name, data){ addTyped(classifyShape(data), data); }
+function setTabs(){
+  $('#tabDesign').disabled = !S.pipeline;
+  $('#tabRun').disabled    = !S.dag;
+  if (S.viewMode === 'design' && !S.pipeline && S.dag) S.viewMode = 'run';
+  if (S.viewMode === 'run' && !S.dag && S.pipeline)    S.viewMode = 'design';
+  $('#tabDesign').classList.toggle('active', S.viewMode === 'design');
+  $('#tabRun').classList.toggle('active', S.viewMode === 'run');
+}
+function renderAll(){
+  setTabs();
+  const data = S.viewMode === 'run' ? S.dag : S.pipeline;
+  S.graph = data ? buildGraph(data) : null;
   drawGraph();
 }
+let pasteSeq = 0;
 
 // ---------- 初始化 ----------
 window.addEventListener('DOMContentLoaded', () => {
   const svg = $('#svg');
 
-  $('#btnOpen').addEventListener('click', () => $('#fileInput').click());
-  $('#fileInput').addEventListener('change', e => {
-    [...e.target.files].forEach(f => {
-      const r = new FileReader();
-      r.onload = () => { try{ addFile(f.name, JSON.parse(r.result)); }catch(err){ alert(`解析 "${f.name}" 失败：${err.message}`); } };
-      r.readAsText(f);
+  const bindLoad = (btn, inputId, kind) => {
+    $(btn).addEventListener('click', () => $(inputId).click());
+    $(inputId).addEventListener('change', e => {
+      [...e.target.files].forEach(f => {
+        const r = new FileReader();
+        r.onload = () => { try{ addTyped(kind, JSON.parse(r.result)); }catch(err){ alert('解析 "'+f.name+'" 失败：'+err.message); } };
+        r.readAsText(f);
+      });
+      e.target.value = '';
     });
-    e.target.value='';
-  });
+  };
+  bindLoad('#btnLoadMeta',     '#metaInput',     'meta');
+  bindLoad('#btnLoadPipeline', '#pipelineInput', 'pipeline');
+  bindLoad('#btnLoadDag',      '#dagInput',      'dag');
 
   window.addEventListener('dragover', e => e.preventDefault());
   window.addEventListener('drop', e => {
@@ -789,7 +934,8 @@ window.addEventListener('DOMContentLoaded', () => {
     });
   });
 
-  $('#fileSelect').addEventListener('change', e => render(e.target.value));
+  $('#tabDesign').addEventListener('click', () => { if (S.pipeline){ S.viewMode = 'design'; renderAll(); } });
+  $('#tabRun').addEventListener('click', () => { if (S.dag){ S.viewMode = 'run'; renderAll(); } });
   $('#toggleSignal').addEventListener('change', e => { S.showSignalNames = e.target.checked; drawGraph(); });
   $('#toggleHist').addEventListener('change', e => { S.showHist = e.target.checked; drawGraph(); });
   $('#edgeMode').addEventListener('change', e => { S.edgeMode = e.target.value; drawGraph(); });
@@ -802,7 +948,7 @@ window.addEventListener('DOMContentLoaded', () => {
   $('#pasteOk').addEventListener('click', () => {
     try{
       const data = JSON.parse($('#pasteText').value);
-      addFile('粘贴配置 #' + (Object.keys(S.files).length+1), data);
+      addFile('粘贴配置 #' + (++pasteSeq), data);
       $('#pasteText').value=''; $('#pasteModal').classList.remove('open');
     }catch(err){ alert('JSON 解析失败：'+err.message); }
   });
