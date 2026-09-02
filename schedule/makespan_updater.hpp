@@ -8,19 +8,30 @@
  *      j=0 项即 Graham's bound，j≥1 更紧；路径表用贪心取最长路径（合法安全上界）。
  *   均只统计 job 顶点（跳过 "tp:" 时间点——其 wcet 是释放间隔，不是执行负载）。
  *
- * 对外接口：
- *   graham_makespan(dag, m) — Graham's bound（ms）
- *   mpb_makespan(dag, m)    — Multi-Path Bound（ms，支配 Graham；装配点默认用它）
+ * 结构缓存（核心优化）：
+ *   len(G)/vol(G)/路径表都是顶点权(wcet)的函数，而 wcet 每轮自整定(FINS_CAL_WCET)会变 →
+ *   **加权量必须每轮现算**；但拓扑序/前驱表/权重源指针是**纯结构量**，跨 rollover 不变 →
+ *   只在结构版本号 version 变化时重建一次，之后每轮只跑数组版 DP（无字符串、无并发 find、
+ *   无按值分配）。version = g_state.hpp 的 PrecedenceGraph::graph_version（expand_hp 重建后 ++）。
  *
- * 依赖：include/g_state.hpp（Workload/Message）、include/utils/form.hpp（DAG）。
+ * 状态模式（同 priority/wcet）：
+ *   MakespanMethod 枚举 + make_makespan_updater(method, version_of, workers_of) →
+ *   与槽签名一致的 std::function，装配点一行选方法。m 参数经 workers_of 现读
+ *   g_state 预留的 makespan_workers。
+ *
+ * 底层函数（自包含，无复杂数据结构暴露）：
+ *   graham_makespan(dag, version, m) — Graham's bound（ms）
+ *   mpb_makespan(dag, version, m)    — Multi-Path Bound（ms，支配 Graham；装配点默认用它）
+ *
+ * 依赖：include/g_state.hpp（Workload/Message/PrecedenceGraph）、include/utils/form.hpp（DAG）。
  ******************************************************************************/
 #pragma once
 
 #include <algorithm>
-#include <map>
+#include <cstdint>
 #include <queue>
-#include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../include/utils/form.hpp"
@@ -28,126 +39,157 @@
 
 namespace fins::sched {
 
-  /** @brief Graham's bound（1979）：R ≤ len(G) + (vol(G) − len(G)) / m。
-   *  @param dag 当前 precedence graph（job 实例级 DAG）
-   *  @param m   worker 数（并行核数）
-   *  @retval double makespan 上界（ms；无 job 顶点返回 0）
-   */
-  inline double graham_makespan(fins::util::DirectedAcyclicGraph<fins::rt::Workload, fins::rt::Message> &dag, int m) {
-    const auto is_job = [](const std::string &id) { return id.rfind("tp:", 0) != 0; };
+namespace detail {
+  using Dag = fins::util::DirectedAcyclicGraph<fins::rt::Workload, fins::rt::Message>;   // detail 别名，防与 priority 的 fins::sched::Dag 撞名
 
-    // job 顶点集 + 拓扑序（Kahn，仅 job 顶点间边）
-    std::vector<std::string> ids;
-    dag.for_each_vertex([&](const std::string &id, const fins::rt::Workload &) {
-      if (is_job(id)) ids.push_back(id);
-    });
-    if (ids.empty()) return 0.0;
+  /** @brief makespan 结构缓存：只缓存**纯结构量**（与权重无关，跨 rollover 不变）。
+   *         权重(wcet)每轮经 wsrc 指针现读——wcet 自整定在顶点对象原位改，指针恒有效。 */
+  struct MakespanStructure {
+    uint64_t ver{0};                                  // 命中版本号（结构缓存的失效信号）
+    std::unordered_map<std::string, uint32_t> idx;    // job 顶点 id → 稠密下标
+    std::vector<uint32_t> order;                      // 拓扑序（稠密下标）
+    std::vector<std::vector<uint32_t>> preds;         // 每个顶点的 job 前驱（稠密下标）
+    std::vector<const fins::rt::Workload *> wsrc;     // 稠密下标 → 顶点载荷指针（现读 wcet，零哈希）
 
-    std::map<std::string, size_t> indeg;
-    std::map<std::string, std::vector<std::string>> succ;
-    for (const auto &id : ids) {
-      for (const auto &p : dag.in_nodes(id)) if (is_job(p)) ++indeg[id];
-      for (const auto &o : dag.out_nodes(id)) if (is_job(o)) succ[id].push_back(o);
-    }
-    std::vector<std::string> order;
-    {
-      std::map<std::string, size_t> deg = indeg;
-      std::queue<std::string> q;
-      for (const auto &id : ids) if (deg[id] == 0) q.push(id);
+    bool empty() const { return order.empty(); }
+
+    /** @brief 从 dag 重建结构（仅结构量；权重源存指针、每轮现读）。 */
+    void rebuild(fins::util::DirectedAcyclicGraph<fins::rt::Workload, fins::rt::Message> &dag) {
+      idx.clear(); order.clear(); preds.clear(); wsrc.clear();
+      const auto is_job = [](const std::string &id) { return id.rfind("tp:", 0) != 0; };
+
+      std::vector<std::string> ids;
+      dag.for_each_vertex([&](const std::string &id, const fins::rt::Workload &) {
+        if (is_job(id)) ids.push_back(id);
+      });
+      const size_t n = ids.size();
+      if (n == 0) return;
+
+      idx.reserve(n); order.reserve(n); preds.resize(n); wsrc.resize(n);
+      for (size_t i = 0; i < n; ++i) idx.emplace(ids[i], (uint32_t)i);
+
+      std::vector<std::vector<uint32_t>> succ(n);   // 后继（仅 Kahn 用，用完即弃）
+      std::vector<uint32_t> indeg(n, 0);
+      for (size_t i = 0; i < n; ++i) {
+        const std::string &id = ids[i];
+        const uint32_t u = (uint32_t)i;
+        wsrc[u] = &dag.vertex(id);
+        for (const auto &p : dag.in_nodes(id)) {          // 前驱（仅 job 顶点间边）
+          if (!is_job(p)) continue;
+          const uint32_t v = idx.at(p);
+          preds[u].push_back(v); ++indeg[u];
+        }
+        for (const auto &o : dag.out_nodes(id)) {         // 后继
+          if (!is_job(o)) continue;
+          succ[u].push_back(idx.at(o));
+        }
+      }
+
+      std::queue<uint32_t> q;                             // Kahn 拓扑序（纯结构，可缓存）
+      for (uint32_t u = 0; u < n; ++u) if (indeg[u] == 0) q.push(u);
       while (!q.empty()) {
-        const std::string u = q.front(); q.pop();
+        const uint32_t u = q.front(); q.pop();
         order.push_back(u);
-        for (const auto &v : succ[u]) if (--deg[v] == 0) q.push(v);
+        for (const uint32_t v : succ[u]) if (--indeg[v] == 0) q.push(v);
       }
     }
+  };
 
-    // len(G) 关键路径 + vol(G)（拓扑序 DP）
-    double lenG = 0.0, vol = 0.0;
-    std::map<std::string, double> cp;
-    for (const auto &id : order) {
+  inline const MakespanStructure &ensure_structure(
+      fins::util::DirectedAcyclicGraph<fins::rt::Workload, fins::rt::Message> &dag, uint64_t version) {
+    static MakespanStructure s;   // 单例：全局唯一 graph_g，main 线程持 mtx 调用
+    if (s.ver != version) { s.rebuild(dag); s.ver = version; }
+    return s;
+  }
+
+  /** @brief 现读权重（wcet 字段单位 ms，直接用）。 */
+  inline std::vector<double> read_weights(const MakespanStructure &s) {
+    std::vector<double> w(s.order.size());
+    for (size_t i = 0; i < s.order.size(); ++i) w[i] = s.wsrc[i]->wcet;
+    return w;
+  }
+
+  /** @brief 数组版 len(G)/vol(G)：沿缓存拓扑序 + 前驱表，纯数组读写（无字符串/并发 find）。 */
+  inline void len_vol(const MakespanStructure &s, const std::vector<double> &w, double &lenG, double &vol) {
+    const size_t n = s.order.size();
+    std::vector<double> cp(n, 0.0);
+    lenG = 0.0; vol = 0.0;
+    for (const uint32_t u : s.order) {
       double best = 0.0;
-      for (const auto &p : dag.in_nodes(id)) if (is_job(p)) best = std::max(best, cp[p]);
-      cp[id] = best + dag.vertex(id).wcet;
-      vol += dag.vertex(id).wcet;
-      lenG = std::max(lenG, cp[id]);
+      for (const uint32_t p : s.preds[u]) best = std::max(best, cp[p]);
+      cp[u] = best + w[u];
+      vol += w[u];
+      lenG = std::max(lenG, cp[u]);
     }
+  }
 
+} // namespace detail
+
+  /** @brief Graham's bound（1979）：R ≤ len(G) + (vol(G) − len(G)) / m。
+   *  @param dag     当前 precedence graph（job 实例级 DAG）
+   *  @param version 图结构版本号（PrecedenceGraph::graph_version；结构缓存的失效信号）
+   *  @param m       worker 数（并行核数）
+   *  @retval double makespan 上界（ms；无 job 顶点返回 0）
+   */
+  inline double graham_makespan(fins::util::DirectedAcyclicGraph<fins::rt::Workload, fins::rt::Message> &dag,
+                                uint64_t version, int m) {
+    const auto &s = detail::ensure_structure(dag, version);
+    if (s.empty()) return 0.0;
+    const auto w = detail::read_weights(s);
+    double lenG, vol;
+    detail::len_vol(s, w, lenG, vol);
     return lenG + (vol - lenG) / std::max(1, m);
   }
 
   /** @brief Multi-Path Bound makespan 上界（He et al. 2023）；j=0 项即 Graham's bound，j≥1 更紧。
-   *  @param dag 当前 precedence graph（job 实例级 DAG）
-   *  @param m   worker 数（并行核数）
+   *         结构缓存命中时每轮只跑数组版 DP + 贪心（无字符串/并发 find/按值分配）。
+   *  @param dag     当前 precedence graph（job 实例级 DAG）
+   *  @param version 图结构版本号（PrecedenceGraph::graph_version；结构缓存的失效信号）
+   *  @param m       worker 数（并行核数）
    *  @retval double makespan 上界（ms；无 job 顶点返回 0）
    */
-  inline double mpb_makespan(fins::util::DirectedAcyclicGraph<fins::rt::Workload, fins::rt::Message> &dag, int m) {
-    const auto is_job = [](const std::string &id) { return id.rfind("tp:", 0) != 0; };
+  inline double mpb_makespan(fins::util::DirectedAcyclicGraph<fins::rt::Workload, fins::rt::Message> &dag,
+                             uint64_t version, int m) {
+    const auto &s = detail::ensure_structure(dag, version);
+    if (s.empty()) return 0.0;
+    const auto w = detail::read_weights(s);
+    double lenG, vol;
+    detail::len_vol(s, w, lenG, vol);
 
-    // job 顶点集 + 拓扑序（Kahn，仅 job 顶点间边）
-    std::vector<std::string> ids;
-    dag.for_each_vertex([&](const std::string &id, const fins::rt::Workload &) {
-      if (is_job(id)) ids.push_back(id);
-    });
-    const size_t n = ids.size();
-    if (n == 0) return 0.0;
-
-    std::map<std::string, size_t> indeg;
-    std::map<std::string, std::vector<std::string>> succ;
-    for (const auto &id : ids) {
-      for (const auto &p : dag.in_nodes(id)) if (is_job(p)) ++indeg[id];
-      for (const auto &o : dag.out_nodes(id)) if (is_job(o)) succ[id].push_back(o);
-    }
-    std::vector<std::string> order;
-    {
-      std::map<std::string, size_t> deg = indeg;
-      std::queue<std::string> q;
-      for (const auto &id : ids) if (deg[id] == 0) q.push(id);
-      while (!q.empty()) {
-        const std::string u = q.front(); q.pop();
-        order.push_back(u);
-        for (const auto &v : succ[u]) if (--deg[v] == 0) q.push(v);
-      }
-    }
-
-    // len(G) 关键路径 + vol(G)（拓扑序 DP）
-    double lenG = 0.0, vol = 0.0;
-    std::map<std::string, double> cp;
-    for (const auto &id : order) {
-      double best = 0.0;
-      for (const auto &p : dag.in_nodes(id)) if (is_job(p)) best = std::max(best, cp[p]);
-      cp[id] = best + dag.vertex(id).wcet;
-      vol += dag.vertex(id).wcet;
-      lenG = std::max(lenG, cp[id]);
-    }
-
-    // 贪心取互不相交最长路径（generalized path list；首条 = 关键路径）
+    const size_t n = s.order.size();
     std::vector<double> path_len;
-    std::set<std::string> removed;
+    std::vector<uint8_t> removed(n, 0);
+    size_t removed_cnt = 0;
     const int max_paths = std::max(1, std::min(m, (int)n));
-    for (int k = 0; k < max_paths && removed.size() < n; ++k) {
-      std::map<std::string, double> cp2;
-      std::map<std::string, std::string> parent;
+
+    // 贪心取互不相交最长路径（首条 = 关键路径）；数组版，每轮复用 cp2/parent 缓冲
+    std::vector<double> cp2(n, 0.0);
+    std::vector<int32_t> parent(n, -1);
+    for (int k = 0; k < max_paths && removed_cnt < n; ++k) {
       double best = 0.0;
-      std::string best_end;
-      for (const auto &id : order) {
-        if (removed.count(id)) continue;
+      int32_t best_end = -1;
+      for (const uint32_t u : s.order) {
+        if (removed[u]) { cp2[u] = 0.0; continue; }   // 已移除：清旧值防下轮误用（其后续顶点不再引用）
         double bestp = 0.0;
-        std::string bp;
-        for (const auto &p : dag.in_nodes(id)) {
-          if (!is_job(p) || removed.count(p)) continue;
-          if (cp2[p] > bestp) { bestp = cp2[p]; bp = p; }
+        int32_t bp = -1;
+        for (const uint32_t p : s.preds[u]) {
+          if (removed[p]) continue;
+          if (cp2[p] > bestp) { bestp = cp2[p]; bp = (int32_t)p; }
         }
-        cp2[id] = bestp + dag.vertex(id).wcet;
-        parent[id] = bp;
-        if (cp2[id] > best) { best = cp2[id]; best_end = id; }
+        cp2[u] = bestp + w[u];
+        parent[u] = bp;
+        if (cp2[u] > best) { best = cp2[u]; best_end = (int32_t)u; }
       }
       if (best <= 0.0) break;
       path_len.push_back(best);
-      for (std::string cur = best_end; !cur.empty(); cur = parent[cur]) removed.insert(cur);
+      for (int32_t cur = best_end; cur != -1; cur = parent[cur]) {
+        if (removed[(size_t)cur]) break;   // 保险：路径顶点应均未移除（无环）
+        removed[(size_t)cur] = 1; ++removed_cnt;
+      }
     }
 
     // 公式 (9)：min_j [ lenG + (vol − Σ_{i≤j} lenλ_i) / (m − j) ]
-    double bound = lenG + vol / std::max(1, m);   // 兜底
+    double bound = lenG + vol / std::max(1, m);   // 兜底（无路径 = 宽松 Graham 项）
     double covered = 0.0;
     for (size_t j = 0; j < path_len.size(); ++j) {
       covered += path_len[j];
@@ -156,6 +198,28 @@ namespace fins::sched {
       bound = std::min(bound, lenG + (vol - covered) / denom);
     }
     return bound;
+  }
+
+  /** @brief makespan 估计方法（装配点一行选）。 */
+  enum class MakespanMethod { GRAHAM, MPB };
+
+  /** @brief 方法 → 装配函数槽（与 makespan_updater 槽签名 std::function<double(DAG&)> 一致）。
+   *  @param method    估计方法
+   *  @param version_of 结构版本号提供者（结构缓存失效信号）。client 传 [&]{ return graph_g.graph_version; }
+   *  @param workers_of makespan 参数 m（并行核数）提供者。client 传 [&]{ return (int)graph_g.makespan_workers; }
+   *  @retval std::function<double(detail::Dag&)> 槽函数（ms makespan 上界）
+   */
+  inline std::function<double(detail::Dag &)> make_makespan_updater(
+      MakespanMethod method,
+      const std::function<uint64_t()> &version_of,
+      const std::function<size_t()> &workers_of) {
+    switch (method) {
+      case MakespanMethod::GRAHAM:
+        return [version_of, workers_of](detail::Dag &d) { return graham_makespan(d, version_of(), workers_of()); };
+      case MakespanMethod::MPB:
+        return [version_of, workers_of](detail::Dag &d) { return mpb_makespan(d, version_of(), workers_of()); };
+    }
+    return [](detail::Dag &) { return 0.0; };   // 防御：未知方法 → 0（无 job 顶点语义）
   }
 
 } // namespace fins::sched
