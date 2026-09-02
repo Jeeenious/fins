@@ -34,7 +34,7 @@
 #include <string>
 #include <vector>
 
-#include "algo/algo_export.hpp"
+#include "xmacro.hpp"
 
 namespace {
 
