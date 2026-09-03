@@ -56,7 +56,7 @@ tool/               uload.ipynb(生成) · test.ipynb(采集) · plot.ipynb(分�
                     viewer.html(设计/运行图可视化) · agent.sh(独占核脚本)
 docs/               4 篇调度/DAG 语义设计
 third_party/        单头依赖 nlohmann/json.hpp · cpp-httplib.h
-bin/ lib/ temp/     构建产物(client/server · plugin.so · trace)gitignore 不入库
+bin/ lib/ tool/temp/     构建产物(client/server · plugin.so · tool/temp 导出的 trace)gitignore 不入库
 ```
 
 **数据流闭环**:
@@ -78,7 +78,7 @@ bin/ lib/ temp/     构建产物(client/server · plugin.so · trace)gitignore �
                                              rollover_hp / grab 决策点注入
                                           │
                                           ▼ 退出
-                           tracing → temp/tracing.csv(+temp/dag.json)
+                           tracing → tool/temp/tracing.csv(+tool/temp/dag.json)
                                           │
                 tool/plot.ipynb(画) · viewer.html(看 DAG/时间线) · 对比 u
 ```
@@ -174,8 +174,8 @@ sudo tool/agent.sh -g        # 一次性授 RT(写 limits.d,重登生效)
 sudo tool/agent.sh 1-6 6     # 独占核 1-6 + 6 worker 起 bin/client
 ```
 
-产物约定(均 gitignore):client 退出写 `temp/tracing.csv`(表头 `tid,seq,kind,t_us,cpu,tag`,
-目录自建)与结构重建时的 `temp/dag.json`;插件 .so 在 `lib/`。
+产物约定(均 gitignore):client(agent) 退出写 `tool/temp/tracing.csv`(表头 `tid,seq,kind,t_us,cpu,tag`,
+目录自建)与结构重建时的 `tool/temp/dag.json`;插件 .so 在 `lib/`。
 
 **实验工作流**(每个 notebook 自包含):
 
