@@ -10,7 +10,7 @@
 //   - .so：插件目录下每个 .so 装载为 1 个 Plugin（dlopen handle + C 工厂）
 //
 // 对外接口（装配示例）：
-//   agent_main [rpc_port=18080] [plugin_dir=./plugins] [num_workers=2]
+//   agent_main [rpc_port=18080] [plugin_dir=./lib] [num_workers=2]
 //   PluginLoader::on_library_add/modify/delete(handler) — 增量增/改/删回调（装配点 SET/ERASE）
 //   PluginLoader::init(plugin_dir) / start(num_threads) — 初始化目录 / 启动监听（存量装载 main 开头做）
 //   RPCListener::on_pipeline_update("/update", handler) — 建图路由（存 JSON + pending 置位）
@@ -24,8 +24,8 @@
 //                                     锁外执行 tp->job() 即 sleep_until 到点 → 回锁置 Finished + notify）
 // ============================================================================
 
-#define FINS_EXPORT_TRACING_PATH "./tmp/traing.csv"
-#define FINS_EXPORT_DGRAPH_PATH "./tmp/dag.json"
+#define FINS_EXPORT_TRACING_PATH "./temp/tracing.csv"
+#define FINS_EXPORT_DGRAPH_PATH "./temp/dag.json"
 
 #define FINS_STATIC_PRIORITY 0                                  // 1 = 静态优先级
 #define FINS_DYNAMIC_PRIORITY 0                                 // 1 = 动态优先级
@@ -36,6 +36,12 @@
 
 #define FINS_CAL_WCET 0                                         // 1 = rollover 用执行历史自整定 wcet
 #define FINS_WCET_METHOD fins::sched::WcetMethod::PQUANTILE     // 估计方法（HWM/PQUANTILE）
+
+#define FINS_ALGO_LIB_PATH "./lib"   // 插件目录（可通过命令行参数覆盖）
+#define FINS_CLIENT_IP "0.0.0.0"     // orchestrator 上报端口（可通过命令行参数覆盖）
+#define FINS_CLIENT_PORT 18080
+#define FINS_SERVER_IP "0.0.0.0"    // orchestrator 监听端口（可通过命令行参数覆盖）
+#define FINS_SERVER_PORT 18080
 
 #include <atomic>
 #include <chrono>
@@ -64,10 +70,15 @@ using namespace fins::rt;
 namespace fs = std::filesystem;
 
 int main(int argc, char **argv) {
-  const int rpc_port = argc > 1 ? std::atoi(argv[1]) : 18080;
-  const std::string plugin_dir = argc > 2 ? argv[2] : "./plugins";
+  const int rpc_port = argc > 1 ? std::atoi(argv[1]) : FINS_CLIENT_PORT;
+  const std::string plugin_dir = argc > 2 ? argv[2] : FINS_ALGO_LIB_PATH;
   int num_workers = argc > 3 ? std::atoi(argv[3]) : 2;   // 线程池 worker 数；非法/≤0 回落默认 2
   if (num_workers < 1) num_workers = 2;
+
+  // 导出目录先行自建：tracing.csv / dag.json 均写 ./temp（相对启动 cwd），缺目录 ofstream 静默失败
+#ifdef FINS_EXPORT_TRACING_PATH
+  fs::create_directories(fs::path(FINS_EXPORT_TRACING_PATH).parent_path());
+#endif
 
   // ── 装配 wcet_updater：FINS_WCET_METHOD 方法（PQUANTILE = 99% 分位 + 20% 裕度）。
   wcet_updater = fins::sched::make_wcet_updater(FINS_WCET_METHOD);
@@ -131,7 +142,7 @@ int main(int argc, char **argv) {
   RPCListener::instance().on_library_add("/plugin/add", plugin_dir, [](const std::string &) {});
   RPCListener::instance().on_library_modify("/plugin/modify", plugin_dir, [](const std::string &) {});
   RPCListener::instance().on_library_delete("/plugin/delete", plugin_dir, [](const std::string &) {});
-  RPCListener::instance().init("0.0.0.0", rpc_port, "0.0.0.0", rpc_port);
+  RPCListener::instance().init(FINS_CLIENT_IP, rpc_port, FINS_SERVER_IP, FINS_SERVER_PORT);
   RPCListener::instance().start(4);
 
   // ── 装配 HardwareMonitor：组件定时触发 on_sample，回调内显式调 observe() 写全局
