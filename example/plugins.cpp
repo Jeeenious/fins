@@ -10,11 +10,15 @@
  *
  * 形状族（每个 = 一个可导出的具体函数，供 pipeline cfg 的 [name:1.0.0] 定位）：
  *   基础    src(0→1) / sink(1→0) / relay(1→1)
- *   扇出    1→k        usr_fork(=2)、usr_fork3..9、usr_fork10(=10)
- *   扇入    k→1        usr_join(=2)、usr_join3..9、usr_join10(=10)
- *   反馈    1 feed + k loop（k=1..10）：usr_acc(=1)  ..  usr_acc10
+ *   扇出    1→k        usr_fork(=2)、usr_fork3..9、usr_fork10(=10)  —— 多速率 fork 类按 fan 选用
+ *   扇入    k→1        usr_join(=2)、usr_join3..9、usr_join10(=10)  —— 多速率 join 类按 fan 选用
+ *   反馈    1 feed + k loop（k=1..10）：usr_acc(=1)  ..  usr_acc10   —— feedback 类随机窗口 N
  *   工具    usr_burn(源,自旋) / usr_nop(零自旋汇)
  *   合计 33 个算法。
+ *
+ *   负载/拓扑入口见 tool/uload.ipynb（gen_class 五类：多速率 multihop / fork / join、
+ *   feedback、mixed；每图内部混合周期 timed 与事件 event 任务）。周期/事件(激活次数 n_j) 与
+ *   目标利用率 u 的分配都在生成侧完成——本族算法只作为“按 cfg 烧掉对应 µs”的端口形状载体。
  *
  * 对外接口（FINS_ALGO_EXPORT 由 X-macro 生成 5 个 C 工厂符号）：
  *   get_plugin_count / get_algo_name / get_algo_version(恒 "1.0.0") / create_algo /
@@ -163,12 +167,12 @@ void usr_acc10(int cfg, int in, const std::vector<int> &h1, const std::vector<in
 }
 
 // ── 工具 ──
-// burn：源(0→1)，cfg=忙等 µs（独立多速率叶子负载用；与 usr_src 等价但语义明确）
+// burn：源(0→1)，cfg=忙等 µs（多速率源的明确形态；与 usr_src 等价，需事件 sink 时用它更语义化）
 void usr_burn(int us, int &out) {
   ignore_all(out);
   if (us > 0) spin_cost_us(us);
 }
-// nop：零自旋汇(1→0)，只收帧不烧算力（burn/sink 的廉价终点，避免 sink 自带烧算失真）
+// nop：零自旋汇(1→0)，只收帧不烧算力（当某个 event/源链路只需收帧、不想 sink 再烧算力时）
 void usr_nop(int in) { ignore_all(in); }
 
 #undef USR_SPIN_BODY
