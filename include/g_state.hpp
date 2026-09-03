@@ -218,7 +218,7 @@ namespace fins::rt {
       version  = n["version"].get<std::string>();
       period   = n.contains("period")   ? n["period"].get<double>()   : 0.0;
       wcet     = n.contains("wcet")     ? n["wcet"].get<double>()     : 1.0;
-      deadline = n.contains("deadline") ? n["deadline"].get<double>() : wcet;  // 缺省 = wcet
+      deadline = n.contains("deadline") ? n["deadline"].get<double>() : period;  // 缺省 = period
       cap      = n.contains("cap")      ? n["cap"].get<size_t>() : 10;        // 缺省 10
       if (n.contains("inputs") && n["inputs"].is_array())
         input_ports = n["inputs"].get<std::vector<std::string>>();
