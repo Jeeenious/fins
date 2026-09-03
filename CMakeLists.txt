@@ -21,10 +21,10 @@ find_package(Threads REQUIRED)
 #   ${SDK_ROOT}                仓库根（RPC_listener.hpp 等内 third_party/... 引用）
 set(SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 # 输出目录（现代变量；LIBRARY_OUTPUT_PATH/EXECUTABLE_OUTPUT_PATH 是遗留变量）：
-#   client/server  → 仓库根 build/（run_client.sh / run_server.sh 默认查找仓库根 client / server）
-#   plugin.so      → 仓库根 plugins/（client 默认 plugin_dir=./plugins 从这加载）
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
-set(LIBRARY_OUTPUT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/plugins")
+#   client/server  → 仓库根 bin/（tool/run.sh 默认 bin/client；无 server 启动脚本，直接 bin/server）
+#   plugin.so      → 仓库根 lib/（loader 的 plugin_dir 指向该目录；client 缺省 ./plugins 由调用侧覆盖）
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin")
+set(LIBRARY_OUTPUT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/lib")
 
 include_directories(
     ${SDK_ROOT}/include

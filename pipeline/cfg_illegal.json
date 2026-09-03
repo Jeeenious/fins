@@ -1,5 +1,0 @@
-[
-  { "id": "a", "name": "usr_src", "version": "1.0.0", "period": 100, "outputs": ["S"], "parameters": [{"value": 7}] },
-  { "id": "b", "name": "usr_src", "version": "1.0.0", "period": 100, "outputs": ["S"], "parameters": [{"value": 7}] },
-  { "id": "c", "name": "usr_sink", "version": "1.0.0", "inputs": ["S"], "parameters": [{"value": 2}] }
-]

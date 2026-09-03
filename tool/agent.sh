@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 # ============================================================================
-# client.sh — 核心独占脚本：RT 授权 + cpuset v2 隔离分区 + 启动 client
+# agent.sh — 核心独占脚本(原 client.sh)：RT 授权 + cpuset v2 隔离分区 + 启动 bin/client
 #
 # 用法：
-#   sudo ./client.sh -g                          # 授 RT 优先级（一次性，写 limits.d）
-#   sudo ./client.sh <核范围>                     # 独占核 + 启动 client（worker=2 默认）
-#   sudo ./client.sh <核范围> <worker数>          # 同上，指定 worker 数
-#   sudo ./client.sh <核范围> <命令...>           # 独占核 + 启动任意命令（透传）
-#   sudo ./client.sh -a <核范围> <pid>            # 把已运行进程移入独占分区
-#   sudo ./client.sh -r                          # 删除独占分区、放回核心
+#   sudo tool/agent.sh -g                          # 授 RT 优先级（一次性，写 limits.d）
+#   sudo tool/agent.sh <核范围>                     # 独占核 + 启动 client（worker=2 默认）
+#   sudo tool/agent.sh <核范围> <worker数>          # 同上，指定 worker 数
+#   sudo tool/agent.sh <核范围> <命令...>           # 独占核 + 启动任意命令（透传）
+#   sudo tool/agent.sh -a <核范围> <pid>            # 把已运行进程移入独占分区
+#   sudo tool/agent.sh -r                          # 删除独占分区、放回核心
 #
 # client 模式选项：
 #   -p <port>      RPC 端口（默认 18080）
-#   -d <dir>       插件目录（默认 ./plugins）
-#   环境变量 CLIENT_BIN 可覆盖 client 二进制路径（默认仓库根 client）
+#   -d <dir>       插件目录（默认 $ROOT/lib，.so 现生成在 lib/）
+#   环境变量 CLIENT_BIN 可覆盖 client 二进制路径（默认仓库根 bin/client）
 #
 # 示例：
-#   sudo ./client.sh 1-4 4                # 独占核 1-4，4 worker 起 client
-#   ./server.sh pipeline/cfg_usr_fork100.json   # 另开终端发配置（无需 sudo）
-#   sudo ./client.sh 1-2 ./client 18080 ./plugins   # 任意命令透传
+#   sudo tool/agent.sh 1-4 4                # 独占核 1-4，4 worker 起 bin/client
+#   ./bin/server pipeline/cfg_usr_fork100.json   # 另开终端发配置（无 server.sh，直接用二进制）
+#   sudo tool/agent.sh 1-2 $ROOT/bin/client 18080 $ROOT/lib   # 任意命令透传
 #
 # 注意：
 #   - 核范围须覆盖 client worker 要绑的核（start(n) → 核 1..n）。
@@ -30,12 +30,13 @@ CGBASE=/sys/fs/cgroup
 CG=$CGBASE/fins_exclusive
 RT_CONF=/etc/security/limits.d/50-fins-rt.conf
 RT_PRIO=95
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLIENT_BIN="${CLIENT_BIN:-$SCRIPT_DIR/client}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # repo/tool
+ROOT="$(dirname "$SCRIPT_DIR")"           # 仓库根
+CLIENT_BIN="${CLIENT_BIN:-$ROOT/bin/client}"   # client 生成在 bin/
 
 # -g：写 limits.d 授 RT（需 root，幂等覆盖）
 grant_rt() {
-  [ "$(id -u)" -eq 0 ] || { echo "!! 需要 root：sudo $0 -g" >&2; exit 2; }
+  [ "$(id -u)" -eq 0 ] || { echo "!! 需要 root：sudo tool/agent.sh -g" >&2; exit 2; }
   local user="${SUDO_USER:-$USER}"
   [ -n "$user" ] && [ "$user" != "root" ] || {
     echo "!! 无法确定目标用户（请用 sudo 调用）" >&2; exit 2; }
@@ -95,7 +96,7 @@ run_in_partition() {
 # 默认模式：argv[2] 为纯数字 → worker 数，封装启动 client
 launch_client() {
   local cpus="$1"; shift
-  local workers=2 port=18080 pdir=./plugins
+  local workers=2 port=18080 pdir="${ROOT}/lib"
   if [ $# -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then workers="$1"; shift; fi
   while [ $# -gt 0 ]; do
     case "$1" in

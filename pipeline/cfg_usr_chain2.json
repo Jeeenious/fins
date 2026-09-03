@@ -1,8 +1,0 @@
-[
-  {"id": "cam", "name": "usr_src", "version": "1.0.0", "period": 100,
-   "outputs": ["feed"], "parameters": [{"value": 7}]},
-  {"id": "proc", "name": "usr_relay", "version": "1.0.0",
-   "inputs": ["feed"], "outputs": ["out"], "parameters": [{"value": 2}]},
-  {"id": "disp", "name": "usr_sink", "version": "1.0.0",
-   "inputs": ["out"], "parameters": [{"value": 2}]}
-]
