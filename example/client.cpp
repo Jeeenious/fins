@@ -24,8 +24,8 @@
 //                                     锁外执行 tp->job() 即 sleep_until 到点 → 回锁置 Finished + notify）
 // ============================================================================
 
-#define FINS_EXPORT_TRACING_PATH "./temp/tracing.csv"
-#define FINS_EXPORT_DGRAPH_PATH "./temp/dag.json"
+#define FINS_EXPORT_TRACING_PATH "./tool/temp/tracing.csv"   // 导出目录固定 tool/temp（相对启动 cwd=仓库根）
+#define FINS_EXPORT_DGRAPH_PATH "./tool/temp/dag.json"
 
 #define FINS_STATIC_PRIORITY 0                                  // 1 = 静态优先级
 #define FINS_DYNAMIC_PRIORITY 0                                 // 1 = 动态优先级
@@ -75,7 +75,7 @@ int main(int argc, char **argv) {
   int num_workers = argc > 3 ? std::atoi(argv[3]) : 2;   // 线程池 worker 数；非法/≤0 回落默认 2
   if (num_workers < 1) num_workers = 2;
 
-  // 导出目录先行自建：tracing.csv / dag.json 均写 ./temp（相对启动 cwd），缺目录 ofstream 静默失败
+  // 导出目录先行自建：tracing.csv / dag.json 均写 ./tool/temp（相对启动 cwd），缺目录 ofstream 静默失败
 #ifdef FINS_EXPORT_TRACING_PATH
   fs::create_directories(fs::path(FINS_EXPORT_TRACING_PATH).parent_path());
 #endif
