@@ -298,6 +298,14 @@ namespace fins::rt {
       for (size_t i = 0; i < nodes.size(); ++i)
         if (nodes[i].input_ports.empty() && nodes[i].period <= 0)
           throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) + "] 无输入节点必填 period");
+      // ④ 孤立输入拒绝：每个非 loop 输入端口须恰好有生产者（数据流边只来自节点输出；无生产者 →
+      //    该节点退化为“伪根”——无 tp、无继承周期、expand 后只跑一次且永不重放，还会让周期兄弟
+      //    因它永不完成而无法翻页）。loop 端口例外：producer 是节点自身（自反馈，③ 已查其 input/output 声明）。
+      for (size_t i = 0; i < nodes.size(); ++i)
+        for (const auto &pn : nodes[i].input_ports)
+          if (!nodes[i].loop.count(pn) && !producers.count(pn))
+            throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) +
+                                        "] 输入端口 '" + pn + "' 无生产者（孤立输入），非法配置");
       // ③ loop 自反馈合法性：loop 端口须同时在本节点 inputs 与 outputs 中声明——反馈历史来自本
       //    节点同名输出；缺 input → 闭包不喂它（pack_inputs 只遍历 input_ports），缺 output →
       //    route_outputs 永不为它记历史，两者都会静默失效。
@@ -1064,16 +1072,39 @@ namespace fins::rt {
 
     /**
      * @brief 超周期回绕（**无锁原语，前提调用方持 mtx**；主线程调度循环图静止时调用）：
-     *        起点更新为当前真实时钟 + 调度增量状态重置（done_/ready_ 清空、tp_released_ 游标归零、
-     *        pred_left_ 重置回 in_degree_ 基准，不 clear dag——顶点对象存活）。回绕后全部顶点未完成：
-     *        job 顶点由前序完成事件（trigger_workload_ready 传播）逐级释放，源节点由其 tp 门被计时线程
-     *        grab_delay_workload 重新拉取释放（tp job 实时读 hyper_start_ms → 平移自动对齐新起点）；
-     *        loop 数据槽跨周期保留不清；abs_deadline 由主线程事件驱动 update_abs_deadline 滚动
+     *        调度增量状态重置（done_/ready_ 清空、tp_released_ 游标归零、pred_left_ 重置回
+     *        in_degree_ 基准，不 clear dag——顶点对象存活）。回绕后全部顶点未完成：job 顶点由前序
+     *        完成事件逐级释放，源节点由其 tp 门被计时线程重新拉取释放。
+     *
+     *        ★ 释放节拍与翻页解耦（2026-09-04 拍板）：
+     *        回绕仍由“本超周期完工”（is_hp_done）触发（干完即翻页），但超周期起点**不再拨回完工
+     *        时刻**，而是推进到“绝对网格上的下一未来边界”（超周期起点按 H 整拍对齐 expand 起点）。
+     *        于是周期任务只在真实周期锚点（起点+offset）释放——早排空自然空等到下一边界，不提前放
+     *        下一拍；排空晚于边界（过载）时错过的整拍被跳过、对齐下一未来边界并告警（不累积漂移）。
+     *        非周期（事件）任务不受影响：绑定前序完成即就绪即跑。tp job 实时读 hyper_start_ms →
+     *        自动对齐新起点；loop 数据槽跨周期保留不清；abs_deadline 由 update_abs_deadline 滚动
      *        校正，非本函数职责。
      * @retval 无
      */
     void rollover_hp() {
-      hyper_start_ms = fins::util::now_ms();   // 起点更新为当前真实时钟
+      // 超周期起点推进到绝对网格上的下一未来边界（ceil(delta/H)·H；delta=距本拍起点已过 ms）。
+      // 早完工（delta<H）→ +H：下一边界在完工之后，tp 睡到边界才放 → 周期任务不提前释放；
+      // 过载（delta≥H）→ 跳过已错过的整拍、对齐 >now 的边界；k=1 正常，k≥2 告警跳过拍数。
+      const double hp_ = hyper_period_ms;
+      if (hp_ > 0.0) {
+        const double delta = fins::util::now_ms() - hyper_start_ms;
+        double k = 1.0;                                  // 至少推进一拍
+        if (delta > 0.0) {                               // ceil(delta/H)，保证下一拍 ≥ now 的最近边界
+          const double d = delta / hp_;
+          k = std::floor(d);
+          if (d > k) k += 1.0;
+        }
+        if (k >= 2.0)
+          FINS_LOG_WARN("[rollover_hp] 超周期过载：排空晚于边界，跳过 {} 个释放拍，下一边界对齐 {:.1f}ms", (long long)(k - 1.0), hyper_start_ms + k * hp_);
+        hyper_start_ms += k * hp_;
+      } else {
+        hyper_start_ms = fins::util::now_ms();           // 无显式周期（理论上不进回绕）保持旧行为
+      }
 
 #if FINS_CAL_WCET
       update_wcet_estimation();
