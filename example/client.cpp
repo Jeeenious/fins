@@ -182,9 +182,17 @@ int main(int argc, char **argv) {
 
         lk.lock();
 
+#ifdef FINS_EXPORT_TRACING_PATH
+        fins::util::trace_record(fins::util::TraceKind::TEMP_1, w->id);   // 结束（job 完成）
+#endif
+
         graph_g.trigger_workload_ready(w->id);   // 回锁直做完成事件：置 done + 传播 pred_left + 入 ready
 
-        graph_g.cv.notify_all();
+#ifdef FINS_EXPORT_TRACING_PATH
+        fins::util::trace_record(fins::util::TraceKind::TEMP_2, w->id);   // 结束（job 完成）
+#endif
+
+        graph_g.cv.notify_all();   // 有新增就绪才唤醒(叶子/无后继完成的完成不再空唤醒全池 → 减惊群与锁抖动)
 
 #ifdef FINS_EXPORT_TRACING_PATH
         fins::util::trace_record(fins::util::TraceKind::SLEEP, w->id);   // 结束（job 完成）
@@ -230,8 +238,8 @@ int main(int argc, char **argv) {
 #endif
 
         tl.lock();
-        graph_g.trigger_workload_ready(tp->id);   // 回锁直做完成事件：置 done + 传播 pred_left（释放后继 job 顶点）
-        graph_g.cv.notify_all();
+        const size_t tp_released = graph_g.trigger_workload_ready(tp->id);   // 回锁直做完成事件：置 done + 传播 pred_left（释放后继 job 顶点）
+        if (tp_released) graph_g.cv.notify_all();   // 有新增就绪才唤醒(空时间点不空唤醒)
 
 #ifdef FINS_EXPORT_TRACING_PATH
         fins::util::trace_record(fins::util::TraceKind::SLEEP, "timer");   // 结束（job 完成）

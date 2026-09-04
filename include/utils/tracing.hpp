@@ -45,6 +45,9 @@ namespace fins::util {
     COMPLETE  = 3,        // 结束（job 完成）
     FINISHED  = 4,        // 完成（job 完成，置 done + 传播 pred_left + 入 ready）
     SLEEP     = 5,        // 休眠（进 cv.wait）
+
+    TEMP_1 = 6,
+    TEMP_2 = 7,
   };
 
   inline const char *trace_kind_name(TraceKind k) {
@@ -55,6 +58,8 @@ namespace fins::util {
       case TraceKind::COMPLETE:  return "complete";
       case TraceKind::FINISHED:  return "finished";
       case TraceKind::SLEEP:     return "sleep";
+      case TraceKind::TEMP_1:    return "temp_1";
+      case TraceKind::TEMP_2:    return "temp_2";
     }
     return "?";
   }
