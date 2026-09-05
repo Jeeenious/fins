@@ -104,16 +104,27 @@ main{flex:1;display:flex;position:relative}
 <script>
 'use strict';
 const $=s=>document.querySelector(s),NS='http://www.w3.org/2000/svg';
-const NODE_W=180,NODE_H=64,COL_GAP=150,ROW_GAP=36,PAD=60;
+const NODE_W=200,NODE_H=64,COL_GAP=240,ROW_GAP=36,PAD=60;
 const TYPE_STYLE=[[/time/,{fill:'#fef9c3',stroke:'#facc15',text:'#854d0e'}],[/src/,{fill:'#d1fae5',stroke:'#34d399',text:'#065f46'}],[/relay/,{fill:'#dbeafe',stroke:'#60a5fa',text:'#1e40af'}],[/sink/,{fill:'#e2e8f0',stroke:'#94a3b8',text:'#334155'}],[/fork/,{fill:'#ede9fe',stroke:'#a78bfa',text:'#5b21b6'}],[/join/,{fill:'#ccfbf1',stroke:'#2dd4bf',text:'#115e59'}],[/acc/,{fill:'#ffedd5',stroke:'#fb923c',text:'#9a3412'}]];
 function nodeStyle(n){for(const[r,s]of TYPE_STYLE)if(r.test(n))return s;return{fill:'#f1f5f9',stroke:'#94a3b8',text:'#334155'}}
 const TYPECOL=[['#e0f2fe','#38bdf8','#0c4a6e'],['#dcfce7','#4ade80','#14532d'],['#fee2e2','#f87171','#7f1d1d'],['#ede9fe','#a78bfa','#4c1d95'],['#ffedd5','#fb923c','#7c2d12'],['#fce7f3','#f472b6','#831843'],['#cffafe','#22d3ee','#155e75'],['#fef9c3','#facc15','#713f12'],['#d1fae5','#34d399','#065f46'],['#e2e8f0','#94a3b8','#1e293b']];
 
 function buildGraph(config){
-  let rawNodes,rawEdges;
+  let rawNodes,rawEdges;const rawHistEdges=[];
   if(Array.isArray(config)){
     const prod={};config.forEach(n=>(n.outputs||[]).forEach(s=>prod[s]=n.id));rawNodes=config.map(n=>({...n}));rawEdges=[];
-    config.forEach(n=>(n.inputs||[]).forEach(sig=>{const from=prod[sig];rawEdges.push({from:from??null,to:n.id,signal:sig,message:null,self:from===n.id,external:from===undefined});}));
+    config.forEach(n=>{
+      const hist=n.hist||{};
+      (n.inputs||[]).forEach(sig=>{
+        const from=prod[sig];
+        if(Object.prototype.hasOwnProperty.call(hist,sig)){
+          // hist：窗口读该字段最近 win 帧 → 标为 hist 隐式依赖(反馈/历史边)，不进前序边
+          rawHistEdges.push({from:from??null,to:n.id,port:sig,mode:'win',win:hist[sig],self:from===n.id,external:from===undefined});
+          return;
+        }
+        rawEdges.push({from:from??null,to:n.id,signal:sig,message:null,self:from===n.id,external:from===undefined});
+      });
+    });
   }else if(config&&Array.isArray(config.vertices)&&Array.isArray(config.edges)){
     rawNodes=config.vertices.map(v=>({id:v.id,name:v.name,kind:v.kind,period:v.period,wcet:v.wcet,deadline:v.deadline,ddl:v.ddl,has_job:v.has_job,k:v.k,inputs:v.inputs,outputs:v.outputs,loop:v.loop,hyper_period_ms:config.hyper_period_ms,hyper_start_ms:config.hyper_start_ms}));
     rawEdges=config.edges.map(e=>({from:e.from,to:e.to,signal:e.tag,message:e.message,self:e.from===e.to,external:false}));
@@ -121,13 +132,12 @@ function buildGraph(config){
   const byId={};rawNodes.forEach(n=>byId[n.id]=n);
   rawEdges.forEach(e=>{if(!byId[e.from])e.external=true;});
   rawEdges.forEach(e=>{const f=byId[e.from],t=byId[e.to];if(f&&f.kind==='timepoint')e.timeLabel=f.id;else if(t&&t.kind==='timepoint')e.timeLabel=t.id;});
-  const rawHistEdges=[];
   if(config&&!Array.isArray(config)&&Array.isArray(config.hist_edges))config.hist_edges.forEach(h=>rawHistEdges.push({from:h.from,to:h.to,port:h.port,mode:h.mode,win:h.win,self:h.from===h.to,external:!byId[h.from]||!byId[h.to]}));
   if(!Array.isArray(config)&&S.pipeline){
     const pl=Array.isArray(S.pipeline)?S.pipeline:(S.pipeline.nodes||[]),pm={};pl.forEach(p=>pm[p.id]=p);
     rawNodes.forEach(n=>{if(Array.isArray(n.inputs)&&Array.isArray(n.outputs))return;const i=n.id.lastIndexOf(':');if(i<=0)return;const p=pm[n.id.slice(0,i)];if(p){n.inputs=p.inputs||[];n.outputs=p.outputs||[];n.task=p;}});
   }
-  rawNodes.forEach(n=>{if(!Array.isArray(n.inputs)&&!Array.isArray(n.outputs))return;const lk=new Set(Object.keys(n.loop||{}));n.inList=(n.inputs||[]).filter(p=>!lk.has(p));n.outList=n.outputs||[];n.anchorOk=n.inList.length<=MAX_PORTS&&n.outList.length<=MAX_PORTS;n.metaObj=S.meta[n.name]||null;});
+  rawNodes.forEach(n=>{if(!Array.isArray(n.inputs)&&!Array.isArray(n.outputs))return;const lk=new Set([...Object.keys(n.loop||{}),...Object.keys(n.hist||{})]);n.inList=(n.inputs||[]).filter(p=>!lk.has(p));n.outList=n.outputs||[];n.anchorOk=n.inList.length<=MAX_PORTS&&n.outList.length<=MAX_PORTS;n.metaObj=S.meta[n.name]||null;});
   const group={},idx={};
   rawEdges.forEach(e=>{const k=(e.from??'∅')+'→'+e.to;group[k]=(group[k]||0)+1;});
   rawEdges.forEach(e=>{const k=(e.from??'∅')+'→'+e.to;e.offsetIndex=idx[k]=(idx[k]??0);e.offsetTotal=group[k];idx[k]++;});
@@ -151,16 +161,19 @@ function buildGraph(config){
     const byName={};rawNodes.forEach(n=>{if(n.kind==='job'){const k=instKey(n.id);(byName[k]=byName[k]||[]).push(n);}});
     Object.keys(byName).forEach(nm=>{byName[nm].sort((a,b)=>(instNo(a.id)-instNo(b.id))||(a.id<b.id?-1:1));for(let i=1;i<byName[nm].length;i++){const p=byName[nm][i-1],c=byName[nm][i];if(depth[c.id]<=depth[p.id])depth[c.id]=depth[p.id]+1;}});
   }else{
-    const names=[],grpIdx={},gkey=n=>{if(!(n.name in grpIdx)){grpIdx[n.name]=names.length;names.push(n.name);}return grpIdx[n.name];};
-    rawNodes.forEach(gkey);
-    const deps=names.map(()=>new Set());
-    rawEdges.forEach(e=>{if(e.self||e.external)return;const f=byId[e.from],t=byId[e.to];if(!f||!t)return;const a=gkey(f),b=gkey(t);if(a!==b)deps[a].add(b);});
-    rawHistEdges.forEach(h=>{if(h.mode==='latest'&&byId[h.from]&&byId[h.to]){const a=gkey(byId[h.from]),b=gkey(byId[h.to]);if(a!==b)deps[a].add(b);}});
-    const indegN=names.map(()=>0);names.forEach((_,i)=>deps[i].forEach(d=>indegN[d]++));
-    const nl=(i,j)=>names[i]<names[j]?-1:names[i]>names[j]?1:0,tq=[];for(let i=0;i<names.length;i++)if(indegN[i]===0)tq.push(i);tq.sort(nl);
-    let ci=0;const col=names.map(()=>-1);while(tq.length){const i=tq.shift();col[i]=ci++;deps[i].forEach(d=>{if(--indegN[d]===0)tq.push(d);});tq.sort(nl);}
-    for(let i=0;i<names.length;i++)if(col[i]<0)col[i]=ci++;
-    rawNodes.forEach(n=>{depth[n.id]=col[gkey(n)];n.tc=gkey(n);});
+    // pipeline(设计视图)：Kahn 拓扑 + 最长路径层级 depth（并行/独立节点共享层，
+    // 后续由蛇形折叠布局消化宽度）；hist 窗口读不属于前序边，已被排除。
+    const indeg={},out={};
+    rawNodes.forEach(n=>{indeg[n.id]=0;out[n.id]=new Set();});
+    rawEdges.forEach(e=>{if(e.self||e.external)return;const f=byId[e.from],t=byId[e.to];if(!f||!t)return;out[f.id].add(t.id);indeg[t.id]++;});
+    const less=(a,b)=>a<b?-1:a>b?1:0;
+    const tq=rawNodes.filter(n=>indeg[n.id]===0).map(n=>n.id).sort(less);
+    const topo=[],il={};rawNodes.forEach(n=>il[n.id]=indeg[n.id]);
+    while(tq.length){const u=tq.shift();topo.push(u);out[u].forEach(v=>{if(--il[v]===0){tq.push(v);tq.sort(less);}});}
+    rawNodes.forEach(n=>{if(topo.indexOf(n.id)<0)topo.push(n.id);});   // 防御残余(正常无环)
+    const lev={};rawNodes.forEach(n=>lev[n.id]=0);
+    topo.forEach(u=>out[u].forEach(v=>{if(lev[v]<lev[u]+1)lev[v]=lev[u]+1;}));
+    rawNodes.forEach(n=>{depth[n.id]=lev[n.id];n.tc=lev[n.id];});
   }
   const outG={};rawEdges.forEach(e=>{if(e.from&&byId[e.from])outG[e.from]=(outG[e.from]||0)+1;});
   const outI={};rawEdges.forEach(e=>{if(e.from&&byId[e.from]){e.outIdx=outI[e.from]=(outI[e.from]??0);e.outCnt=outG[e.from];outI[e.from]++;}});
@@ -169,7 +182,34 @@ function buildGraph(config){
   return{nodes:rawNodes,edges:rawEdges,histEdges:rawHistEdges,byId,depth,isDag};
 }
 
+function layoutPipeline(g){
+  const levels={};g.nodes.forEach(n=>{const d=g.depth[n.id]|0;(levels[d]=levels[d]||[]).push(n);});
+  const R=Object.keys(levels).map(Number).sort((a,b)=>a-b);
+  const L=R.map(d=>levels[d]);
+  const cur={},setCur=()=>L.forEach(arr=>arr.forEach((n,i)=>cur[n.id]=i));
+  const pre={},suc={};g.nodes.forEach(n=>{pre[n.id]=[];suc[n.id]=[];});
+  g.edges.forEach(e=>{if(e.self||e.external)return;pre[e.to].push(e.from);suc[e.from].push(e.to);});
+  const bary=nids=>{const ps=nids.filter(x=>x in cur);if(!ps.length)return null;return ps.reduce((s,x)=>s+cur[x],0)/ps.length;};
+  const sortBy=(arr,key)=>arr.sort((a,b)=>{const A=key(a),B=key(b);if(A==null&&B==null)return 0;if(A==null)return 1;if(B==null)return -1;return A-B;});
+  // 初始稳定序：按 id 尾号数字
+  const num=k=>{const m=/(\d+)$/.exec(k||'');return m?+m[1]:0;};
+  L.forEach(arr=>arr.sort((a,b)=>(num(a.id)-num(b.id))||(a.id<b.id?-1:1)));
+  setCur();
+  // 重心法去交叉：下行(依前驱) + 上行(依后继) 若干轮
+  for(let rnd=0;rnd<3;rnd++){
+    for(let ri=1;ri<L.length;ri++){sortBy(L[ri],n=>bary(pre[n.id]));setCur();}
+    for(let ri=L.length-2;ri>=0;ri--){sortBy(L[ri],n=>bary(suc[n.id]));setCur();}
+  }
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+  R.forEach((d,ri)=>{const arr=L[ri],cnt=arr.length,span=(cnt-1)*(NODE_H+ROW_GAP),x=PAD+ri*(NODE_W+COL_GAP);
+    arr.forEach((n,i)=>{n.x=x;n.y=PAD+i*(NODE_H+ROW_GAP)-span/2;
+      minX=Math.min(minX,n.x);maxX=Math.max(maxX,n.x+NODE_W);
+      minY=Math.min(minY,n.y);maxY=Math.max(maxY,n.y+NODE_H);});});
+  if(!g.nodes.length){minX=minY=0;maxX=maxY=200;}
+  return{x:minX,y:minY,w:maxX-minX,h:maxY-minY};
+}
 function layout(g){
+  if(!g.isDag)return layoutPipeline(g);
   const instOf=id=>{const m=/:(\d+)$/.exec(id||'');return m?+m[1]:Infinity;};
   const levels={};g.nodes.forEach(n=>{if(n.kind==='timepoint')return;const d=g.depth[n.id];(levels[d]=levels[d]||[]).push(n);});
   const ds=Object.keys(levels).map(Number).sort((a,b)=>a-b);
@@ -230,9 +270,10 @@ function edgeGeometry(g,e,mode){const to=g.byId[e.to];let d,lx=0,ly=0;const ap=(
   else{const r=edgePts(g,e);d=pathFromPts(r.pts,mode);lx=r.lx;ly=r.ly;}
   return{d,lx,ly};
 }
-function hedgePath(g,he){const f=g.byId[he.from],t=g.byId[he.to],xS=f.x+NODE_W,yF=f.y+NODE_H/2,xT=t.x,yT=t.y+NODE_H/2;if(he.self)return{d:`M ${xS+4} ${yF} C ${xS+70} ${yF-66}, ${xS+70} ${yF+66}, ${xS+4} ${yF}`,lx:xS+44,ly:yF};const n=(g.histEdges||[]).length||1,e={from:he.from,to:he.to,outIdx:1,outCnt:2,gutterIdx:n+1,gutterCnt:1};const r=edgePts(g,e);return{d:pathFromPts(r.pts,'smooth'),lx:r.lx,ly:r.ly};}
+function hedgePath(g,he){const f=g.byId[he.from],t=g.byId[he.to],xS=f.x+NODE_W,yF=f.y+NODE_H/2,xT=t.x,yT=t.y+NODE_H/2;if(he.self)return{d:`M ${xS+4} ${yF} C ${xS+70} ${yF-66}, ${xS+70} ${yF+66}, ${xS+4} ${yF}`,lx:xS+44,ly:yF};if(f.x<=t.x){const dx=Math.max(40,Math.abs(xT-xS)*0.45);return{d:`M ${xS} ${yF} C ${xS+dx} ${yF}, ${xT-dx} ${yT}, ${xT} ${yT}`,lx:(xS+xT)/2,ly:(yF+yT)/2-8};}const lift=90;return{d:`M ${xS} ${yF} C ${xS+110} ${yF-lift}, ${xT-70} ${yT-lift}, ${xT} ${yT}`,lx:(xS+xT)/2,ly:Math.min(yF,yT)-lift+6};}
 const MAX_PORTS=8;
-const S={graph:null,view:{x:0,y:0,w:800,h:600},showSignalNames:true,showHist:true,showTp:true,edgeMode:'smooth',meta:{},pipeline:null,dag:null,viewMode:'design'};
+const n1=v=>Number.isFinite(v)?(+v).toFixed(1):v;   // 数值属性显示统一 1 位小数
+const S={graph:null,view:{x:0,y:0,w:1100,h:700},showSignalNames:true,showHist:true,showTp:true,edgeMode:'smooth',meta:{},pipeline:null,dag:null,viewMode:'design'};
 let dragState=null,edgeRefreshQueued=false;
 function toSvgPoint(cx,cy){const r=$('#svg').getBoundingClientRect();return{x:S.view.x+(cx-r.left)/r.width*S.view.w,y:S.view.y+(cy-r.top)/r.height*S.view.h};}
 function startNodeDrag(ev,n,group){ev.preventDefault();ev.stopPropagation();const p=toSvgPoint(ev.clientX,ev.clientY);dragState={kind:'node',node:n,group,startX:p.x,startY:p.y,baseX:n.x,baseY:n.y,moved:false};group.classList.add('dragging');}
@@ -252,7 +293,7 @@ function drawGraph(){
     w.addEventListener('mouseenter',ev=>{const ed=g.edges[i],rel=new Set([ed.from,ed.to]);document.querySelectorAll('#nodes .node').forEach(el=>el.classList.toggle('dim',!rel.has(el.dataset.id)));document.querySelectorAll('#edges .edge').forEach(x=>x.classList.remove('hl','dim'));w.classList.add('hl');let tip=`${ed.signal} → ${ed.to}`;if(ed.self)tip+='（自反馈）';if(ed.external)tip+='（外部输入）';if(ed.message&&ed.message.type)tip+=`<br>类型: ${ed.message.type}${ed.message.has_frame?' · 带帧':''}`;showTip(ev,tip);});w.addEventListener('mouseleave',resetHighlight);eg.appendChild(w);
   });
   vp.appendChild(eg);
-  if(g.histEdges&&S.showHist&&g.histEdges.length){const hg=document.createElementNS(NS,'g');hg.id='hedges';g.histEdges.forEach((he,i)=>{if(he.external)return;const w=document.createElementNS(NS,'g');w.className.baseVal='hedge';w.dataset.idx=i;const geo=hedgePath(g,he),p=document.createElementNS(NS,'path');p.setAttribute('d',geo.d);p.setAttribute('marker-end','url(#harrow)');w.appendChild(p);const t=document.createElementNS(NS,'text');t.setAttribute('class','hlabel');t.setAttribute('x',geo.lx);t.setAttribute('y',geo.ly);t.textContent=he.port+(he.mode==='latest'?'·最新':'·win'+he.win);w.appendChild(t);w.addEventListener('mouseenter',ev=>{const rel=new Set([he.from,he.to]);document.querySelectorAll('#nodes .node').forEach(el=>el.classList.toggle('dim',!rel.has(el.dataset.id)));document.querySelectorAll('#edges .edge').forEach(el=>el.classList.remove('hl','dim'));document.querySelectorAll('#hedges .hedge').forEach(el=>el.classList.toggle('dim',el!==w));w.classList.add('hl');showTip(ev,`${he.port} ${he.mode==='latest'?'读最新一帧':'依赖前'+he.win+'帧'}（${he.from} → ${he.to}）`);});w.addEventListener('mouseleave',resetHighlight);hg.appendChild(w);});vp.appendChild(hg);}
+  if(g.histEdges&&S.showHist&&g.histEdges.length){const hg=document.createElementNS(NS,'g');hg.id='hedges';g.histEdges.forEach((he,i)=>{if(he.external)return;const w=document.createElementNS(NS,'g');w.className.baseVal='hedge';w.dataset.idx=i;const geo=hedgePath(g,he),p=document.createElementNS(NS,'path');p.setAttribute('d',geo.d);p.setAttribute('marker-end','url(#harrow)');w.appendChild(p);const t=document.createElementNS(NS,'text');t.setAttribute('class','hlabel');t.setAttribute('x',geo.lx);t.setAttribute('y',geo.ly);t.textContent=he.port+(he.mode==='win'?(' ·hist'+he.win):(he.mode==='latest'?'·最新':'·win'+he.win));w.appendChild(t);w.addEventListener('mouseenter',ev=>{const rel=new Set([he.from,he.to]);document.querySelectorAll('#nodes .node').forEach(el=>el.classList.toggle('dim',!rel.has(el.dataset.id)));document.querySelectorAll('#edges .edge').forEach(el=>el.classList.remove('hl','dim'));document.querySelectorAll('#hedges .hedge').forEach(el=>el.classList.toggle('dim',el!==w));w.classList.add('hl');showTip(ev,`${he.port} ${he.mode==='win'?'hist 窗口读前'+he.win+'帧（反馈/历史依赖）':(he.mode==='latest'?'读最新一帧':'依赖前'+he.win+'帧')}（${he.from} → ${he.to}）`);});w.addEventListener('mouseleave',resetHighlight);hg.appendChild(w);});vp.appendChild(hg);}
   if(S.viewMode==='run'&&S.showTp){const tps=g.nodes.filter(n=>n.kind==='timepoint').sort((a,b)=>((g.depth[a.id]||0)-(g.depth[b.id]||0))||(a.id<b.id?-1:1));if(tps.length>1){const tg=document.createElementNS(NS,'g');tg.id='tplinks';for(let i=0;i<tps.length-1;i++){const a=tps[i],b=tps[i+1],p=document.createElementNS(NS,'path');p.setAttribute('d',`M ${a.x+NODE_W/2} ${a.y+NODE_H/2} L ${b.x+NODE_W/2} ${b.y+NODE_H/2}`);p.setAttribute('stroke','#64748b');p.setAttribute('stroke-dasharray','6 4');p.setAttribute('stroke-width','1.2');p.setAttribute('opacity','0.55');p.setAttribute('marker-end','url(#arrow)');tg.appendChild(p);}vp.appendChild(tg);}}
   const ng=document.createElementNS(NS,'g');ng.id='nodes';
   g.nodes.forEach(n=>{
@@ -262,11 +303,11 @@ function drawGraph(){
     const t1=document.createElementNS(NS,'text');t1.setAttribute('class','nid');t1.setAttribute('x',n.x+NODE_W/2);t1.setAttribute('y',n.y+NODE_H/2-4);t1.setAttribute('fill',tcolor);t1.textContent=n.id;w.appendChild(t1);
     const t2=document.createElementNS(NS,'text');t2.setAttribute('class','nname');t2.setAttribute('x',n.x+NODE_W/2);t2.setAttribute('y',n.y+NODE_H/2+14);t2.setAttribute('fill',tcolor);t2.textContent=(n.kind==='timepoint')?('⏱ 时间锚点'+(n.anchorIdx!=null?' T'+n.anchorIdx:'')):(n.name+(n.kind&&n.kind!=='job'?' · '+n.kind:''));w.appendChild(t2);
     const meta=[];
-    if(n.kind==='timepoint'){if(n.anchorOffsetMs!=null)meta.push('t='+n.anchorOffsetMs+'ms');if(n.anchorAbsMs!=null)meta.push('abs='+(+n.anchorAbsMs).toFixed(2)+'ms');}
-    else{const nrp=(S.viewMode==='run'&&n.kind==='job'&&n.task)?!n.task.period:false;if(nrp){meta.push('非周期');if(n.wcet!==undefined)meta.push('wcet='+n.wcet+'（虚拟）');}else{if(n.period)meta.push('period='+n.period);if(n.wcet!==undefined)meta.push('wcet='+n.wcet);}if(n.deadline!==undefined)meta.push('dl='+n.deadline);if(n.parameters&&n.parameters.length)meta.push('p='+n.parameters[0].value);}
+    if(n.kind==='timepoint'){if(n.anchorOffsetMs!=null)meta.push('t='+n1(n.anchorOffsetMs)+'ms');if(n.anchorAbsMs!=null)meta.push('abs='+n1(n.anchorAbsMs)+'ms');}
+    else{const nrp=(S.viewMode==='run'&&n.kind==='job'&&n.task)?!n.task.period:false;if(nrp){meta.push('非周期');if(n.wcet!==undefined)meta.push('wcet='+n1(n.wcet)+'（虚拟）');}else{if(n.period)meta.push('period='+n1(n.period));if(n.wcet!==undefined)meta.push('wcet='+n1(n.wcet));}if(n.deadline!==undefined)meta.push('dl='+n1(n.deadline));if(n.parameters&&n.parameters.length)meta.push('p='+n.parameters[0].value);}
     if(meta.length){const t3=document.createElementNS(NS,'text');t3.setAttribute('class','nmeta');t3.setAttribute('x',n.x+NODE_W/2);t3.setAttribute('y',n.y+NODE_H/2+28);t3.setAttribute('fill',tcolor);t3.textContent=meta.join(' · ');w.appendChild(t3);}
     if(n.anchorOk&&!g.isDag){(n.inList||[]).forEach((name,ii)=>{const py=portYAt(n,n.inList.length,ii),pg=document.createElementNS(NS,'g');pg.setAttribute('class','pin');pg.setAttribute('data-side','in');pg.setAttribute('data-i',ii);const c=document.createElementNS(NS,'circle');c.setAttribute('cx',n.x);c.setAttribute('cy',py);c.setAttribute('r',3.5);pg.appendChild(c);const tt=document.createElementNS(NS,'text');tt.setAttribute('x',n.x-4);tt.setAttribute('y',py+3);tt.textContent=name;pg.appendChild(tt);const m=n.metaObj&&n.metaObj.params?n.metaObj.params.filter(p=>p.role==='in')[ii]:null;pg.addEventListener('mouseenter',ev=>showTip(ev,'IN '+name+(m?' · '+m.name+(m.desc?' · '+m.desc:''):'')));pg.addEventListener('mouseleave',resetHighlight);w.appendChild(pg);});(n.outList||[]).forEach((name,oo)=>{const py=portYAt(n,n.outList.length,oo),pg=document.createElementNS(NS,'g');pg.setAttribute('class','pout');pg.setAttribute('data-side','out');pg.setAttribute('data-i',oo);const c=document.createElementNS(NS,'circle');c.setAttribute('cx',n.x+NODE_W);c.setAttribute('cy',py);c.setAttribute('r',3.5);pg.appendChild(c);const tt=document.createElementNS(NS,'text');tt.setAttribute('x',n.x+NODE_W+4);tt.setAttribute('y',py+3);tt.textContent=name;pg.appendChild(tt);const m=n.metaObj&&n.metaObj.params?n.metaObj.params.filter(p=>p.role==='out')[oo]:null;pg.addEventListener('mouseenter',ev=>showTip(ev,'OUT '+name+(m?' · '+m.name+(m.desc?' · '+m.desc:''):'')));pg.addEventListener('mouseleave',resetHighlight);w.appendChild(pg);});}
-    w.addEventListener('mouseenter',ev=>{const rel=new Set([n.id]);g.edges.forEach(ed=>{if(ed.from===n.id||ed.to===n.id){rel.add(ed.from);rel.add(ed.to);}});(g.histEdges||[]).forEach(h=>{if(h.from===n.id||h.to===n.id){rel.add(h.from);rel.add(h.to);}});document.querySelectorAll('#nodes .node').forEach(el=>el.classList.toggle('dim',!rel.has(el.dataset.id)));document.querySelectorAll('#edges .edge').forEach(el=>{const ed=g.edges[+el.dataset.idx],on=ed.from===n.id||ed.to===n.id;el.classList.toggle('dim',!on);el.classList.toggle('hl',on);});document.querySelectorAll('#hedges .hedge').forEach(el=>{const h=g.histEdges&&g.histEdges[+el.dataset.idx],on=!!h&&(h.from===n.id||h.to===n.id);el.classList.toggle('dim',!on);el.classList.toggle('hl',on);});let tip=`${n.id} · ${n.name}${n.kind?' · '+n.kind:''}`;if(n.kind==='timepoint'){tip+='<br>时间锚点'+(n.anchorIdx!=null?' #'+n.anchorIdx:'');if(n.anchorOffsetMs!=null)tip+=' · 偏移 '+n.anchorOffsetMs+'ms';if(n.anchorAbsMs!=null)tip+='<br>绝对时刻 '+(+n.anchorAbsMs).toFixed(2)+'ms';}showTip(ev,tip);});
+    w.addEventListener('mouseenter',ev=>{const rel=new Set([n.id]);g.edges.forEach(ed=>{if(ed.from===n.id||ed.to===n.id){rel.add(ed.from);rel.add(ed.to);}});(g.histEdges||[]).forEach(h=>{if(h.from===n.id||h.to===n.id){rel.add(h.from);rel.add(h.to);}});document.querySelectorAll('#nodes .node').forEach(el=>el.classList.toggle('dim',!rel.has(el.dataset.id)));document.querySelectorAll('#edges .edge').forEach(el=>{const ed=g.edges[+el.dataset.idx],on=ed.from===n.id||ed.to===n.id;el.classList.toggle('dim',!on);el.classList.toggle('hl',on);});document.querySelectorAll('#hedges .hedge').forEach(el=>{const h=g.histEdges&&g.histEdges[+el.dataset.idx],on=!!h&&(h.from===n.id||h.to===n.id);el.classList.toggle('dim',!on);el.classList.toggle('hl',on);});let tip=`${n.id} · ${n.name}${n.kind?' · '+n.kind:''}`;if(n.kind==='timepoint'){tip+='<br>时间锚点'+(n.anchorIdx!=null?' #'+n.anchorIdx:'');if(n.anchorOffsetMs!=null)tip+=' · 偏移 '+n1(n.anchorOffsetMs)+'ms';if(n.anchorAbsMs!=null)tip+='<br>绝对时刻 '+n1(n.anchorAbsMs)+'ms';}showTip(ev,tip);});
     w.addEventListener('mouseleave',resetHighlight);w.addEventListener('mousedown',ev=>startNodeDrag(ev,n,w));ng.appendChild(w);
   });
   vp.appendChild(ng);
@@ -287,7 +328,7 @@ function renderAll(){setTabs();const data=S.viewMode==='run'?S.dag:S.pipeline;S.
 let pasteSeq=0;
 window.addEventListener('DOMContentLoaded',()=>{
   const svg=$('#svg');
-  function openDetail(n){const d=$('#detail');d.innerHTML='';const h=document.createElement('h3');h.innerHTML=`<span>节点详情 <span style="color:var(--muted);font-weight:400;font-size:12px">${n.name}</span></span>`;const cl=document.createElement('button');cl.className='close';cl.textContent='×';cl.onclick=()=>d.classList.remove('open');h.appendChild(cl);d.appendChild(h);const kv=document.createElement('dl');kv.className='kv';const rows=[['ID',n.id],['Name',n.name],['Kind',n.kind||'—'],['Period',n.period??'—'],['WCET',n.wcet??'—'],['Deadline',n.deadline??'—'],['k',n.k??'—'],['HyperPeriod',n.hyper_period_ms??'—'],['AnchorOffset',n.anchorOffsetMs!=null?n.anchorOffsetMs+'ms':'—'],['AnchorAbs',n.anchorAbsMs!=null?(+n.anchorAbsMs).toFixed(2)+'ms':'—'],['Inputs',(n.inputs||[]).join(', ')||'—'],['Outputs',(n.outputs||[]).join(', ')||'—'],['Parameters',(n.parameters||[]).map(p=>JSON.stringify(p)).join(', ')||'—']];rows.forEach(([k,v])=>{if(v==='—')return;const dt=document.createElement('dt');dt.textContent=k;const dd=document.createElement('dd');dd.textContent=v;kv.append(dt,dd);});d.appendChild(kv);const pre=document.createElement('pre');pre.textContent=JSON.stringify(n,null,2);d.appendChild(pre);d.classList.add('open');}
+  function openDetail(n){const d=$('#detail');d.innerHTML='';const h=document.createElement('h3');h.innerHTML=`<span>节点详情 <span style="color:var(--muted);font-weight:400;font-size:12px">${n.name}</span></span>`;const cl=document.createElement('button');cl.className='close';cl.textContent='×';cl.onclick=()=>d.classList.remove('open');h.appendChild(cl);d.appendChild(h);const kv=document.createElement('dl');kv.className='kv';const rows=[['ID',n.id],['Name',n.name],['Kind',n.kind||'—'],['Period',n.period!=null?n1(n.period):'—'],['WCET',n.wcet!=null?n1(n.wcet):'—'],['Deadline',n.deadline!=null?n1(n.deadline):'—'],['k',n.k??'—'],['HyperPeriod',n.hyper_period_ms!=null?n1(n.hyper_period_ms):'—'],['AnchorOffset',n.anchorOffsetMs!=null?n1(n.anchorOffsetMs)+'ms':'—'],['AnchorAbs',n.anchorAbsMs!=null?n1(n.anchorAbsMs)+'ms':'—'],['Inputs',(n.inputs||[]).join(', ')||'—'],['Outputs',(n.outputs||[]).join(', ')||'—'],['Parameters',(n.parameters||[]).map(p=>JSON.stringify(p)).join(', ')||'—']];rows.forEach(([k,v])=>{if(v==='—')return;const dt=document.createElement('dt');dt.textContent=k;const dd=document.createElement('dd');dd.textContent=v;kv.append(dt,dd);});d.appendChild(kv);const pre=document.createElement('pre');pre.textContent=JSON.stringify(n,null,2);d.appendChild(pre);d.classList.add('open');}
   const bindLoad=(btn,inputId,kind)=>{$(btn).addEventListener('click',()=>$(inputId).click());$(inputId).addEventListener('change',e=>{[...e.target.files].forEach(f=>{const r=new FileReader();r.onload=()=>{try{addTyped(kind,JSON.parse(r.result));}catch(err){alert('解析 "'+f.name+'" 失败：'+err.message);}};r.readAsText(f);});e.target.value='';});};
   bindLoad('#btnLoadMeta','#metaInput','meta');bindLoad('#btnLoadPipeline','#pipelineInput','pipeline');bindLoad('#btnLoadDag','#dagInput','dag');
   window.addEventListener('dragover',e=>e.preventDefault());window.addEventListener('drop',e=>{e.preventDefault();[...e.dataTransfer.files].forEach(f=>{if(!/\.json$/i.test(f.name)&&f.type!=='application/json')return;const r=new FileReader();r.onload=()=>{try{addFile(f.name,JSON.parse(r.result));}catch(err){alert(`解析失败：${err.message}`);}};r.readAsText(f);});});
