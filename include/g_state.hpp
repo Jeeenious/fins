@@ -149,7 +149,7 @@ namespace fins::rt {
   inline Library library_g;
 
   /** @brief 节点解析态（Pipeline 内嵌，parse_pipeline 产物）：纯数据，字段含 id/name/version、
-   *  端口名数组、config_cache、loop、period/wcet/deadline/cap。 */
+   *  端口名数组、config_cache、hist、period/wcet/deadline。 */
   struct NodeInfo {
     std::string id;                                      // 节点在图中的唯一标识（顶点名 id:{k} 前缀）
     std::string name;                                    // 算法名（[name:version] = so 表定位键）
@@ -158,19 +158,18 @@ namespace fins::rt {
     double period{0};                                    // 执行周期（ms；0 = 未配置，走支配继承）
     double deadline{1};                                  // 相对截止期（ms；缺省已折成 wcet）
     double wcet{1};                                      // 最坏执行时间（ms；缺省 1）
-    size_t cap{10};                                     // 滑动窗口容量（hist 长度：loop 反馈历史槽每端口保留帧数；默认 10，config 顶层 "cap" 可配）
 
     std::vector<std::string> input_ports;
     std::vector<std::string> output_ports;
     std::vector<nlohmann::json> config_cache;
 
-    std::map<std::string, size_t> loop;                      // loop 端口 → 迭代步 N（回喂过去 N 帧；窗口长度 = N）
+    std::map<std::string, size_t> hist;                     // hist 端口（显式周期节点输入）→ 窗口长度 N（>2，触发时读该字段缓存最近 N 帧；未声明 hist 的周期输入 = 标量读最新单帧）
 
     /** @brief 逐节点自解析：全部结构校验 + 字段抽取（Pipeline::parse 只拆封顶层后逐个调用
      *  本构造器）。parameters 为**位置式取值表** config_cache——只取 p["value"]、名字丢弃
      *  （顺序 = config "parameters" 数组元素顺序 = AlgoFunc 配置段相对序号，
      *  见 algo_func.hpp 头注释顺序保证链）。
-     * @param n 节点 JSON 对象（必填 name/version/id，可选 parameters/inputs/outputs/wcet/deadline/period/cap/loop）
+     * @param n 节点 JSON 对象（必填 name/version/id，可选 parameters/inputs/outputs/wcet/deadline/period/cap/hist）
      * @param at 错误定位上下文串（如 "nodes[i]."，错误消息前缀用）
      * @retval 无（格式违反抛 std::invalid_argument）
      */
@@ -219,21 +218,27 @@ namespace fins::rt {
       period   = n.contains("period")   ? n["period"].get<double>()   : 0.0;
       wcet     = n.contains("wcet")     ? n["wcet"].get<double>()     : 1.0;
       deadline = n.contains("deadline") ? n["deadline"].get<double>() : period;  // 缺省 = period
-      cap      = n.contains("cap")      ? n["cap"].get<size_t>() : 10;        // 缺省 10
+
       if (n.contains("inputs") && n["inputs"].is_array())
         input_ports = n["inputs"].get<std::vector<std::string>>();
       if (n.contains("outputs") && n["outputs"].is_array())
         output_ports = n["outputs"].get<std::vector<std::string>>();
-      if (n.contains("loop")) {
-        if (!n["loop"].is_object())
-          throw std::invalid_argument("[parse_dataflow] " + at + "loop 须为 object");
-        for (const auto &[port, arg] : n["loop"].items()) {
+      if (n.contains("hist")) {
+        if (!n["hist"].is_object())
+          throw std::invalid_argument("[parse_dataflow] " + at + "hist 须为 object");
+        if (period <= 0.0)
+          throw std::invalid_argument("[parse_dataflow] " + at + "hist 仅允许显式周期节点（period>0）声明");
+        for (const auto &[port, arg] : n["hist"].items()) {
           if (!arg.is_number())
-            throw std::invalid_argument("[parse_dataflow] " + at + "loop." + port + " 须为 number（迭代步 N）");
-          const double d = arg.get<double>();   // 迭代步 = 回溯最近 N 帧（须为正整数，窗口长度 = N）
-          if (d < 1.0 || d != std::floor(d))
-            throw std::invalid_argument("[parse_dataflow] " + at + "loop." + port + " 须为正整数迭代步 N（收到 " + std::to_string(d) + "）");
-          loop[port] = static_cast<size_t>(d);
+            throw std::invalid_argument("[parse_dataflow] " + at + "hist." + port + " 须为 number（窗口长度 N）");
+          const double d = arg.get<double>();   // 窗口长度 = 触发时读该字段缓存最近 N 帧
+          if (d != std::floor(d))
+            throw std::invalid_argument("[parse_dataflow] " + at + "hist." + port + " 须为整数窗口长度 N（收到 " + std::to_string(d) + "）");
+          if (d <= 2.0)
+            throw std::invalid_argument("[parse_dataflow] " + at + "hist." + port + " 窗口长度 N 须大于 2（真正多帧窗口；读最新单帧请勿声明 hist）");
+          if (std::find(input_ports.begin(), input_ports.end(), port) == input_ports.end())
+            throw std::invalid_argument("[parse_dataflow] " + at + "hist 端口 '" + port + "' 须在本节点 inputs 中声明");
+          hist[port] = static_cast<size_t>(d);
         }
       }
     }
@@ -241,7 +246,7 @@ namespace fins::rt {
   /** @brief Pipeline — dataflow 配置（解析态；全局单份 pipeline_g）：cache = 原始配置 JSON 双缓冲
    *  （RPC 写缓冲份不解析 → pending → 主线程调度循环图静止时 commit + parse_pipeline 填 nodes），
    *  标准形式 = 节点对象数组（name/version/id 必填 + parameters/inputs/outputs/wcet/deadline/period/
-   *  loop 可选），违反抛 std::invalid_argument；loop 端口反馈走 message_hist_ 数据槽。 */
+   *  hist 可选），违反抛 std::invalid_argument；显式周期节点输入经 message_hist_ 字段缓存取样（hist 窗口/最新标量）。 */
   struct Pipeline {
     /// 原始数据
     util::DoubleBuff<nlohmann::json> cache;
@@ -284,7 +289,8 @@ namespace fins::rt {
      *  ① 单写者约束：同名输出端口至多一个生产者（数据流语义）；多写者直接拒绝，否则图侧
      *     expand_hp 绑定边对每个 producer 都建边、闭包读哪条取决于遍历顺序（不确定）；
      *  ② 源周期：无输入节点（input_ports 空）无上游驱动，须主动周期执行，必填 period；
-     *  ③ loop 自反馈：loop 端口须同时在本节点 inputs 与 outputs 中声明（否则静默失效）。
+     *  ③ 孤立输入：每个输入端口（含显式周期节点的窗口输入/自反馈字段）须有生产者；hist 指向无人
+     *     产出的字段 = 悬空窗口，同样拒绝（hist 合法性——仅显式周期节点、键 ⊆ inputs——解析期已校）。
      * @retval 无（违反抛 std::invalid_argument）
      */
     void check_topology() const {
@@ -298,29 +304,15 @@ namespace fins::rt {
       for (size_t i = 0; i < nodes.size(); ++i)
         if (nodes[i].input_ports.empty() && nodes[i].period <= 0)
           throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) + "] 无输入节点必填 period");
-      // ④ 孤立输入拒绝：每个非 loop 输入端口须恰好有生产者（数据流边只来自节点输出；无生产者 →
-      //    该节点退化为“伪根”——无 tp、无继承周期、expand 后只跑一次且永不重放，还会让周期兄弟
-      //    因它永不完成而无法翻页）。loop 端口例外：producer 是节点自身（自反馈，③ 已查其 input/output 声明）。
+      // ③ 孤立输入拒绝：每个输入端口（含显式周期节点的窗口输入/自反馈字段）须有生产者（数据流边
+      //    只来自节点输出；无生产者 → 该节点退化为“伪根”——无 tp、无继承周期、expand 后只跑一次且
+      //    永不重放，还会让周期兄弟因它永不完成而无法翻页）。周期节点自反馈（hist 字段 = 自身输出）
+      //    经自身 output 入 producers 而通过；hist 指向无人产出的字段 = 悬空窗口 → 拒绝。
       for (size_t i = 0; i < nodes.size(); ++i)
         for (const auto &pn : nodes[i].input_ports)
-          if (!nodes[i].loop.count(pn) && !producers.count(pn))
+          if (!producers.count(pn))
             throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) +
                                         "] 输入端口 '" + pn + "' 无生产者（孤立输入），非法配置");
-      // ③ loop 自反馈合法性：loop 端口须同时在本节点 inputs 与 outputs 中声明——反馈历史来自本
-      //    节点同名输出；缺 input → 闭包不喂它（pack_inputs 只遍历 input_ports），缺 output →
-      //    route_outputs 永不为它记历史，两者都会静默失效。
-      for (size_t i = 0; i < nodes.size(); ++i) {
-        const auto &ins  = nodes[i].input_ports;
-        const auto &outs = nodes[i].output_ports;
-        for (const auto &[pn, _] : nodes[i].loop) {
-          if (std::find(ins.begin(), ins.end(), pn) == ins.end())
-            throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) +
-                                        "] loop 端口 '" + pn + "' 须在本节点 inputs 中声明");
-          if (std::find(outs.begin(), outs.end(), pn) == outs.end())
-            throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) +
-                                        "] loop 端口 '" + pn + "' 须在本节点 outputs 中声明（自反馈）");
-        }
-      }
     }
 
     /** @brief 取本 pipeline 引用的全部算法定位键（[name]:[version] 列表，与 Plugin::loaded_keys 同构），
@@ -390,7 +382,7 @@ namespace fins::rt {
     uint64_t graph_version{0};       // 图结构版本号（expand_hp 重建后 ++；main 线程持 mtx 写读）。
 
     /** @brief 记录一帧到历史滑动窗口数据槽（满丢最旧；TBBMap accessor 按端口锁，只锁本端口
-     *  历史槽字段）。历史槽 = loop 反馈窗口（容量 cap）与显式周期节点“最新一帧”读（容量 1）。
+     *  历史槽字段）。历史槽 = 显式周期节点取样的 producer 输出字段缓存（hist 窗口/最新标量；容量 mesg_hist_cap = 读者 max（hist N 或 1））。
      *  追加按 Message.timestamp（采集时间戳，pub 时置 now_us）升序插入，队列恒按时间有序，尽量
      *  保留最新数据——乱序完成的旧帧插到前面、满 cap 丢最旧（ts 最小）。
      * @param id 输出端口名（历史槽键）
@@ -407,9 +399,8 @@ namespace fins::rt {
         while (q.size() > cap) q.pop_front();  // 满丢最旧（cap 运行时只读，调用方已 guard >0）
       });
     }
-    std::map<std::string, size_t> mesg_hist_cap{};   // 滑动窗口容量（expand_hp 填充：loop 反馈输出端口 → producer 节点 NodeInfo.cap，默认 10 可配；expand_hp 重建时清空重算；运行时只读无并发写）
-    std::vector<nlohmann::json> hist_export_;        // hist 隐式依赖导出表（bind_job 段 3 填：loop 自反馈 / 显式周期“最新一帧”读；export_dag 输出 hist_edges，独立于前序 edges；expand 重建时清空）
-    util::TBBMap<std::deque<Message>> message_hist_;  // 运行时：输出端口名 → 最近 cap 帧滑动窗口（loop 反馈历史槽；
+    std::map<std::string, size_t> mesg_hist_cap{};   // 字段历史缓存保留容量（expand_hp 填充：被显式周期节点取样的字段 → 读者 max（hist N 或 1）；重建时清空重算；运行时只读无并发写）
+    util::TBBMap<std::deque<Message>> message_hist_;  // 运行时：输出端口名 → 最近 mesg_hist_cap 帧滑动窗口（周期节点窗口读的字段历史槽；跨重建保留）
 
     /** @brief 记录一次 execute 耗时到节点环形队列（按完成时间戳升序插入、满 cap 丢最旧——保留最新；
      *  TBBMap accessor 按节点锁，只锁本节点字段）。
@@ -460,13 +451,13 @@ namespace fins::rt {
     std::vector<std::string> tp_order_;                   // 时间点释放顺序（pin_sync 按 offset 升序填全量 tp id；rollover 重放）
     size_t tp_released_{0};                     // 游标：下一个待释放 tp 在 tp_order_ 的下标
 
-    /** @brief ① 端口索引：输出/输入端口名 → 节点 + 一跳邻居（loop 端口跳过——反馈 producer
-     *  是自身，无绑定边）。单写者约束已在 Pipeline::check_topology 校验（同名输出端口多 producer
+    /** @brief ① 端口索引：输出/输入端口名 → 节点 + 一跳邻居（显式周期节点的输入跳过——窗口读，
+     *  无绑定边/不构成拓扑依赖）。单写者约束已在 Pipeline::check_topology 校验（同名输出端口多 producer
      *  拒绝），这里只建索引供拓扑/继承周期用；先预建所有节点的一跳邻居条目（空集）→ ③ 拓扑序
      *  对 const map 用 .at() 安全。
      * @param nodes 解析态节点表（只读）
      * @param producers [out] 输出端口名 → producer 节点 id 列表
-     * @param consumers [out] 输入端口名 → consumer 节点 id 列表（loop 端口不构成消费者）
+     * @param consumers [out] 输入端口名 → consumer 节点 id 列表（显式周期节点输入不构成消费者）
      * @param in_producers [out] 节点 id → 输入一跳邻居（producer 集）
      * @param out_consumers [out] 节点 id → 输出一跳邻居（consumer 集）
      * @retval 无
@@ -484,12 +475,12 @@ namespace fins::rt {
         for (const auto &pn : info.output_ports)
           producers[pn].push_back(info.id);
         for (const auto &pn : info.input_ports)
-          if (!info.loop.count(pn))   // loop 端口：不构成消费者（无自环绑定边）
+          if (info.period <= 0)   // 显式周期节点输入为历史槽取样读（无数据边，不构成消费者）；事件节点才构成
             consumers[pn].push_back(info.id);
       }
       for (const auto &info : nodes) {
         for (const auto &pn : info.input_ports)
-          if (!info.loop.count(pn))   // loop 端口：反馈 producer 是自身，不构成拓扑依赖
+          if (info.period <= 0)   // 显式周期节点输入为历史槽取样读，不构成拓扑依赖；事件节点才依赖 producer
             for (const auto &p : producers[pn])
               in_producers[info.id].insert(p);
         for (const auto &pn : info.output_ports)
@@ -619,15 +610,15 @@ namespace fins::rt {
           // 未配置 → 继承前级：多前级取最短周期前级（topo 序保证前级已定最终周期）
           std::string trig;
           double best = 0;
-          for (const auto &pn : info->input_ports)
-            if (!info->loop.contains(pn)) {  // loop 端口：反馈 producer 是自身，不参与继承
-              auto pit = producers.find(pn);
-              if (pit == producers.end()) continue;   // 孤立输入端口（无 producer）→ 无继承源
-              for (const auto &p : pit->second) {
-                const double pt = period_final.contains(p) ? period_final[p] : 0;
-                if (trig.empty() || pt < best) { trig = p; best = pt; }
-              }
+          // 仅事件节点（T≤0）进入继承：其输入端口全为绑定边 → 全部参与继承（显式周期节点 T>0 不进此分支）
+          for (const auto &pn : info->input_ports) {
+            auto pit = producers.find(pn);
+            if (pit == producers.end()) continue;   // 孤立输入端口（无 producer）→ 无继承源
+            for (const auto &p : pit->second) {
+              const double pt = period_final.contains(p) ? period_final[p] : 0;
+              if (trig.empty() || pt < best) { trig = p; best = pt; }
             }
+          }
           T = (!trig.empty() && period_final.contains(trig)) ? period_final[trig] : 0.0;
         }
         period_final[id] = T;
@@ -671,8 +662,8 @@ namespace fins::rt {
      *    producer:{pk} → consumer:{k}（时段内最新已完成帧；同速率一一对应；快→慢绑末帧；
      *    慢→快共享帧；恒有边）；
      *  · 显式周期（info.period>0）节点 = 时间触发，不建任何数据前序边——它执行时从 producer 输出
-     *    端口的历史槽读“最新一帧”（队列长度 1），见 bind_job 段 1 注册 / pack_inputs 的 read_latest；
-     *  · loop 端口（loop 中）永远无绑定边——反馈走 message_hist_ 滑动窗口。
+     *    端口历史槽取样：hist 端口读 N>2 帧窗口、其余输入读最新一帧（标量），见 bind_job 段 1 注册 /
+     *    pack_inputs；事件节点输入端口全部建绑定边（数据驱动）。显式周期节点输入恒无绑定边。
      * @param dag 目标图（就地加边）
      * @param nodes 解析态节点表（只读）
      * @param node_count 节点 id → 实例数（只读）
@@ -689,7 +680,6 @@ namespace fins::rt {
         if (info.period > 0) continue;   // 显式周期（时间触发）节点：无数据绑定边（读 hist 最新，见 bind_job）
         const size_t Nc = node_count.at(info.id);
         for (const auto &pn : info.input_ports) {
-          if (info.loop.count(pn)) continue;   // loop 端口无绑定边
           auto pit = producer_of.find(pn);
           if (pit == producer_of.end()) continue;   // 输入端口无生产者（孤立输入）→ 无边
           const std::string &p = pit->second;
@@ -776,14 +766,13 @@ namespace fins::rt {
 
     /**
      * @brief ⑧ 填 job 执行体闭包：按 NodeInfo 端口序打包输入/输出 array → AlgoBase execute →
-     *        输出路由下游绑定边 + record_mesg 维护 loop 滑动窗口，运行时不再接触原始 JSON。
+     *        输出路由下游绑定边 + record_mesg 维护字段历史槽，运行时不再接触原始 JSON。
      *        闭包捕获稳定解析态（shared_ptr<const NodeInfo> 每节点 1 份按 k 共享）+ 算法实例 by_id；
-     *        输入逐输入端口取绑定边帧（loop 端口从 message_hist_ 聚合最近 N 帧——N = config 迭代步，
-     *        恒长 N、未满头部补 0，运行时直出 typed std::vector<int> 进对应下标（方案 A：AlgoFunc/
-     *        插件侧只声明 std::vector<int> 接收，不参与转换）。hist 容量
-     *        mesg_hist_cap[输出端口] = 该端口作为 loop 反馈被消费时 producer 节点的 NodeInfo.cap
-     *        （config 顶层 "cap"，默认 10），只对 loop 反馈输出端口建历史槽；单写者约束保证
-     *        每输出端口唯一 producer → 直接赋值（非 max）；message_hist_ 跨重建保留不清。
+     *        输入打包：事件节点逐输入端口取绑定边帧；显式周期（period>0）节点——hist 声明的端口读
+     *        producer 字段历史槽窗口（长度 N>2，恒长 N、未满头部 0 补位，直出 typed std::vector<int>，
+     *        方案 A：插件侧声明 std::vector<int> 接收），未声明 hist 的输入读“最新一帧”标量 int。
+     *        历史容量 mesg_hist_cap[输出端口] = 该字段全部周期读者的保留长度 max（hist N 或 1），
+     *        只对被周期读的字段建历史槽；单写者约束保证每输出端口唯一 producer；message_hist_ 跨重建保留不清。
      * @param nodes 解析态节点表（只读）
      * @param by_id 节点 id → 算法实例（只读）
      * @param node_count 节点 id → job 实例数（只读）
@@ -792,35 +781,33 @@ namespace fins::rt {
     void bind_job(const std::vector<NodeInfo> &nodes,
                     const std::map<std::string, std::shared_ptr<AlgoBase>> &by_id,
                     const std::map<std::string, size_t> &node_count) {
-      // loop 端口 → 聚合窗口帧数 = config 迭代步 N（扁平 loop map；无需换算，直取）
-
-      // ── 段 1：历史容量表 mesg_hist_cap[输出端口] ──
-      //  ① loop 反馈端口：容量 = 本节点 cap（config 顶层 "cap"，默认 10），自反馈窗口 N 帧；
-      //  ② 显式周期（时间触发）节点的非 loop 输入：读其 producer 输出端口的“最新一帧”（队列长度 1）
-      //    ——为此给该输出端口建容量 1 的历史槽；若已由 ① 注册则保留其较大 cap（不降级）。
-      //    route_outputs 见 mesg_hist_cap 含该端口才 record_mesg，故须先在此登记。
+      // ── 段 1：历史容量表 mesg_hist_cap[输出端口]（记录条件 + 保留长度）──
+      //  仅显式周期节点的输入从 producer 字段历史槽取样（hist 端口读 N>2 帧窗口、未声明读最新单帧），
+      //  故其每个输入对应字段都要建历史槽：保留容量 = 该字段全部周期读者的 max（hist N 或 1）。同字段
+      //  多读者共享槽。route_outputs 见 mesg_hist_cap 含该端口才 record_mesg，故须先在此登记。
       std::set<std::string> out_ports;   // 全部节点输出端口名并集（判定“有 producer”）
       for (const auto &info : nodes)
         for (const auto &pn : info.output_ports) out_ports.insert(pn);
-      for (const auto &info : nodes)
-        for (const auto &[port, _] : info.loop) mesg_hist_cap[port] = info.cap;   // ① loop 自反馈槽
       for (const auto &info : nodes) {
-        if (info.period <= 0) continue;   // 仅显式周期节点以“最新一帧”方式读输入
-        for (const auto &pn : info.input_ports)
-          if (!info.loop.count(pn) && out_ports.count(pn) && !mesg_hist_cap.count(pn))
-            mesg_hist_cap[pn] = 1;   // ② 最新一帧槽（读 producer 输出端口的最近帧）
+        if (info.period <= 0) continue;   // 仅显式周期节点从字段历史槽取样（事件节点无历史读）
+        for (const auto &pn : info.input_ports) {
+          if (!out_ports.count(pn)) continue;   // 无 producer 字段（check_topology 已拒，防御）
+          const size_t w = info.hist.count(pn) ? info.hist.at(pn) : 1;   // hist N（窗口）或 1（最新单帧）
+          auto &cap = mesg_hist_cap[pn];
+          if (w > cap) cap = w;   // 保留容量 = 读者 max（同字段多读者共享槽，保证不丢窗内最新帧）
+        }
       }
 
-      // ── 段 2：每个节点 → 每实例填 job 闭包（闭包捕获稳定解析态 + 算法实例 + loop 聚合窗口）──
+      // ── 段 2：每个节点 → 每实例填 job 闭包（闭包捕获稳定解析态 + 算法实例 + hist 窗口长度表）──
       for (const auto &info : nodes) {
         auto sinfo = std::make_shared<const NodeInfo>(info);           // 闭包捕获稳定共享解析态
         const auto &algo = by_id.at(info.id);
         const size_t n = node_count.at(info.id);
-        const auto loop_w = info.loop;   // loop 端口 → 聚合窗口帧数（迭代步 N，直取 config）
+        const auto hist_w = info.hist;   // hist 端口 → 窗口长度 N（>2；未声明的周期输入走“最新单帧”标量读）
 
         for (size_t k = 0; k < n; ++k) {
           const std::string vtx = info.id + ":" + std::to_string(k);   // 顶点名现拼（无 JobInst）
-          dag.mutate_vertex(vtx, [this, sinfo, algo, vtx, loop_w](Workload &v) {
+          dag.mutate_vertex(vtx, [this, sinfo, algo, vtx, hist_w](Workload &v) {
             v.id = vtx;   // Workload.id 实际填充（grab_ready_workload 返回 Workload* 含 id，装配点直做完成事件用）
 
             // 按 tag 分组一次性解析（O(边数) 替代 O(端口×边数) 的逐端口 edges_to/from）
@@ -828,7 +815,7 @@ namespace fins::rt {
             auto out_groups = dag.edges_from_grouped(vtx);
             std::vector<std::vector<std::reference_wrapper<Message>>> in_refs(sinfo->input_ports.size());
             for (size_t i = 0; i < in_refs.size(); ++i)
-              if (!loop_w.count(sinfo->input_ports[i])) {   // 非 loop 端口：查分组表（单写者 → 至多一条）
+              if (sinfo->period <= 0) {   // 事件节点输入端口：查绑定边分组表（单写者 → 至多一条）；周期节点无绑定边
                 const auto it = in_groups.find(sinfo->input_ports[i]);
                 if (it != in_groups.end()) in_refs[i] = it->second;
               }
@@ -841,13 +828,18 @@ namespace fins::rt {
             v.job = [this,
               sinfo,
               algo,
-              loop_w,
+              hist_w,
               in_refs = std::move(in_refs), out_refs = std::move(out_refs)]() {
-              // ── 功能 1a：loop 端口 → 滑动窗口历史槽聚合最近 N 帧为 typed std::vector<int>
-              auto collect_loop_window = [this](const std::string &pn, size_t w) {
-                std::vector<int> vals;   // 恒长 w；未满头部 0 占位，尾部覆盖最近真实帧
+              // ── 功能 1：周期节点输入取样 helper（时间触发无数据前序边，执行时才取样；
+              //      const_accessor 只锁本端口历史槽，与 record_mesg 同端口写互斥、不同端口并发读）
+              //   · collect_window：hist 声明端口 → 读 producer 字段历史槽最近 w 帧为 typed
+              //     std::vector<int>（w = hist N>2，恒长 w、未满头部 0 占位、尾部覆盖最近真实帧；
+              //     producer 未产出过（槽空）→ 全 0）；
+              //   · read_latest：未声明 hist 的周期输入 → 标量读“最新一帧”（int；槽空 → 0 占位）。
+              auto collect_window = [this](const std::string &pn, size_t w) {
+                std::vector<int> vals;
                 vals.resize(w);
-                { // TBBMap const_accessor 只锁本端口历史槽（与 record_mesg 同端口写互斥；不同端口并发读）
+                {
                   util::TBBMap<std::deque<Message>>::const_accessor a;
                   if (message_hist_.find(a, pn)) {
                     const auto &h = a->second;   // 队列按 timestamp 升序，尾部 = 最新真实帧
@@ -855,47 +847,43 @@ namespace fins::rt {
                     for (size_t j = 0; j < take; ++j)
                       vals[w - take + j] = *h[h.size() - take + j].p_shared<int>();   // 逐帧取真实值
                   }
-                  // find 失败（理论不发生：producer 已先执行并 record_mesg 压槽）→ 全 0 占位
                 }
                 Message m;
                 *m.p_mutable<std::vector<int>>() = std::move(vals);
                 return m;
               };
 
-              // ── 功能 1b：显式周期（时间触发）节点读“最新一帧”——从其 producer 输出端口历史槽
-              //      （容量 1，bind_job 段 1 注册）取最近一帧；时间触发无数据前序，执行时才取样。
-              //      producer 尚未产出（槽空）→ 0 占位（当前 SDK 载荷为 int）。
               auto read_latest = [this](const std::string &pn) {
                 Message m;
-                { // TBBMap const_accessor 读（与 record_mesg 同端口写互斥）
+                {
                   util::TBBMap<std::deque<Message>>::const_accessor a;
                   if (message_hist_.find(a, pn) && !a->second.empty())
                     m = a->second.back();   // 队列按 timestamp 升序，back = 最新一帧（拷贝，shared_ptr 保活）
                 }
                 if (m.frame) return m;
                 Message z;
-                *z.p_mutable<int>() = 0;
+                *z.p_mutable<int>() = 0;   // 槽空（producer 尚未产出）→ 0 占位
                 return z;
               };
 
-              // ── 功能 1：打包输入 array（loop 聚合 / 周期节点读最新 / 普通端口预解析 in_refs；
-              //      按端口序，算法按位置取不碰端口名）──
-              auto pack_inputs = [this, sinfo, loop_w, collect_loop_window, read_latest, &in_refs]() {
+              // ── 功能 2：打包输入 array——hist 声明端口 → 窗口读（collect_window）；周期未声明 →
+              //      标量读最新（read_latest）；事件节点 → 绑定边帧（按端口序，算法按位置取不碰端口名）──
+              auto pack_inputs = [this, sinfo, hist_w, collect_window, read_latest, &in_refs]() {
                 std::vector<Message> inputs(sinfo->input_ports.size());
                 for (size_t i = 0; i < inputs.size(); ++i) {
                   const std::string &pn = sinfo->input_ports[i];
 
-                  if (loop_w.count(pn))
-                    inputs[i] = collect_loop_window(pn, loop_w.at(pn));
+                  if (hist_w.count(pn))
+                    inputs[i] = collect_window(pn, hist_w.at(pn));   // hist 端口：N>2 帧窗口
                   else if (sinfo->period > 0)
-                    inputs[i] = read_latest(pn);   // 显式周期：读 producer 最新一帧（无数据前序边）
+                    inputs[i] = read_latest(pn);   // 周期节点未声明 hist：标量读最新一帧
                   else
-                    inputs[i] = in_refs[i].empty() ? Message{} : in_refs[i][0].get();   // 跟随节点：绑定边预解析引用
+                    inputs[i] = in_refs[i].empty() ? Message{} : in_refs[i][0].get();   // 事件节点：绑定边预解析帧
                 }
                 return inputs;
               };
 
-              // ── 功能 2：execute + record_exec（耗时统计：execute 前后 steady_clock 计时 us，
+              // ── 功能 3：execute + record_exec（耗时统计：execute 前后 steady_clock 计时 us，
               //      不含输入打包/输出路由；按算法键（info.name）环形队列，expand_hp 重建保留不清）──
               auto execute_and_time = [this, sinfo, algo](std::vector<Message> &inputs) {
                 std::vector<Message> outputs(sinfo->output_ports.size());   // 输出按端口序预构造 array（算法按位置写）
@@ -918,14 +906,14 @@ namespace fins::rt {
                 return outputs;
               };
 
-              // ── 功能 3：路由输出（写预解析下游引用共享帧 + 有 loop 消费者才存历史槽）──
+              // ── 功能 4：路由输出（写预解析下游引用共享帧；字段有周期读者才存历史槽）──
               auto route_outputs = [this, sinfo, &out_refs](std::vector<Message> &outputs) {
                 for (size_t i = 0; i < outputs.size(); ++i) {
                   for (auto &e : out_refs[i])
                     e.get() = outputs[i];   // 写全部下游绑定边（生产者消费者共享帧）
                   const std::string &pn = sinfo->output_ports[i];
                   const auto cap_it = mesg_hist_cap.find(pn);   // 锁外执行：const 查找避 operator[] 并发写 UB
-                  if (cap_it != mesg_hist_cap.end() && cap_it->second > 0)   // 有 loop 消费者才存历史（cap>0）；record_mesg 满 cap 丢最旧
+                  if (cap_it != mesg_hist_cap.end() && cap_it->second > 0)   // 字段有周期读者才存历史（cap>0）；record_mesg 满 cap 丢最旧
                     record_mesg(pn, outputs[i]);
                 }
               };
@@ -935,41 +923,6 @@ namespace fins::rt {
               route_outputs(outputs);
             };
           });
-        }
-      }
-
-      // ── 段 3：hist 隐式依赖导出表（hist_export_；export_dag → hist_edges，独立于前序 edges）──
-      //  loop   ：consumer 依赖自身输出端口历史槽的前 win 帧（往前找 win 个更早实例；k=0 无更早帧不画）。
-      //  latest ：显式周期节点读 producer 输出端口“最新一帧”（队列长 1），锚 producer 末实例。
-      hist_export_.clear();
-      std::map<std::string, std::string> producer_of;   // 输出端口名 → producer 节点 id（单写者保证唯一）
-      for (const auto &info : nodes)
-        for (const auto &pn : info.output_ports)
-          if (!producer_of.count(pn)) producer_of[pn] = info.id;
-      for (const auto &info : nodes) {
-        const size_t n = node_count.at(info.id);
-        for (size_t k = 0; k < n; ++k) {
-          const std::string vtx = info.id + ":" + std::to_string(k);
-          for (const auto &[pn, win] : info.loop) {   // ① loop 自反馈：标注它实际依赖的历史帧
-            // “往前找 win 帧” = 本节点输出历史槽中该实例之前的最近 win 帧（同一超周期内为前 k 个实例；
-            // 跨超周期历史在本轮顶点集内不可见，不画）。k=0 首实例无更早帧 → 不画（也不画自环）。
-            const size_t mx = std::min<size_t>(win, k);
-            for (size_t w = 1; w <= mx; ++w)
-              hist_export_.push_back({{"from", info.id + ":" + std::to_string(k - w)},
-                                      {"to", vtx}, {"port", pn},
-                                      {"mode", "loop"}, {"win", win}});
-          }
-          if (info.period > 0) {   // ② 显式周期“最新一帧”读（非 loop 输入，且存在 producer）
-            for (const auto &pn : info.input_ports) {
-              if (info.loop.count(pn)) continue;
-              const auto pit = producer_of.find(pn);
-              if (pit == producer_of.end()) continue;
-              const size_t Np = node_count.at(pit->second);
-              hist_export_.push_back({{"from", pit->second + ":" + std::to_string(Np - 1)},
-                                      {"to", vtx}, {"port", pn},
-                                      {"mode", "latest"}, {"win", size_t(1)}});
-            }
-          }
         }
       }
     }
@@ -1082,7 +1035,7 @@ namespace fins::rt {
      *        于是周期任务只在真实周期锚点（起点+offset）释放——早排空自然空等到下一边界，不提前放
      *        下一拍；排空晚于边界（过载）时错过的整拍被跳过、对齐下一未来边界并告警（不累积漂移）。
      *        非周期（事件）任务不受影响：绑定前序完成即就绪即跑。tp job 实时读 hyper_start_ms →
-     *        自动对齐新起点；loop 数据槽跨周期保留不清；abs_deadline 由 update_abs_deadline 滚动
+     *        自动对齐新起点；字段历史窗口数据槽跨周期保留不清；abs_deadline 由 update_abs_deadline 滚动
      *        校正，非本函数职责。
      * @retval 无
      */
@@ -1305,7 +1258,6 @@ namespace fins::rt {
         });
       });
 
-      j["hist_edges"] = hist_export_;   // hist 隐式依赖（loop 自反馈 / 周期“最新一帧”读），与前序 edges 分开
       return j;
     }
   };
