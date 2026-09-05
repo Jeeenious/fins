@@ -163,7 +163,7 @@ namespace fins::rt {
     std::vector<std::string> output_ports;
     std::vector<nlohmann::json> config_cache;
 
-    std::map<std::string, size_t> hist;                     // hist 端口（显式周期节点输入）→ 窗口长度 N（>2，触发时读该字段缓存最近 N 帧；未声明 hist 的周期输入 = 标量读最新单帧）
+    std::map<std::string, size_t> hist;                     // hist 端口 → 窗口长度 N（触发时读该字段缓存最近 N 帧；语义合法性——键 ∈ inputs / 仅显式周期节点 / N>2——由 check_topology ④ 审查）
 
     /** @brief 逐节点自解析：全部结构校验 + 字段抽取（Pipeline::parse 只拆封顶层后逐个调用
      *  本构造器）。parameters 为**位置式取值表** config_cache——只取 p["value"]、名字丢弃
@@ -226,19 +226,13 @@ namespace fins::rt {
       if (n.contains("hist")) {
         if (!n["hist"].is_object())
           throw std::invalid_argument("[parse_dataflow] " + at + "hist 须为 object");
-        if (period <= 0.0)
-          throw std::invalid_argument("[parse_dataflow] " + at + "hist 仅允许显式周期节点（period>0）声明");
         for (const auto &[port, arg] : n["hist"].items()) {
           if (!arg.is_number())
             throw std::invalid_argument("[parse_dataflow] " + at + "hist." + port + " 须为 number（窗口长度 N）");
           const double d = arg.get<double>();   // 窗口长度 = 触发时读该字段缓存最近 N 帧
-          if (d != std::floor(d))
-            throw std::invalid_argument("[parse_dataflow] " + at + "hist." + port + " 须为整数窗口长度 N（收到 " + std::to_string(d) + "）");
-          if (d <= 2.0)
-            throw std::invalid_argument("[parse_dataflow] " + at + "hist." + port + " 窗口长度 N 须大于 2（真正多帧窗口；读最新单帧请勿声明 hist）");
-          if (std::find(input_ports.begin(), input_ports.end(), port) == input_ports.end())
-            throw std::invalid_argument("[parse_dataflow] " + at + "hist 端口 '" + port + "' 须在本节点 inputs 中声明");
-          hist[port] = static_cast<size_t>(d);
+          if (d < 1.0 || d != std::floor(d))
+            throw std::invalid_argument("[parse_dataflow] " + at + "hist." + port + " 须为正整数窗口长度 N（收到 " + std::to_string(d) + "）");
+          hist[port] = static_cast<size_t>(d);   // 语义合法性（键 ∈ inputs / 仅显式周期节点 / N>2）由 check_topology ④ 统一审查
         }
       }
     }
@@ -290,7 +284,11 @@ namespace fins::rt {
      *     expand_hp 绑定边对每个 producer 都建边、闭包读哪条取决于遍历顺序（不确定）；
      *  ② 源周期：无输入节点（input_ports 空）无上游驱动，须主动周期执行，必填 period；
      *  ③ 孤立输入：每个输入端口（含显式周期节点的窗口输入/自反馈字段）须有生产者；hist 指向无人
-     *     产出的字段 = 悬空窗口，同样拒绝（hist 合法性——仅显式周期节点、键 ⊆ inputs——解析期已校）。
+     *     产出的字段 = 悬空窗口，同样拒绝；
+     *  ④ hist 语义合法性（唯一审查点）：hist 键须在本节点 inputs 中、仅显式周期节点（period>0）可
+     *     声明、窗口长度 N>2；
+     *  ⑤ 数据驱动前序边无环：仅事件（period≤0）节点的非 hist 输入构成 producer→consumer 前序边，
+     *     该子图须无环——事件链互相喂会令调度永久挂起（pred_left 永不归零），故直接拒绝。
      * @retval 无（违反抛 std::invalid_argument）
      */
     void check_topology() const {
@@ -313,6 +311,61 @@ namespace fins::rt {
           if (!producers.count(pn))
             throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) +
                                         "] 输入端口 '" + pn + "' 无生产者（孤立输入），非法配置");
+      // ④ hist 语义合法性（唯一审查点）：hist 键须在本节点 inputs 中声明、所在节点须显式周期
+      //    （period>0）、窗口长度 N>2（N>2 = 真多帧窗口；读最新单帧请勿声明 hist）。NodeInfo 解析只
+      //    做结构校验，语义统一在此审查。
+      for (size_t i = 0; i < nodes.size(); ++i) {
+        if (nodes[i].hist.empty()) continue;
+        if (nodes[i].period <= 0)
+          throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) +
+                                      "] 声明 hist 须为显式周期节点（period>0）");
+        for (const auto &[pn, N] : nodes[i].hist) {
+          if (std::find(nodes[i].input_ports.begin(), nodes[i].input_ports.end(), pn) ==
+              nodes[i].input_ports.end())
+            throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) + "] hist 端口 '" + pn +
+                                        "' 须在本节点 inputs 中声明");
+          if (N <= 2)
+            throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) + "] hist 端口 '" + pn +
+                                        "' 窗口长度 N 须大于 2");
+        }
+      }
+      // ⑤ 数据驱动前序边无环：仅事件（period≤0）节点的输入端口构成 producer→consumer 前序边
+      //    （hist 输入 = 字段缓存窗口读，非前序边，排除在环检测外；周期节点输入同为缓存取样、
+      //    亦不构成前序边）。Kahn 拓扑检测残余 = 环（含依赖环而未归零的节点）→ 拒绝，避免调度
+      //    pred_left 永不归零而永久挂起。
+      {
+        std::vector<int> indeg(nodes.size(), 0);
+        std::vector<std::vector<size_t>> outs(nodes.size());   // producer idx → consumer idx
+        for (size_t c = 0; c < nodes.size(); ++c) {
+          if (nodes[c].period > 0) continue;                   // 周期节点输入为缓存取样，无前序边
+          for (const auto &pn : nodes[c].input_ports) {
+            if (nodes[c].hist.count(pn)) continue;             // 防御：hist 输入不是前序边
+            auto it = producers.find(pn);
+            if (it == producers.end()) continue;               // 无 producer（③ 已拒，防御）
+            for (const size_t p : it->second) { outs[p].push_back(c); ++indeg[c]; }   // 单写者 → 至多一条
+          }
+        }
+        std::vector<size_t> q;
+        for (size_t i = 0; i < nodes.size(); ++i)
+          if (indeg[i] == 0) q.push_back(i);
+        size_t seen = 0;
+        for (size_t h = 0; h < q.size(); ++h) {
+          ++seen;
+          for (const size_t c : outs[q[h]])
+            if (--indeg[c] == 0) q.push_back(c);
+        }
+        if (seen != nodes.size()) {
+          std::string ids;
+          bool first = true;
+          for (size_t i = 0; i < nodes.size(); ++i)
+            if (indeg[i] > 0) {
+              if (!first) ids += ", ";
+              ids += nodes[i].id;
+              first = false;
+            }
+          throw std::invalid_argument("[check_topology] 数据驱动前序边存在环（事件节点互相喂，无 hist），环内/依赖环的节点: " + ids);
+        }
+      }
     }
 
     /** @brief 取本 pipeline 引用的全部算法定位键（[name]:[version] 列表，与 Plugin::loaded_keys 同构），
