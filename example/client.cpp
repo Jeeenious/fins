@@ -37,6 +37,10 @@
 #define FINS_CAL_WCET 0                                         // 1 = rollover 用执行历史自整定 wcet
 #define FINS_WCET_METHOD fins::sched::WcetMethod::PQUANTILE     // 估计方法（HWM/PQUANTILE）
 
+#define FINS_ROLLOVER_LATE_REANCHOR 0   // 排空晚于边界（过载）时的翻页策略：
+                                        //   0 = 严格等下一拍：跳到下一未来网格边界（跳漏拍、空等、相位不漂移）
+                                        //   1 = 提前到这一拍：立刻以此刻为新起点重启（相位重置、无空闲空洞、之后按新节拍 now+j·H 跑）
+
 #define FINS_ALGO_LIB_PATH "./lib"   // 插件目录（可通过命令行参数覆盖）
 #define FINS_CLIENT_IP "0.0.0.0"     // orchestrator 上报端口（可通过命令行参数覆盖）
 #define FINS_CLIENT_PORT 18080
