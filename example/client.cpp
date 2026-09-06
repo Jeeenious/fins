@@ -196,16 +196,19 @@ int main(int argc, char **argv) {
         fins::util::trace_record(fins::util::TraceKind::TEMP_2, w->id);   // 结束（job 完成）
 #endif
 
-        graph_g.cv.notify_all();   // 有新增就绪才唤醒(叶子/无后继完成的完成不再空唤醒全池 → 减惊群与锁抖动)
+        graph_g.cv.notify_all();   // 本 job 完成可能释放新就绪 → 唤醒其他空转 worker 来取(多核并行)
 
 #ifdef FINS_EXPORT_TRACING_PATH
         fins::util::trace_record(fins::util::TraceKind::SLEEP, w->id);   // 结束（job 完成）
 #endif
 
-        return true;
+        continue;   // ★ 积压快路径：不回池重进(免 ThreadPool 再调 cb + 重新抢锁)，持锁回循环顶
+                    //   直接再 grab_ready_workload()——有积压立刻接着抓；只有 grab 取空(无积压)
+                    //   才落到下方 wait_for 睡觉。执行期已 unlock，其他 worker 仍可趁隙取任务，
+                    //   不损多核并行。返回 false 仅当 stopped。
       }
 
-      graph_g.cv.wait_for(lk, std::chrono::milliseconds(1));   // 等完成/回绕/expand_hp/停止（notify 快路径 + 1ms 超时兜底 lost wakeup）
+      graph_g.cv.wait_for(lk, std::chrono::milliseconds(1));   // 无积压才睡：等完成/回绕/expand_hp/停止（notify 快路径 + 1ms 超时兜底 lost wakeup）
     }
   });
   ThreadPool::instance().start(num_workers);
