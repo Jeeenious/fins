@@ -168,10 +168,6 @@ int main(int argc, char **argv) {
 
       if (auto w = graph_g.grab_ready_workload()) {
 
-#ifdef FINS_EXPORT_TRACING_PATH
-        fins::util::trace_record(fins::util::TraceKind::WAKE);   // 唤醒（含首轮 = 线程启动）
-#endif
-
         lk.unlock();
 
 #ifdef FINS_EXPORT_TRACING_PATH
@@ -186,21 +182,8 @@ int main(int argc, char **argv) {
 
         lk.lock();
 
-#ifdef FINS_EXPORT_TRACING_PATH
-        fins::util::trace_record(fins::util::TraceKind::TEMP_1, w->id);   // 结束（job 完成）
-#endif
-
-        graph_g.trigger_workload_ready(w->id);   // 回锁直做完成事件：置 done + 传播 pred_left + 入 ready
-
-#ifdef FINS_EXPORT_TRACING_PATH
-        fins::util::trace_record(fins::util::TraceKind::TEMP_2, w->id);   // 结束（job 完成）
-#endif
-
-        graph_g.cv.notify_all();   // 本 job 完成可能释放新就绪 → 唤醒其他空转 worker 来取(多核并行)
-
-#ifdef FINS_EXPORT_TRACING_PATH
-        fins::util::trace_record(fins::util::TraceKind::SLEEP, w->id);   // 结束（job 完成）
-#endif
+        if (graph_g.trigger_workload_ready(w->id))   // ★ 仅本完成新增了就绪才唤醒空闲 worker 帮忙(并行吃 batch)；叶子/无后继完成的完成不再空唤醒全池 → 减惊群
+          graph_g.cv.notify_all();
 
         continue;   // ★ 积压快路径：不回池重进(免 ThreadPool 再调 cb + 重新抢锁)，持锁回循环顶
                     //   直接再 grab_ready_workload()——有积压立刻接着抓；只有 grab 取空(无积压)
@@ -208,7 +191,17 @@ int main(int argc, char **argv) {
                     //   不损多核并行。返回 false 仅当 stopped。
       }
 
-      graph_g.cv.wait_for(lk, std::chrono::milliseconds(1));   // 无积压才睡：等完成/回绕/expand_hp/停止（notify 快路径 + 1ms 超时兜底 lost wakeup）
+#ifdef FINS_EXPORT_TRACING_PATH
+        fins::util::trace_record(fins::util::TraceKind::SLEEP);   // 空活入睡（无 tag = 空转等待）
+#endif
+
+        // grab 取空（无积压）→ 睡 1ms。★ 这里 w 是 if 初始化的 nullptr，**不可**解引用 w->id
+        graph_g.cv.wait_for(lk, std::chrono::milliseconds(100));   // 无积压才睡：等完成/回绕/expand_hp/停止（notify 快路径 + 1ms 超时兜底 lost wakeup）
+
+#ifdef FINS_EXPORT_TRACING_PATH
+        fins::util::trace_record(fins::util::TraceKind::WAKE);   // 空转醒来再查（无 tag）
+#endif
+
     }
   });
   ThreadPool::instance().start(num_workers);
@@ -228,10 +221,6 @@ int main(int argc, char **argv) {
     while (!graph_g.stopped.load()) {
       if (const auto tp = graph_g.grab_delay_workload()) {
 
-#ifdef FINS_EXPORT_TRACING_PATH
-        fins::util::trace_record(fins::util::TraceKind::WAKE, "timer");   // 结束（job 完成）
-#endif
-
         tl.unlock();
 
 #ifdef FINS_EXPORT_TRACING_PATH
@@ -244,17 +233,24 @@ int main(int argc, char **argv) {
         fins::util::trace_record(fins::util::TraceKind::FINISHED, "timer");   // 结束（job 完成）
 #endif
 
-        tl.lock();
-        graph_g.trigger_workload_ready(tp->id);   // 回锁直做完成事件：置 done + 传播 pred_left（释放后继 job 顶点）
-        graph_g.cv.notify_all();   // 有新增就绪才唤醒(空时间点不空唤醒)
+        tl.lock(); // 回锁直做完成事件：置 done + 传播 pred_left（释放后继 job 顶点）；返回是否新增就绪
+
+        if (graph_g.trigger_workload_ready(tp->id))   // ★ 仅 tp 释放确有新 job 就绪才唤醒 worker；空时间点/无后继不空唤醒
+          graph_g.cv.notify_all();
+
+        continue;
+      }
 
 #ifdef FINS_EXPORT_TRACING_PATH
         fins::util::trace_record(fins::util::TraceKind::SLEEP, "timer");   // 结束（job 完成）
 #endif
 
-        continue;
-      }
-      graph_g.cv.wait_for(tl, std::chrono::milliseconds(1));   // 无待释放时间点 → 等事件（notify 快路径 + 1ms 超时兜底 lost wakeup）
+      graph_g.cv.wait_for(tl, std::chrono::milliseconds(100));   // 无待释放时间点 → 等事件（notify 快路径 + 1ms 超时兜底 lost wakeup）
+
+#ifdef FINS_EXPORT_TRACING_PATH
+        fins::util::trace_record(fins::util::TraceKind::WAKE, "timer");   // 结束（job 完成）
+#endif
+
     }
   });
 
@@ -264,7 +260,6 @@ int main(int argc, char **argv) {
       if (graph_g.is_hp_done() && graph_g.pending.load()) {
 
 #ifdef FINS_EXPORT_TRACING_PATH
-        fins::util::trace_record(fins::util::TraceKind::WAKE, "main::expand");   // 唤醒（含首轮 = 线程启动）
         fins::util::trace_record(fins::util::TraceKind::RELEASE, "main::expand");   // 释放（取到 job）
 #endif
 
@@ -295,7 +290,7 @@ int main(int argc, char **argv) {
             if (!lib_keys.contains(key)) { ready = false; break; }
           if (!ready) {
             FINS_LOG_INFO("[agent] algo not ready, defer (pending kept, wait plugin load)");
-            graph_g.cv.wait_for(lk, std::chrono::milliseconds(500));   // 等热加载 notify 唤醒重试
+            graph_g.cv.wait_for(lk, std::chrono::milliseconds(100));   // 等热加载 notify 唤醒重试
             continue;   // 保留 pending，不丢弃配置
           }
         }
@@ -313,7 +308,6 @@ int main(int argc, char **argv) {
 
 #ifdef FINS_EXPORT_TRACING_PATH
         fins::util::trace_record(fins::util::TraceKind::FINISHED, "main::expand");   // 释放（取到 job）
-        fins::util::trace_record(fins::util::TraceKind::SLEEP, "main::expand");   // 释放（取到 job）
 #endif
 
         continue;
@@ -321,7 +315,6 @@ int main(int argc, char **argv) {
       if (!graph_g.is_hp_empty() && graph_g.is_hp_done()) {   // 有超周期才回绕（一次性图保持静止，防清 done_ 后 is_hp_done 变 false → 新配置永不 apply）
 
 #ifdef FINS_EXPORT_TRACING_PATH
-        fins::util::trace_record(fins::util::TraceKind::WAKE, "main::rollover");   // 唤醒（含首轮 = 线程启动
         fins::util::trace_record(fins::util::TraceKind::RELEASE, "main::rollover");   // 释放（取到 job）
 #endif
 
@@ -333,13 +326,19 @@ int main(int argc, char **argv) {
 
         graph_g.cv.notify_all();
 
-#ifdef FINS_EXPORT_TRACING_PATH
-        fins::util::trace_record(fins::util::TraceKind::SLEEP, "main::rollover");
-#endif
-
         continue;
       }
-      graph_g.cv.wait_for(lk, std::chrono::milliseconds(1));   // 纯事件等待（notify 快路径 + 1ms 超时兜底 lost wakeup）
+
+#ifdef FINS_EXPORT_TRACING_PATH
+      fins::util::trace_record(fins::util::TraceKind::SLEEP, "main::rollover");
+#endif
+
+      graph_g.cv.wait_for(lk, std::chrono::milliseconds(100));   // 纯事件等待（notify 快路径 + 1ms 超时兜底 lost wakeup）
+
+#ifdef FINS_EXPORT_TRACING_PATH
+      fins::util::trace_record(fins::util::TraceKind::WAKE, "main::rollover");   // 唤醒（含首轮 = 线程启动
+#endif
+
     }
   }
 

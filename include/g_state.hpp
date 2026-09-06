@@ -1225,15 +1225,18 @@ namespace fins::rt {
      *        全部前序（含 seq/绑定/tp 挂靠边）完成 = 就绪，非 tp 者入 ready_ 就绪集。job 完成与
      *        tp 释放（tp 是 job 顶点前序，挂靠边）走同一传播路径。
      * @param id 已完成顶点 id（job 顶点或 "tp:" 时间点顶点）
-     * @retval 无
+     * @retval bool 本完成是否**新入队了就绪后继**（≥1）——装配点据此决定是否 notify_all 唤醒空闲
+     *         worker：只有新增就绪才值得唤醒（空闲 worker 仅在就绪堆为空时存在；叶子/无后继的
+     *         完成不新增 → 不空唤醒全池，减惊群与锁抖动）。
      */
     std::unordered_map<std::string, uint64_t> done_;   // 顶点 id → 完成世代号（世代化 clear：rollover O(1) 重置，免释放节点）
     uint64_t done_gen_{0};                              // 当前世代号（rollover/expand 递增；done_[id]==gen ⇒ 本世代已完成）
     size_t done_count_{0};                              // 本世代已完成顶点数（is_hp_done 用；rollover 归零）
-    void trigger_workload_ready(const std::string &id) {
+    bool trigger_workload_ready(const std::string &id) {
+      bool enqueued = false;
       {   // 幂等防御（世代化 done_：本世代已完成 → 跳过；正常每顶点每超周期恰完成一次）
         auto it = done_.find(id);
-        if (it != done_.end() && it->second == done_gen_) return;
+        if (it != done_.end() && it->second == done_gen_) return false;   // 本代已处理过 → 无新增
         if (it == done_.end()) done_.emplace(id, done_gen_);
         else it->second = done_gen_;
         ++done_count_;
@@ -1242,9 +1245,12 @@ namespace fins::rt {
       for (const auto &s : dag.out_nodes(id)) {
         auto it = pred_left_.find(s);
         if (it == pred_left_.end() || it->second == 0) continue;   // 未知/已就绪 → 跳过（防重复递减）
-        if (--it->second == 0 && s.rfind("tp:", 0) != 0)   // 减到 0 = 恰好一次就绪
+        if (--it->second == 0 && s.rfind("tp:", 0) != 0) {   // 减到 0 = 恰好一次就绪
           ready_.push({s, ready_seq_++, 0});   // 推刚就绪的后继 s（勿推已完成前序 id）
+          enqueued = true;
+        }
       }
+      return enqueued;
     }
 
   private:
