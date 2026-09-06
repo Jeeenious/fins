@@ -542,10 +542,13 @@ namespace fins::rt {
       }
     }
 
-    /** @brief ② 超周期：lcm(全部显式周期节点 period)（无周期节点 → 返回 0 不回绕）。
-     *  整数毫秒 lcm（std::lcm）：period 就近取整为整数毫秒后参与整数 lcm——gcd 恒整数，无浮点
-     *  病态（旧 T+0.5 hack 会静默算错：lcm(1,100.5)=201 而非 100）。非整数毫秒 period 不拒绝，
-     *  FINS_LOG_WARN 提示后就近取整继续（周期小数毫秒按整数毫秒近似，实例数可能偏差，预警）。
+    /** @brief ② 超周期：全部显式周期节点的有理最小公倍（无周期节点 → 返回 0 不回绕）。
+     *  **不做整数毫秒取整**：保留 period 实值（如 12.5/14.2857 = 100/n 这类 100 的精确子因子），
+     *  从最大周期起步找能整除全部周期的最小公共周期 H = k·Tmax（判 H/T_i 近整数，浮点容差）。
+     *  llround 会把 12.5→13、破坏 100 的整除关系，虚增超周期（12.5 本整除 100）→ 图永排不空 →
+     *  is_hp_done 永不成立 → rollover 永不触发，故弃用整数 lcm。整除判定用容差吸收 T 的浮点
+     *  表示误差；k 达上限仍不能整除（周期实质不可通约/病态）→ **警告**并回退整数毫秒 lcm
+     *  （保守公共倍数，仍是合法超周期，仅可能偏大）。
      * @param nodes 解析态节点表（只读；只统计 info.period > 0 的节点）
      * @retval double 超周期长度（ms）；无周期节点返回 0
      */
@@ -1095,7 +1098,7 @@ namespace fins::rt {
     void rollover_hp() {
       // 超周期起点推进到绝对网格上的下一未来边界（ceil(delta/H)·H；delta=距本拍起点已过 ms）。
       // 早完工（delta<H）→ +H：下一边界在完工之后，tp 睡到边界才放 → 周期任务不提前释放；
-      // 过载（delta≥H）→ 跳过已错过的整拍、对齐 >now 的边界；k=1 正常，k≥2 告警跳过拍数。
+      // 过载（delta≥H）→ 见下：默认严格等下一拍；FINS_ROLLOVER_LATE_REANCHOR=1 时提前到这一拍。
       const double hp_ = hyper_period_ms;
       if (hp_ > 0.0) {
         const double delta = fins::util::now_ms() - hyper_start_ms;
@@ -1105,9 +1108,23 @@ namespace fins::rt {
           k = std::floor(d);
           if (d > k) k += 1.0;
         }
+#if FINS_ROLLOVER_LATE_REANCHOR
+        // 过载（k≥2，排空晚于边界）→ “提前到这一拍”：不以完工时刻跳往未来边界空等，而是立刻以
+        // “此刻”为新起点重启一拍（相位重置到完工时刻），之后按新节拍 now+j·H 继续——不漏掉空闲
+        // 空洞、流水不断；代价是每次过载相位相对原绝对网格漂移一次。早完工（k==1）仍对齐下一拍。
+        if (k >= 2.0) {
+          FINS_LOG_WARN("[rollover_hp] 超周期过载：排空晚于边界，提前到这一拍（此刻重锚，跳过 {} 个漏拍，新起点 {:.1f}ms）",
+                        (long long)(k - 1.0), delta);
+          hyper_start_ms = fins::util::now_ms();         // 相位重置到“这一拍”完工时刻
+        } else {
+          hyper_start_ms += hp_;                         // 未过载：仍严格等下一拍
+        }
+#else
+        // 过载 → “严格等下一拍”：跳过已错过的整拍、对齐下一未来网格边界（相位不漂移，但空等 + 丢拍）
         if (k >= 2.0)
           FINS_LOG_WARN("[rollover_hp] 超周期过载：排空晚于边界，跳过 {} 个释放拍，下一边界对齐 {:.1f}ms", (long long)(k - 1.0), hyper_start_ms + k * hp_);
         hyper_start_ms += k * hp_;
+#endif
       } else {
         hyper_start_ms = fins::util::now_ms();           // 无显式周期（理论上不进回绕）保持旧行为
       }
