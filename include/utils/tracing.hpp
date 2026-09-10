@@ -42,12 +42,10 @@ namespace fins::util {
     WAKE      = 0,        // 唤醒
     RELEASE   = 1,        // 释放（job 取到）
     EXECUTE   = 2,        // 执行（job 开始）
-    COMPLETE  = 3,        // 结束（job 完成）
-    FINISHED  = 4,        // 完成（job 完成，置 done + 传播 pred_left + 入 ready）
-    SLEEP     = 5,        // 休眠（进 cv.wait）
-
-    TEMP_1 = 6,
-    TEMP_2 = 7,
+    WORKING   = 3,
+    COMPLETE  = 4,        // 结束（job 完成）
+    FINISHED  = 5,        // 完成（job 完成，置 done + 传播 pred_left + 入 ready）
+    SLEEP     = 6,        // 休眠（进 cv.wait）
   };
 
   inline const char *trace_kind_name(TraceKind k) {
@@ -55,12 +53,10 @@ namespace fins::util {
       case TraceKind::WAKE:      return "wake";
       case TraceKind::RELEASE:   return "release";
       case TraceKind::EXECUTE:   return "execute";
+      case TraceKind::WORKING:   return "working";
       case TraceKind::COMPLETE:  return "complete";
       case TraceKind::FINISHED:  return "finished";
-      case TraceKind::SLEEP:     return "sleep";
-      case TraceKind::TEMP_1:    return "temp_1";
-      case TraceKind::TEMP_2:    return "temp_2";
-    }
+      case TraceKind::SLEEP:     return "sleep";   }
     return "?";
   }
 

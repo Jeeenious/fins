@@ -29,7 +29,7 @@
 #include <condition_variable>
 #include <deque>
 #include <dlfcn.h>
-#include <fstream>   // FINS_EXPORT_DAG_PATH 导出 dag JSON 用
+#include <fstream> // FINS_EXPORT_DAG_PATH 导出 dag JSON 用
 #include <functional>
 #include <map>
 #include <memory>
@@ -37,9 +37,9 @@
 #include <numeric>
 #include <set>
 #include <stdexcept>
-#include <unordered_map>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "algo/algo_base.hpp"
@@ -62,16 +62,17 @@ namespace fins::rt {
   inline std::function<double(std::deque<double>)> wcet_updater = nullptr;
   /// 外部回调槽（命名空间级 inline，装配点直接赋值注入；优先级唯一来源：键函数 → 顶点调度优先级，
   /// grab 决策点现算；nullptr = 就绪堆退化为纯 FIFO——优先级不可预设，须经此函数拿到）。
-  inline std::function<int(util::DirectedAcyclicGraph<Workload, Message>&, const Workload&)> priority_updater = nullptr;
+  inline std::function<int(util::DirectedAcyclicGraph<Workload, Message> &, const Workload &)> priority_updater =
+      nullptr;
   /// 外部回调槽（求makespan）ms
-  inline std::function<double(util::DirectedAcyclicGraph<Workload, Message>&)> makespan_updater = nullptr;
+  inline std::function<double(util::DirectedAcyclicGraph<Workload, Message> &)> makespan_updater = nullptr;
 
   /** @brief .so 加载上下文（library_g.so_ctx 的元素）：构造=dlopen 装载 + dlsym 解析 C 工厂符号并
    *  填 loaded_keys，析构=dlclose 卸载，take_keys() 取定位键；装配点经 on_library_* 回调维护表。 */
   struct Plugin {
     void *handle = nullptr;
     std::string so_path;
-    std::vector<std::string> loaded_keys;  // 本 so 产出的算法 key（删除时按 so 取走）
+    std::vector<std::string> loaded_keys; // 本 so 产出的算法 key（删除时按 so 取走）
 
     typedef void (*DestroyPluginFunc)(AlgoBase *);
     typedef int (*GetPluginCountFunc)();
@@ -93,10 +94,11 @@ namespace fins::rt {
      *  "Missing required C-symbols"；已开的 handle 在 catch 内 dlclose 清理，
      *  构造抛 → 析构不调用 → 防泄漏）
      */
-    explicit Plugin(const std::string &path)  {
+    explicit Plugin(const std::string &path) {
       so_path = path;
       handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-      if (!handle) throw std::runtime_error(dlerror());
+      if (!handle)
+        throw std::runtime_error(dlerror());
       try {
         destroy_plugin = (DestroyPluginFunc) dlsym(handle, "destroy_plugin");
         get_plugin_count = (GetPluginCountFunc) dlsym(handle, "get_plugin_count");
@@ -112,7 +114,8 @@ namespace fins::rt {
         for (int i = 0; i < count; ++i)
           loaded_keys.emplace_back(std::string(get_algo_name(i)) + ":" + get_algo_version(i));
       } catch (...) {
-        if (handle) dlclose(handle);   // 构造失败清理，防 handle 泄漏（构造抛 → 析构不调用）
+        if (handle)
+          dlclose(handle); // 构造失败清理，防 handle 泄漏（构造抛 → 析构不调用）
         handle = nullptr;
         throw;
       }
@@ -122,7 +125,11 @@ namespace fins::rt {
      *  shared_ptr<Plugin> 保活，实例未全销毁期间库不卸载（保活语义见 expand_hp()）。
      * @retval 无
      */
-    ~Plugin() { if (handle) dlclose(handle); handle = nullptr; }
+    ~Plugin() {
+      if (handle)
+        dlclose(handle);
+      handle = nullptr;
+    }
 
     /** @brief 取走并清空本 so 的算法定位键（删除/替换路径装配点调用——析构不能返回值，
      *  单独保留供删除时回收 [name:version] 定位键）。
@@ -131,7 +138,7 @@ namespace fins::rt {
     std::vector<std::string> take_keys() { return std::move(loaded_keys); }
   };
   /** @brief so 上下文表（library_g）：[so_path] → Plugin，唯一算法定位数据源；装配点回调维护。 */
-  struct Library{
+  struct Library {
     util::TBBMap<std::shared_ptr<Plugin>> so_ctx;
 
     /** @brief 取全部已注册算法定位键（[name]:[version]，跨所有 so 的 loaded_keys 聚合去重），
@@ -141,7 +148,7 @@ namespace fins::rt {
     [[nodiscard]] std::set<std::string> algo_keys() const {
       std::set<std::string> keys;
       for (const auto &val: so_ctx | std::views::values)
-        for (const auto &k : val->loaded_keys)
+        for (const auto &k: val->loaded_keys)
           keys.insert(k);
       return keys;
     }
@@ -151,19 +158,20 @@ namespace fins::rt {
   /** @brief 节点解析态（Pipeline 内嵌，parse_pipeline 产物）：纯数据，字段含 id/name/version、
    *  端口名数组、config_cache、hist、period/wcet/deadline。 */
   struct NodeInfo {
-    std::string id;                                      // 节点在图中的唯一标识（顶点名 id:{k} 前缀）
-    std::string name;                                    // 算法名（[name:version] = so 表定位键）
-    std::string version;                                 // 算法版本（定位键）
+    std::string id; // 节点在图中的唯一标识（顶点名 id:{k} 前缀）
+    std::string name; // 算法名（[name:version] = so 表定位键）
+    std::string version; // 算法版本（定位键）
 
-    double period{0};                                    // 执行周期（ms；0 = 未配置，走支配继承）
-    double deadline{1};                                  // 相对截止期（ms；缺省已折成 wcet）
-    double wcet{1};                                      // 最坏执行时间（ms；缺省 1）
+    double period{0}; // 执行周期（ms；0 = 未配置，走支配继承）
+    double deadline{1}; // 相对截止期（ms；缺省已折成 wcet）
+    double wcet{1}; // 最坏执行时间（ms；缺省 1）
 
     std::vector<std::string> input_ports;
     std::vector<std::string> output_ports;
     std::vector<nlohmann::json> config_cache;
 
-    std::map<std::string, size_t> hist;                     // hist 端口 → 窗口长度 N（触发时读该字段缓存最近 N 帧；语义合法性——键 ∈ inputs / 仅显式周期节点 / N>2——由 check_topology ④ 审查）
+    std::map<std::string, size_t> hist; // hist 端口 → 窗口长度 N（触发时读该字段缓存最近 N 帧；语义合法性——键 ∈ inputs
+                                        // / 仅显式周期节点 / N>2——由 check_topology ④ 审查）
 
     /** @brief 逐节点自解析：全部结构校验 + 字段抽取（Pipeline::parse 只拆封顶层后逐个调用
      *  本构造器）。parameters 为**位置式取值表** config_cache——只取 p["value"]、名字丢弃
@@ -174,7 +182,8 @@ namespace fins::rt {
      * @retval 无（格式违反抛 std::invalid_argument）
      */
     NodeInfo(const nlohmann::json &n, const std::string &at) {
-      if (!n.is_object()) throw std::invalid_argument("[parse_dataflow] " + at + "须为对象");
+      if (!n.is_object())
+        throw std::invalid_argument("[parse_dataflow] " + at + "须为对象");
       if (!n.contains("name") || !n["name"].is_string())
         throw std::invalid_argument("[parse_dataflow] " + at + "name 必填 string");
       if (!n.contains("version") || !n["version"].is_string())
@@ -188,23 +197,22 @@ namespace fins::rt {
         for (size_t j = 0; j < n["parameters"].size(); ++j) {
           const auto &p = n["parameters"][j];
           if (!p.is_object() || !p.contains("value"))
-            throw std::invalid_argument(
-                "[parse_dataflow] " + at + "parameters[" + std::to_string(j) + "] 须含 value");
-          config_cache.push_back(p["value"]);   // 位置式值表（名字丢弃，顺序保留）
+            throw std::invalid_argument("[parse_dataflow] " + at + "parameters[" + std::to_string(j) + "] 须含 value");
+          config_cache.push_back(p["value"]); // 位置式值表（名字丢弃，顺序保留）
         }
       }
       // 端口名数组：inputs/outputs 为 string 数组（顺序 = AlgoFunc 参数顺序），同名端口直连
-      for (const char *f : {"inputs", "outputs"}) {
-        if (!n.contains(f)) continue;
+      for (const char *f: {"inputs", "outputs"}) {
+        if (!n.contains(f))
+          continue;
         if (!n[f].is_array())
           throw std::invalid_argument("[parse_dataflow] " + at + f + " 须为 string 数组");
         for (size_t j = 0; j < n[f].size(); ++j)
           if (!n[f][j].is_string())
-            throw std::invalid_argument(
-                "[parse_dataflow] " + at + std::string(f) + "[" + std::to_string(j) +
-                "] 元素须为 string（端口名）");
+            throw std::invalid_argument("[parse_dataflow] " + at + std::string(f) + "[" + std::to_string(j) +
+                                        "] 元素须为 string（端口名）");
       }
-      for (const char *f : {"wcet", "deadline", "period", "cap"}) {
+      for (const char *f: {"wcet", "deadline", "period", "cap"}) {
         if (n.contains(f) && !n[f].is_number())
           throw std::invalid_argument("[parse_dataflow] " + at + f + " 须为 number");
       }
@@ -212,12 +220,12 @@ namespace fins::rt {
       // （本构造器只做逐节点 json 格式校验，不查跨节点图结构）。
 
       // ── 字段抽取（图侧/运行时不再接触原始 JSON）──
-      id       = n["id"].get<std::string>();
-      name     = n["name"].get<std::string>();
-      version  = n["version"].get<std::string>();
-      period   = n.contains("period")   ? n["period"].get<double>()   : 0.0;
-      wcet     = n.contains("wcet")     ? n["wcet"].get<double>()     : 1.0;
-      deadline = n.contains("deadline") ? n["deadline"].get<double>() : period;  // 缺省 = period
+      id = n["id"].get<std::string>();
+      name = n["name"].get<std::string>();
+      version = n["version"].get<std::string>();
+      period = n.contains("period") ? n["period"].get<double>() : 0.0;
+      wcet = n.contains("wcet") ? n["wcet"].get<double>() : 1.0;
+      deadline = n.contains("deadline") ? n["deadline"].get<double>() : period; // 缺省 = period
 
       if (n.contains("inputs") && n["inputs"].is_array())
         input_ports = n["inputs"].get<std::vector<std::string>>();
@@ -226,13 +234,15 @@ namespace fins::rt {
       if (n.contains("hist")) {
         if (!n["hist"].is_object())
           throw std::invalid_argument("[parse_dataflow] " + at + "hist 须为 object");
-        for (const auto &[port, arg] : n["hist"].items()) {
+        for (const auto &[port, arg]: n["hist"].items()) {
           if (!arg.is_number())
             throw std::invalid_argument("[parse_dataflow] " + at + "hist." + port + " 须为 number（窗口长度 N）");
-          const double d = arg.get<double>();   // 窗口长度 = 触发时读该字段缓存最近 N 帧
+          const double d = arg.get<double>(); // 窗口长度 = 触发时读该字段缓存最近 N 帧
           if (d < 1.0 || d != std::floor(d))
-            throw std::invalid_argument("[parse_dataflow] " + at + "hist." + port + " 须为正整数窗口长度 N（收到 " + std::to_string(d) + "）");
-          hist[port] = static_cast<size_t>(d);   // 语义合法性（键 ∈ inputs / 仅显式周期节点 / N>2）由 check_topology ④ 统一审查
+            throw std::invalid_argument("[parse_dataflow] " + at + "hist." + port + " 须为正整数窗口长度 N（收到 " +
+                                        std::to_string(d) + "）");
+          hist[port] =
+              static_cast<size_t>(d); // 语义合法性（键 ∈ inputs / 仅显式周期节点 / N>2）由 check_topology ④ 统一审查
         }
       }
     }
@@ -240,7 +250,8 @@ namespace fins::rt {
   /** @brief Pipeline — dataflow 配置（解析态；全局单份 pipeline_g）：cache = 原始配置 JSON 双缓冲
    *  （RPC 写缓冲份不解析 → pending → 主线程调度循环图静止时 commit + parse_pipeline 填 nodes），
    *  标准形式 = 节点对象数组（name/version/id 必填 + parameters/inputs/outputs/wcet/deadline/period/
-   *  hist 可选），违反抛 std::invalid_argument；显式周期节点输入经 message_hist_ 字段缓存取样（hist 窗口/最新标量）。 */
+   *  hist 可选），违反抛 std::invalid_argument；显式周期节点输入经 message_hist_ 字段缓存取样（hist 窗口/最新标量）。
+   */
   struct Pipeline {
     /// 原始数据
     util::DoubleBuff<nlohmann::json> cache;
@@ -259,7 +270,8 @@ namespace fins::rt {
     void parse_pipeline(const nlohmann::json &script) {
       nodes.clear();
       std::vector<nlohmann::json> raw_nodes;
-      if (script.is_null()) return;   // 空配置 → 空表（expand_hp() 幂等）
+      if (script.is_null())
+        return; // 空配置 → 空表（expand_hp() 幂等）
       if (script.is_array()) {
         raw_nodes = script.get<std::vector<nlohmann::json>>();
       } else if (script.is_object() && script.contains("nodes") && script["nodes"].is_array()) {
@@ -267,8 +279,7 @@ namespace fins::rt {
       } else if (script.is_object() && script.contains("name")) {
         raw_nodes.push_back(script);
       } else {
-        throw std::invalid_argument(
-            "[parse_dataflow] dataflow 顶层须为 array / {nodes:[...]} / 单节点对象");
+        throw std::invalid_argument("[parse_dataflow] dataflow 顶层须为 array / {nodes:[...]} / 单节点对象");
       }
 
       // 拆封到若干 NodeInfo 各自完成解析（构造器自解析：格式校验 + 字段抽取 + config_cache 取值表）。
@@ -294,9 +305,9 @@ namespace fins::rt {
     void check_topology() const {
       std::map<std::string, std::vector<size_t>> producers;
       for (size_t i = 0; i < nodes.size(); ++i)
-        for (const auto &pn : nodes[i].output_ports)
+        for (const auto &pn: nodes[i].output_ports)
           producers[pn].push_back(i);
-      for (const auto &[P, ps] : producers)
+      for (const auto &[P, ps]: producers)
         if (ps.size() > 1)
           throw std::invalid_argument("[check_topology] 输出端口 '" + P + "' 有多个生产者（单写者约束），非法配置");
       for (size_t i = 0; i < nodes.size(); ++i)
@@ -307,21 +318,21 @@ namespace fins::rt {
       //    永不重放，还会让周期兄弟因它永不完成而无法翻页）。周期节点自反馈（hist 字段 = 自身输出）
       //    经自身 output 入 producers 而通过；hist 指向无人产出的字段 = 悬空窗口 → 拒绝。
       for (size_t i = 0; i < nodes.size(); ++i)
-        for (const auto &pn : nodes[i].input_ports)
+        for (const auto &pn: nodes[i].input_ports)
           if (!producers.count(pn))
-            throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) +
-                                        "] 输入端口 '" + pn + "' 无生产者（孤立输入），非法配置");
+            throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) + "] 输入端口 '" + pn +
+                                        "' 无生产者（孤立输入），非法配置");
       // ④ hist 语义合法性（唯一审查点）：hist 键须在本节点 inputs 中声明、所在节点须显式周期
       //    （period>0）、窗口长度 N>2（N>2 = 真多帧窗口；读最新单帧请勿声明 hist）。NodeInfo 解析只
       //    做结构校验，语义统一在此审查。
       for (size_t i = 0; i < nodes.size(); ++i) {
-        if (nodes[i].hist.empty()) continue;
+        if (nodes[i].hist.empty())
+          continue;
         if (nodes[i].period <= 0)
           throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) +
                                       "] 声明 hist 须为显式周期节点（period>0）");
-        for (const auto &[pn, N] : nodes[i].hist) {
-          if (std::find(nodes[i].input_ports.begin(), nodes[i].input_ports.end(), pn) ==
-              nodes[i].input_ports.end())
+        for (const auto &[pn, N]: nodes[i].hist) {
+          if (std::find(nodes[i].input_ports.begin(), nodes[i].input_ports.end(), pn) == nodes[i].input_ports.end())
             throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) + "] hist 端口 '" + pn +
                                         "' 须在本节点 inputs 中声明");
           if (N <= 2)
@@ -335,35 +346,45 @@ namespace fins::rt {
       //    pred_left 永不归零而永久挂起。
       {
         std::vector<int> indeg(nodes.size(), 0);
-        std::vector<std::vector<size_t>> outs(nodes.size());   // producer idx → consumer idx
+        std::vector<std::vector<size_t>> outs(nodes.size()); // producer idx → consumer idx
         for (size_t c = 0; c < nodes.size(); ++c) {
-          if (nodes[c].period > 0) continue;                   // 周期节点输入为缓存取样，无前序边
-          for (const auto &pn : nodes[c].input_ports) {
-            if (nodes[c].hist.count(pn)) continue;             // 防御：hist 输入不是前序边
+          if (nodes[c].period > 0)
+            continue; // 周期节点输入为缓存取样，无前序边
+          for (const auto &pn: nodes[c].input_ports) {
+            if (nodes[c].hist.count(pn))
+              continue; // 防御：hist 输入不是前序边
             auto it = producers.find(pn);
-            if (it == producers.end()) continue;               // 无 producer（③ 已拒，防御）
-            for (const size_t p : it->second) { outs[p].push_back(c); ++indeg[c]; }   // 单写者 → 至多一条
+            if (it == producers.end())
+              continue; // 无 producer（③ 已拒，防御）
+            for (const size_t p: it->second) {
+              outs[p].push_back(c);
+              ++indeg[c];
+            } // 单写者 → 至多一条
           }
         }
         std::vector<size_t> q;
         for (size_t i = 0; i < nodes.size(); ++i)
-          if (indeg[i] == 0) q.push_back(i);
+          if (indeg[i] == 0)
+            q.push_back(i);
         size_t seen = 0;
         for (size_t h = 0; h < q.size(); ++h) {
           ++seen;
-          for (const size_t c : outs[q[h]])
-            if (--indeg[c] == 0) q.push_back(c);
+          for (const size_t c: outs[q[h]])
+            if (--indeg[c] == 0)
+              q.push_back(c);
         }
         if (seen != nodes.size()) {
           std::string ids;
           bool first = true;
           for (size_t i = 0; i < nodes.size(); ++i)
             if (indeg[i] > 0) {
-              if (!first) ids += ", ";
+              if (!first)
+                ids += ", ";
               ids += nodes[i].id;
               first = false;
             }
-          throw std::invalid_argument("[check_topology] 数据驱动前序边存在环（事件节点互相喂，无 hist），环内/依赖环的节点: " + ids);
+          throw std::invalid_argument(
+              "[check_topology] 数据驱动前序边存在环（事件节点互相喂，无 hist），环内/依赖环的节点: " + ids);
         }
       }
     }
@@ -377,7 +398,7 @@ namespace fins::rt {
     [[nodiscard]] std::vector<std::string> algo_keys() const {
       std::vector<std::string> keys;
       keys.reserve(nodes.size());
-      for (const auto &node : nodes)
+      for (const auto &node: nodes)
         keys.emplace_back(node.name + ":" + node.version);
       return keys;
     }
@@ -385,6 +406,7 @@ namespace fins::rt {
   private:
     /// RPC 并发写 cache.write() 的串行锁（wr_lock() 返回；装配点 lock_guard 持用）。
     std::mutex wr_mtx_;
+
   public:
     /** @brief RPC 写入端串行锁访问：多 /update 并发写 pipeline_g.cache.write() JSON 份不撕裂；
      *  main/worker 侧（commit/read 消费）不持本锁。装配点 handler 用法：
@@ -400,23 +422,24 @@ namespace fins::rt {
    *  优先级不预设：就绪堆排序键由装配点注入的 priority_updater 键函数 grab 前现算（唯一来源；
    *  未注入 → 退化为纯 FIFO），图侧不存储静态优先级。 */
   struct Workload {
-    std::string id{};             // 顶点名（格式 {节点id}:{k}，如 cam:0/cam:1）——expand_hp ⑥ 建顶点时填 vtx（同 dag 的 map 键）；
-    std::string name{};           // 节点名（来自 Pipeline::NodeInfo.name；区别于 id 顶点名 = {name}:{k}）——装配点/测试按节点名识别
-    size_t k{0};                  // 超周期内实例序号（expand_hp ⑥ 建顶点填；update_abs_deadline 滚动校正用）
+    std::string id{}; // 顶点名（格式 {节点id}:{k}，如 cam:0/cam:1）——expand_hp ⑥ 建顶点时填 vtx（同 dag 的 map 键）；
+    std::string
+        name{}; // 节点名（来自 Pipeline::NodeInfo.name；区别于 id 顶点名 = {name}:{k}）——装配点/测试按节点名识别
+    size_t k{0}; // 超周期内实例序号（expand_hp ⑥ 建顶点填；update_abs_deadline 滚动校正用）
 
     double period{0};
-    double deadline{1};           // 相对截止期（ms；缺省 = wcet）
+    double deadline{1}; // 相对截止期（ms；缺省 = wcet）
 
-    double ddl{0};                // 绝对截止期（ms；滚动排期 = 主线程事件驱动 update_abs_deadline 按当前
-    double wcet{1};               // 最坏执行时间（ms；缺省 1）
+    double ddl{0}; // 绝对截止期（ms；滚动排期 = 主线程事件驱动 update_abs_deadline 按当前
+    double wcet{1}; // 最坏执行时间（ms；缺省 1）
 
-    std::function<void()> job;    // 执行体（闭包捕获实例 + 预解析绑定边引用，运行时零查找取帧/发布）
+    std::function<void()> job; // 执行体（闭包捕获实例 + 预解析绑定边引用，运行时零查找取帧/发布）
   };
 
   /// 一次 execute 耗时样本（exec_us_hist_ 元素）：us 用时 + 完成时间戳（排序键，保留最新）
   struct ExecSample {
-    double us{0};                 // 执行耗时（us）
-    double ts{0};                 // 完成时间戳（util::now_us；队列按 ts 升序）
+    double us{0}; // 执行耗时（us）
+    double ts{0}; // 完成时间戳（util::now_us；队列按 ts 升序）
   };
 
   /** @brief PrecedenceGraph — 数据流图 + 调度依据（单份运行图 graph_g）。公开成员 = 调度状态
@@ -428,32 +451,37 @@ namespace fins::rt {
   struct PrecedenceGraph {
     // ── public：图数据 + 无锁原语（方法不碰锁，前提调用方持 mtx；带锁事务在装配点
     //    on_execute 回调 / 主线程调度循环）──
-    util::DirectedAcyclicGraph<Workload, Message> dag;  // 顶点带权、边=Message 槽
+    util::DirectedAcyclicGraph<Workload, Message> dag; // 顶点带权、边=Message 槽
 
-    double hyper_period_ms{0};       // 超周期长度（ms）
-    double hyper_start_ms{0};        // 当前超周期起点（ms；expand 初始化 = 当前真实时钟、rollover_hp 回绕更新 = 当前真实时钟）
-    uint64_t graph_version{0};       // 图结构版本号（expand_hp 重建后 ++；main 线程持 mtx 写读）。
+    double hyper_period_ms{0}; // 超周期长度（ms）
+    double hyper_start_ms{0}; // 当前超周期起点（ms；expand 初始化 = 当前真实时钟、rollover_hp 回绕更新 = 当前真实时钟）
+    uint64_t graph_version{0}; // 图结构版本号（expand_hp 重建后 ++；main 线程持 mtx 写读）。
 
     /** @brief 记录一帧到历史滑动窗口数据槽（满丢最旧；TBBMap accessor 按端口锁，只锁本端口
-     *  历史槽字段）。历史槽 = 显式周期节点取样的 producer 输出字段缓存（hist 窗口/最新标量；容量 mesg_hist_cap = 读者 max（hist N 或 1））。
-     *  追加按 Message.timestamp（采集时间戳，pub 时置 now_us）升序插入，队列恒按时间有序，尽量
+     *  历史槽字段）。历史槽 = 显式周期节点取样的 producer 输出字段缓存（hist 窗口/最新标量；容量 mesg_hist_cap = 读者
+     * max（hist N 或 1））。 追加按 Message.timestamp（采集时间戳，pub 时置 now_us）升序插入，队列恒按时间有序，尽量
      *  保留最新数据——乱序完成的旧帧插到前面、满 cap 丢最旧（ts 最小）。
      * @param id 输出端口名（历史槽键）
      * @param mesg 数据帧（Message）
      * @retval 无
      */
-    void record_mesg(const std::string &id, const Message& mesg) {
-      TBBMAP_UPDATE(message_hist_, id, [&](auto &q) {   // 无则默认构造插入、有则定位（持写锁，仅本端口）
-        const size_t cap = mesg_hist_cap.count(id) ? mesg_hist_cap.at(id) : 100;  // 缺省 100（同 record_exec；勿 operator[]→0，否则 pop_front 空 deque = UB）
+    void record_mesg(const std::string &id, const Message &mesg) {
+      TBBMAP_UPDATE(message_hist_, id, [&](auto &q) { // 无则默认构造插入、有则定位（持写锁，仅本端口）
+        const size_t cap = mesg_hist_cap.count(id)
+                               ? mesg_hist_cap.at(id)
+                               : 100; // 缺省 100（同 record_exec；勿 operator[]→0，否则 pop_front 空 deque = UB）
         // 按采集时间戳升序插入（乱序完成的旧帧放前面）；满 cap 从最旧（ts 最小）丢，保留最新。
         const auto it = std::lower_bound(q.begin(), q.end(), mesg,
-            [](const Message &a, const Message &b) { return a.timestamp < b.timestamp; });
+                                         [](const Message &a, const Message &b) { return a.timestamp < b.timestamp; });
         q.insert(it, mesg);
-        while (q.size() > cap) q.pop_front();  // 满丢最旧（cap 运行时只读，调用方已 guard >0）
+        while (q.size() > cap)
+          q.pop_front(); // 满丢最旧（cap 运行时只读，调用方已 guard >0）
       });
     }
-    std::map<std::string, size_t> mesg_hist_cap{};   // 字段历史缓存保留容量（expand_hp 填充：被显式周期节点取样的字段 → 读者 max（hist N 或 1）；重建时清空重算；运行时只读无并发写）
-    util::TBBMap<std::deque<Message>> message_hist_;  // 运行时：输出端口名 → 最近 mesg_hist_cap 帧滑动窗口（周期节点窗口读的字段历史槽；跨重建保留）
+    std::map<std::string, size_t> mesg_hist_cap{}; // 字段历史缓存保留容量（expand_hp 填充：被显式周期节点取样的字段 →
+                                                   // 读者 max（hist N 或 1）；重建时清空重算；运行时只读无并发写）
+    util::TBBMap<std::deque<Message>>
+        message_hist_; // 运行时：输出端口名 → 最近 mesg_hist_cap 帧滑动窗口（周期节点窗口读的字段历史槽；跨重建保留）
 
     /** @brief 记录一次 execute 耗时到节点环形队列（按完成时间戳升序插入、满 cap 丢最旧——保留最新；
      *  TBBMap accessor 按节点锁，只锁本节点字段）。
@@ -462,18 +490,23 @@ namespace fins::rt {
      * @retval 无
      */
     void record_exec(const std::string &id, double us) {
-      const double ts = fins::util::now_us();   // 完成时间戳（排序键）
-      TBBMAP_UPDATE(exec_us_hist_, id, [&](auto &q) {   // 无则默认构造插入、有则定位（持写锁，仅本节点）
-        const size_t cap = exec_hist_cap.count(id) ? exec_hist_cap.at(id) : 100;  // 缺省 100（未填充时勿取 operator[]→0，否则 pop_front 空 deque = UB）
+      const double ts = fins::util::now_us(); // 完成时间戳（排序键）
+      TBBMAP_UPDATE(exec_us_hist_, id, [&](auto &q) { // 无则默认构造插入、有则定位（持写锁，仅本节点）
+        const size_t cap = exec_hist_cap.count(id)
+                               ? exec_hist_cap.at(id)
+                               : 100; // 缺省 100（未填充时勿取 operator[]→0，否则 pop_front 空 deque = UB）
         // 按完成时间戳升序插入（乱序完成的旧样本插前面）；满 cap 从最旧（ts 最小）丢，保留最新。
-        const auto it = std::lower_bound(q.begin(), q.end(), ts,
-            [](const ExecSample &a, double b) { return a.ts < b; });
+        const auto it =
+            std::lower_bound(q.begin(), q.end(), ts, [](const ExecSample &a, double b) { return a.ts < b; });
         q.insert(it, ExecSample{us, ts});
-        while (q.size() > cap) q.pop_front();  // 满丢最旧（环形语义）
+        while (q.size() > cap)
+          q.pop_front(); // 满丢最旧（环形语义）
       });
     }
-    std::map<std::string, size_t> exec_hist_cap{};   // 环形队列容量（可配：每节点保留最近 N 次 execute 耗时；未配置节点由 record_exec count/at 兜底缺省 100）
-    util::TBBMap<std::deque<ExecSample>> exec_us_hist_;  // 算法键 → 最近 execute 耗时样本（us + 完成 ts；按 ts 升序、满 cap 丢最旧，保留最新；TBBMap accessor 按算法锁）
+    std::map<std::string, size_t> exec_hist_cap{}; // 环形队列容量（可配：每节点保留最近 N 次 execute 耗时；未配置节点由
+                                                   // record_exec count/at 兜底缺省 100）
+    util::TBBMap<std::deque<ExecSample>> exec_us_hist_; // 算法键 → 最近 execute 耗时样本（us + 完成 ts；按 ts 升序、满
+                                                        // cap 丢最旧，保留最新；TBBMap accessor 按算法锁）
 
     // ── 调度状态公开成员（装配点直接读写：worker on_execute 回调 / main 主线程调度循环
     //    持 mtx 调用下述无锁原语；std::mutex 不可重入——持锁期间勿再 lock()，会死锁）──
@@ -484,25 +517,26 @@ namespace fins::rt {
 
   private:
     // ── 就绪增量调度状态（私有；持 mtx 访问，装配点经无锁原语间接使用）──
-    std::map<std::string, size_t> pred_left_;   // 剩余未完成前序数（含 seq/绑定/tp 挂靠边）
-    std::map<std::string, size_t> in_degree_;   // 入度基准（expand 填；rollover 重置 pred_left_ 用）
+    std::map<std::string, size_t> pred_left_; // 剩余未完成前序数（含 seq/绑定/tp 挂靠边）
+    std::map<std::string, size_t> in_degree_; // 入度基准（expand 填；rollover 重置 pred_left_ 用）
 
-    struct ReadyItem {                          // 就绪集元素：id + 入队序号 + 排序键
+    struct ReadyItem { // 就绪集元素：id + 入队序号 + 排序键
       std::string id;
-      size_t seq;                               // 入队序号（全局递增；prio 相等时 seq 小者先出 = FIFO 精确）
-      int prio;                                 // 排序键（grab 前由 priority_updater 键函数现算，唯一来源；未注入恒 0 → 退化为纯 FIFO）
+      size_t seq; // 入队序号（全局递增；prio 相等时 seq 小者先出 = FIFO 精确）
+      int prio; // 排序键（grab 前由 priority_updater 键函数现算，唯一来源；未注入恒 0 → 退化为纯 FIFO）
     };
-    struct ReadyItemLess {                      // 就绪堆比较器（最大堆）：prio 高者在顶；相等 → seq 小者先出 = FIFO。全序。
+    struct ReadyItemLess { // 就绪堆比较器（最大堆）：prio 高者在顶；相等 → seq 小者先出 = FIFO。全序。
       bool operator()(const ReadyItem &a, const ReadyItem &b) const {
-        if (a.prio != b.prio) return a.prio < b.prio;
+        if (a.prio != b.prio)
+          return a.prio < b.prio;
         return a.seq > b.seq;
       }
     };
-    util::LazyMaxHeap<ReadyItem, ReadyItemLess> ready_;                // 就绪堆（懒最大堆；push 只入队，grab 前 rebuild 后堆序成立）
-    size_t ready_seq_{0};                       // 入队序号（expand/rollover 时重置 0）
+    util::LazyMaxHeap<ReadyItem, ReadyItemLess> ready_; // 就绪堆（懒最大堆；push 只入队，grab 前 rebuild 后堆序成立）
+    size_t ready_seq_{0}; // 入队序号（expand/rollover 时重置 0）
 
-    std::vector<std::string> tp_order_;                   // 时间点释放顺序（pin_sync 按 offset 升序填全量 tp id；rollover 重放）
-    size_t tp_released_{0};                     // 游标：下一个待释放 tp 在 tp_order_ 的下标
+    std::vector<std::string> tp_order_; // 时间点释放顺序（pin_sync 按 offset 升序填全量 tp id；rollover 重放）
+    size_t tp_released_{0}; // 游标：下一个待释放 tp 在 tp_order_ 的下标
 
     /** @brief ① 端口索引：输出/输入端口名 → 节点 + 一跳邻居（显式周期节点的输入跳过——窗口读，
      *  无绑定边/不构成拓扑依赖）。单写者约束已在 Pipeline::check_topology 校验（同名输出端口多 producer
@@ -516,28 +550,28 @@ namespace fins::rt {
      * @retval 无
      */
     static void build_port_index(const std::vector<NodeInfo> &nodes,
-                          std::map<std::string, std::vector<std::string>> &producers,
-                          std::map<std::string, std::vector<std::string>> &consumers,
-                          std::map<std::string, std::set<std::string>> &in_producers,
-                          std::map<std::string, std::set<std::string>> &out_consumers) {
-      for (const auto &info : nodes) {
+                                 std::map<std::string, std::vector<std::string>> &producers,
+                                 std::map<std::string, std::vector<std::string>> &consumers,
+                                 std::map<std::string, std::set<std::string>> &in_producers,
+                                 std::map<std::string, std::set<std::string>> &out_consumers) {
+      for (const auto &info: nodes) {
         in_producers.emplace(info.id, std::set<std::string>{});
         out_consumers.emplace(info.id, std::set<std::string>{});
       }
-      for (const auto &info : nodes) {
-        for (const auto &pn : info.output_ports)
+      for (const auto &info: nodes) {
+        for (const auto &pn: info.output_ports)
           producers[pn].push_back(info.id);
-        for (const auto &pn : info.input_ports)
-          if (info.period <= 0)   // 显式周期节点输入为历史槽取样读（无数据边，不构成消费者）；事件节点才构成
+        for (const auto &pn: info.input_ports)
+          if (info.period <= 0) // 显式周期节点输入为历史槽取样读（无数据边，不构成消费者）；事件节点才构成
             consumers[pn].push_back(info.id);
       }
-      for (const auto &info : nodes) {
-        for (const auto &pn : info.input_ports)
-          if (info.period <= 0)   // 显式周期节点输入为历史槽取样读，不构成拓扑依赖；事件节点才依赖 producer
-            for (const auto &p : producers[pn])
+      for (const auto &info: nodes) {
+        for (const auto &pn: info.input_ports)
+          if (info.period <= 0) // 显式周期节点输入为历史槽取样读，不构成拓扑依赖；事件节点才依赖 producer
+            for (const auto &p: producers[pn])
               in_producers[info.id].insert(p);
-        for (const auto &pn : info.output_ports)
-          for (const auto &cc : consumers[pn])
+        for (const auto &pn: info.output_ports)
+          for (const auto &cc: consumers[pn])
             out_consumers[info.id].insert(cc);
       }
     }
@@ -553,16 +587,17 @@ namespace fins::rt {
      * @retval double 超周期长度（ms）；无周期节点返回 0
      */
     static double build_hyper_period(const std::vector<NodeInfo> &nodes) {
-      long long hp = 1;   // 整数毫秒 lcm 累乘
+      long long hp = 1; // 整数毫秒 lcm 累乘
       bool any_periodic = false;
-      for (const auto &info : nodes) {
-        const double T = info.period;   // ms（已由 parse 抽取）
-        if (T <= 0) continue;
+      for (const auto &info: nodes) {
+        const double T = info.period; // ms（已由 parse 抽取）
+        if (T <= 0)
+          continue;
         any_periodic = true;
-        const long long Ti = std::llround(T);   // 就近取整毫秒
-        if (std::abs(T - (double)Ti) > 1e-6)   // 非整数毫秒：不拒绝，WARN + 就近取整继续
+        const long long Ti = std::llround(T); // 就近取整毫秒
+        if (std::abs(T - (double) Ti) > 1e-6) // 非整数毫秒：不拒绝，WARN + 就近取整继续
           FINS_LOG_WARN("[build_hyper_period] 节点 '{}' period 非整数毫秒: {}，就近取整为 {}ms", info.id, T, Ti);
-        hp = std::lcm(hp, Ti);   // 整数 lcm：gcd 恒整数，无浮点病态
+        hp = std::lcm(hp, Ti); // 整数 lcm：gcd 恒整数，无浮点病态
       }
       return any_periodic ? static_cast<double>(hp) : 0.0;
     }
@@ -574,25 +609,29 @@ namespace fins::rt {
      * @param out_consumers 节点 id → 输出 consumer 邻居集（只读）
      * @retval std::vector<std::string> 拓扑序节点 id 列表
      */
-    static std::vector<std::string> build_topo_order(
-        const std::vector<NodeInfo> &nodes,
-        const std::map<std::string, std::set<std::string>> &in_producers,
-        const std::map<std::string, std::set<std::string>> &out_consumers) {
+    static std::vector<std::string>
+    build_topo_order(const std::vector<NodeInfo> &nodes,
+                     const std::map<std::string, std::set<std::string>> &in_producers,
+                     const std::map<std::string, std::set<std::string>> &out_consumers) {
       std::vector<std::string> topo;
       std::map<std::string, size_t> indeg;
       std::deque<std::string> q;
-      for (const auto &info : nodes) {
+      for (const auto &info: nodes) {
         indeg[info.id] = in_producers.at(info.id).size();
-        if (in_producers.at(info.id).empty()) q.push_back(info.id);
+        if (in_producers.at(info.id).empty())
+          q.push_back(info.id);
       }
       while (!q.empty()) {
-        const std::string id = q.front(); q.pop_front();
+        const std::string id = q.front();
+        q.pop_front();
         topo.push_back(id);
-        for (const auto &oc : out_consumers.at(id))
-          if (--indeg[oc] == 0) q.push_back(oc);
+        for (const auto &oc: out_consumers.at(id))
+          if (--indeg[oc] == 0)
+            q.push_back(oc);
       }
-      for (const auto &info : nodes)
-        if (std::find(topo.begin(), topo.end(), info.id) == topo.end()) topo.push_back(info.id);
+      for (const auto &info: nodes)
+        if (std::find(topo.begin(), topo.end(), info.id) == topo.end())
+          topo.push_back(info.id);
       return topo;
     }
 
@@ -607,33 +646,39 @@ namespace fins::rt {
      * @param by_info [out] 节点 id → 解析态指针（只读别名）
      * @retval 无（[name:version] 未注册抛 std::runtime_error）
      */
-    static void build_instances(const std::vector<NodeInfo> &nodes,
-                                const util::TBBMap<std::shared_ptr<Plugin>> &so_ctx,
+    static void build_instances(const std::vector<NodeInfo> &nodes, const util::TBBMap<std::shared_ptr<Plugin>> &so_ctx,
                                 std::map<std::string, std::shared_ptr<AlgoBase>> &by_id,
                                 std::map<std::string, const NodeInfo *> &by_info) {
-      for (const auto &info : nodes) {
+      for (const auto &info: nodes) {
         const std::string &nm = info.name;
         const std::string key = nm + ":" + info.version;
 
         // 遍历 so 表（显式入参 so_ctx）定位算法（[name:version] 落在哪个 so 的 loaded_keys）
         std::shared_ptr<AlgoBase> algo;
         std::shared_ptr<Plugin> pctx;
-        for (const auto &[so_path, pc] : so_ctx) {
+        for (const auto &[so_path, pc]: so_ctx) {
           bool found = false;
-          for (const auto &k : pc->loaded_keys)
-            if (k == key) { pctx = pc; found = true; break; }
-          if (found) break;
+          for (const auto &k: pc->loaded_keys)
+            if (k == key) {
+              pctx = pc;
+              found = true;
+              break;
+            }
+          if (found)
+            break;
         }
-        if (!pctx) throw std::runtime_error("Unregistered algorithm name in map: " + key);
+        if (!pctx)
+          throw std::runtime_error("Unregistered algorithm name in map: " + key);
 
         // C 工厂实例化；shared_ptr 删除器持 ctx → 实例存活期间库不卸载
-        algo = std::shared_ptr<AlgoBase>(
-            pctx->create_algo(key.c_str()),
-            [pctx](AlgoBase *p) { if (pctx->destroy_plugin && p) pctx->destroy_plugin(p); });
+        algo = std::shared_ptr<AlgoBase>(pctx->create_algo(key.c_str()), [pctx](AlgoBase *p) {
+          if (pctx->destroy_plugin && p)
+            pctx->destroy_plugin(p);
+        });
 
         // 配置注入：顺序 = info.config_cache（位置式值表，顺序 = config "parameters" 数组元素
         // 值顺序 = AlgoFunc 配置段相对序号）——AlgoFunc 位置式解码写 configs_（execute 零解析）。
-        for (const auto &v : info.config_cache)
+        for (const auto &v: info.config_cache)
           algo->configure("", v);
 
         by_id[info.id] = std::move(algo);
@@ -656,23 +701,26 @@ namespace fins::rt {
     static void build_dominance(const std::vector<std::string> &topo,
                                 const std::map<std::string, const NodeInfo *> &by_info,
                                 const std::map<std::string, std::vector<std::string>> &producers,
-                                const double hyper_period,
-                                std::map<std::string, double> &period_final,
+                                const double hyper_period, std::map<std::string, double> &period_final,
                                 std::map<std::string, size_t> &node_count) {
-      for (const auto &id : topo) {
+      for (const auto &id: topo) {
         const auto *info = by_info.at(id);
-        double T = info->period;                   // 显式配置周期（0 = 未配置 → 走继承）
+        double T = info->period; // 显式配置周期（0 = 未配置 → 走继承）
         if (T <= 0) {
           // 未配置 → 继承前级：多前级取最短周期前级（topo 序保证前级已定最终周期）
           std::string trig;
           double best = 0;
           // 仅事件节点（T≤0）进入继承：其输入端口全为绑定边 → 全部参与继承（显式周期节点 T>0 不进此分支）
-          for (const auto &pn : info->input_ports) {
+          for (const auto &pn: info->input_ports) {
             auto pit = producers.find(pn);
-            if (pit == producers.end()) continue;   // 孤立输入端口（无 producer）→ 无继承源
-            for (const auto &p : pit->second) {
+            if (pit == producers.end())
+              continue; // 孤立输入端口（无 producer）→ 无继承源
+            for (const auto &p: pit->second) {
               const double pt = period_final.contains(p) ? period_final[p] : 0;
-              if (trig.empty() || pt < best) { trig = p; best = pt; }
+              if (trig.empty() || pt < best) {
+                trig = p;
+                best = pt;
+              }
             }
           }
           T = (!trig.empty() && period_final.contains(trig)) ? period_final[trig] : 0.0;
@@ -692,19 +740,18 @@ namespace fins::rt {
      * @param node_count 节点 id → 实例数（只读；⑤ 的结果）
      * @retval 无
      */
-    static void build_vertex(util::DirectedAcyclicGraph<Workload, Message> &dag,
-                               const std::vector<NodeInfo> &nodes,
-                               const std::map<std::string, double> &period_final,
-                               const std::map<std::string, size_t> &node_count) {
-      for (const auto &info : nodes) {
+    static void build_vertex(util::DirectedAcyclicGraph<Workload, Message> &dag, const std::vector<NodeInfo> &nodes,
+                             const std::map<std::string, double> &period_final,
+                             const std::map<std::string, size_t> &node_count) {
+      for (const auto &info: nodes) {
         const size_t N = node_count.at(info.id);
         for (size_t k = 0; k < N; ++k) {
           Workload v;
-          v.k            = k;   // 实例序号（update_abs_deadline 滚动校正用）
-          v.name         = info.name;   // 节点名（NodeInfo.name；id 顶点名 = {name}:{k}）
-          v.period       = period_final.at(info.id);
-          v.deadline     = info.deadline;   // parse 已折到 wcet（缺省 = wcet）
-          v.wcet         = info.wcet;
+          v.k = k; // 实例序号（update_abs_deadline 滚动校正用）
+          v.name = info.name; // 节点名（NodeInfo.name；id 顶点名 = {name}:{k}）
+          v.period = period_final.at(info.id);
+          v.deadline = info.deadline; // parse 已折到 wcet（缺省 = wcet）
+          v.wcet = info.wcet;
           dag.add_node(info.id + ":" + std::to_string(k), std::move(v));
         }
       }
@@ -725,23 +772,25 @@ namespace fins::rt {
      * @param node_count 节点 id → 实例数（只读）
      * @retval 无
      */
-    static void build_edge(util::DirectedAcyclicGraph<Workload, Message> &dag,
-                            const std::vector<NodeInfo> &nodes,
-                            const std::map<std::string, size_t> &node_count) {
-      std::map<std::string, std::string> producer_of;   // 输出端口名 → producer 节点 id（首生产者，函数内局部）
-      for (const auto &info : nodes)
-        for (const auto &pn : info.output_ports)
-          if (!producer_of.count(pn)) producer_of[pn] = info.id;
-      for (const auto &info : nodes) {
-        if (info.period > 0) continue;   // 显式周期（时间触发）节点：无数据绑定边（读 hist 最新，见 bind_job）
+    static void build_edge(util::DirectedAcyclicGraph<Workload, Message> &dag, const std::vector<NodeInfo> &nodes,
+                           const std::map<std::string, size_t> &node_count) {
+      std::map<std::string, std::string> producer_of; // 输出端口名 → producer 节点 id（首生产者，函数内局部）
+      for (const auto &info: nodes)
+        for (const auto &pn: info.output_ports)
+          if (!producer_of.count(pn))
+            producer_of[pn] = info.id;
+      for (const auto &info: nodes) {
+        if (info.period > 0)
+          continue; // 显式周期（时间触发）节点：无数据绑定边（读 hist 最新，见 bind_job）
         const size_t Nc = node_count.at(info.id);
-        for (const auto &pn : info.input_ports) {
+        for (const auto &pn: info.input_ports) {
           auto pit = producer_of.find(pn);
-          if (pit == producer_of.end()) continue;   // 输入端口无生产者（孤立输入）→ 无边
+          if (pit == producer_of.end())
+            continue; // 输入端口无生产者（孤立输入）→ 无边
           const std::string &p = pit->second;
           const size_t Np = node_count.at(p);
           for (size_t k = 0; k < Nc; ++k) {
-            const long long pk = ((long long)(k + 1) * (long long)Np - 1) / (long long)Nc;
+            const long long pk = ((long long) (k + 1) * (long long) Np - 1) / (long long) Nc;
             dag.add_edge(p + ":" + std::to_string(pk), info.id + ":" + std::to_string(k), pn, Message{});
           }
         }
@@ -759,33 +808,35 @@ namespace fins::rt {
      * @param node_count 节点 id → 实例数（只读）
      * @retval 无
      */
-    void bind_sync(const std::vector<NodeInfo> &nodes,
-                  const std::map<std::string, size_t> &node_count) {
-      std::set<double> sync_points;   // 同步点集合：显式周期节点释放时刻并集（去重升序）
-      for (const auto &info : nodes) {
-        if (info.period <= 0) continue;
+    void bind_sync(const std::vector<NodeInfo> &nodes, const std::map<std::string, size_t> &node_count) {
+      std::set<double> sync_points; // 同步点集合：显式周期节点释放时刻并集（去重升序）
+      for (const auto &info: nodes) {
+        if (info.period <= 0)
+          continue;
         const size_t N = node_count.at(info.id);
-        for (size_t k = 0; k < N; ++k) sync_points.insert((double)k * info.period);
+        for (size_t k = 0; k < N; ++k)
+          sync_points.insert((double) k * info.period);
       }
 
-      std::map<double, std::string> tp_id;   // 偏移 → 时间点顶点 id（序号化，无精度碰撞）
+      std::map<double, std::string> tp_id; // 偏移 → 时间点顶点 id（序号化，无精度碰撞）
       size_t seq = 0;
-      for (const double off : sync_points) tp_id[off] = "tp:" + std::to_string(seq++);
+      for (const double off: sync_points)
+        tp_id[off] = "tp:" + std::to_string(seq++);
 
-      for (const auto &[off, id] : tp_id) {
-        tp_order_.push_back(id);   // 升序 offset = 释放顺序（grab_delay_workload 按序取，与原 min-period 扫描等价）
+      for (const auto &[off, id]: tp_id) {
+        tp_order_.push_back(id); // 升序 offset = 释放顺序（grab_delay_workload 按序取，与原 min-period 扫描等价）
       }
 
-      double prev_off = 0.0;   // 理论延迟基准：相对前一个同步点的间隔（首个 tp:0 = 0，立即释放）
-      for (const auto &[off, id] : tp_id) {
+      double prev_off = 0.0; // 理论延迟基准：相对前一个同步点的间隔（首个 tp:0 = 0，立即释放）
+      for (const auto &[off, id]: tp_id) {
         Workload v;
-        v.id     = id;
-        v.name   = "time";
-        v.wcet   = off - prev_off;
-        v.job    = [this, off]() {
+        v.id = id;
+        v.name = "time";
+        v.wcet = off - prev_off;
+        v.job = [this, off]() {
           const double at = hyper_start_ms + off;
-          const auto until = std::chrono::steady_clock::now()
-              + std::chrono::microseconds((long long)(at - fins::util::now_ms()) * 1000ll);
+          const auto until = std::chrono::steady_clock::now() +
+                             std::chrono::microseconds((long long) (at - fins::util::now_ms()) * 1000ll);
           while (!stopped.load() && std::chrono::steady_clock::now() < until)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         };
@@ -794,12 +845,13 @@ namespace fins::rt {
         prev_off = off;
       }
 
-      for (const auto &info : nodes) {
-        if (info.period <= 0) continue;
+      for (const auto &info: nodes) {
+        if (info.period <= 0)
+          continue;
 
         const size_t N = node_count.at(info.id);
         for (size_t k = 0; k < N; ++k) {
-          const double off = (double)k * info.period;
+          const double off = (double) k * info.period;
           dag.add_edge(tp_id.at(off), info.id + ":" + std::to_string(k), "time", Message{});
         }
       }
@@ -813,7 +865,7 @@ namespace fins::rt {
     void build_pred() {
       std::vector<std::string> ids;
       dag.for_each_vertex([&](const std::string &id, const Workload &) { ids.push_back(id); });
-      for (const auto &id : ids) {
+      for (const auto &id: ids) {
         const size_t deg = dag.in_nodes(id).size();
         in_degree_[id] = deg;
         pred_left_[id] = deg;
@@ -834,58 +886,59 @@ namespace fins::rt {
      * @param node_count 节点 id → job 实例数（只读）
      * @retval 无
      */
-    void bind_job(const std::vector<NodeInfo> &nodes,
-                    const std::map<std::string, std::shared_ptr<AlgoBase>> &by_id,
-                    const std::map<std::string, size_t> &node_count) {
+    void bind_job(const std::vector<NodeInfo> &nodes, const std::map<std::string, std::shared_ptr<AlgoBase>> &by_id,
+                  const std::map<std::string, size_t> &node_count) {
       // ── 段 1：历史容量表 mesg_hist_cap[输出端口]（记录条件 + 保留长度）──
       //  仅显式周期节点的输入从 producer 字段历史槽取样（hist 端口读 N>2 帧窗口、未声明读最新单帧），
       //  故其每个输入对应字段都要建历史槽：保留容量 = 该字段全部周期读者的 max（hist N 或 1）。同字段
       //  多读者共享槽。route_outputs 见 mesg_hist_cap 含该端口才 record_mesg，故须先在此登记。
-      std::set<std::string> out_ports;   // 全部节点输出端口名并集（判定“有 producer”）
-      for (const auto &info : nodes)
-        for (const auto &pn : info.output_ports) out_ports.insert(pn);
-      for (const auto &info : nodes) {
-        if (info.period <= 0) continue;   // 仅显式周期节点从字段历史槽取样（事件节点无历史读）
-        for (const auto &pn : info.input_ports) {
-          if (!out_ports.count(pn)) continue;   // 无 producer 字段（check_topology 已拒，防御）
-          const size_t w = info.hist.count(pn) ? info.hist.at(pn) : 1;   // hist N（窗口）或 1（最新单帧）
+      std::set<std::string> out_ports; // 全部节点输出端口名并集（判定“有 producer”）
+      for (const auto &info: nodes)
+        for (const auto &pn: info.output_ports)
+          out_ports.insert(pn);
+      for (const auto &info: nodes) {
+        if (info.period <= 0)
+          continue; // 仅显式周期节点从字段历史槽取样（事件节点无历史读）
+        for (const auto &pn: info.input_ports) {
+          if (!out_ports.count(pn))
+            continue; // 无 producer 字段（check_topology 已拒，防御）
+          const size_t w = info.hist.count(pn) ? info.hist.at(pn) : 1; // hist N（窗口）或 1（最新单帧）
           auto &cap = mesg_hist_cap[pn];
-          if (w > cap) cap = w;   // 保留容量 = 读者 max（同字段多读者共享槽，保证不丢窗内最新帧）
+          if (w > cap)
+            cap = w; // 保留容量 = 读者 max（同字段多读者共享槽，保证不丢窗内最新帧）
         }
       }
 
       // ── 段 2：每个节点 → 每实例填 job 闭包（闭包捕获稳定解析态 + 算法实例 + hist 窗口长度表）──
-      for (const auto &info : nodes) {
-        auto sinfo = std::make_shared<const NodeInfo>(info);           // 闭包捕获稳定共享解析态
+      for (const auto &info: nodes) {
+        auto sinfo = std::make_shared<const NodeInfo>(info); // 闭包捕获稳定共享解析态
         const auto &algo = by_id.at(info.id);
         const size_t n = node_count.at(info.id);
-        const auto hist_w = info.hist;   // hist 端口 → 窗口长度 N（>2；未声明的周期输入走“最新单帧”标量读）
+        const auto hist_w = info.hist; // hist 端口 → 窗口长度 N（>2；未声明的周期输入走“最新单帧”标量读）
 
         for (size_t k = 0; k < n; ++k) {
-          const std::string vtx = info.id + ":" + std::to_string(k);   // 顶点名现拼（无 JobInst）
+          const std::string vtx = info.id + ":" + std::to_string(k); // 顶点名现拼（无 JobInst）
           dag.mutate_vertex(vtx, [this, sinfo, algo, vtx, hist_w](Workload &v) {
-            v.id = vtx;   // Workload.id 实际填充（grab_ready_workload 返回 Workload* 含 id，装配点直做完成事件用）
+            v.id = vtx; // Workload.id 实际填充（grab_ready_workload 返回 Workload* 含 id，装配点直做完成事件用）
 
             // 按 tag 分组一次性解析（O(边数) 替代 O(端口×边数) 的逐端口 edges_to/from）
-            auto in_groups  = dag.edges_to_grouped(vtx);
+            auto in_groups = dag.edges_to_grouped(vtx);
             auto out_groups = dag.edges_from_grouped(vtx);
             std::vector<std::vector<std::reference_wrapper<Message>>> in_refs(sinfo->input_ports.size());
             for (size_t i = 0; i < in_refs.size(); ++i)
-              if (sinfo->period <= 0) {   // 事件节点输入端口：查绑定边分组表（单写者 → 至多一条）；周期节点无绑定边
+              if (sinfo->period <= 0) { // 事件节点输入端口：查绑定边分组表（单写者 → 至多一条）；周期节点无绑定边
                 const auto it = in_groups.find(sinfo->input_ports[i]);
-                if (it != in_groups.end()) in_refs[i] = it->second;
+                if (it != in_groups.end())
+                  in_refs[i] = it->second;
               }
             std::vector<std::vector<std::reference_wrapper<Message>>> out_refs(sinfo->output_ports.size());
             for (size_t i = 0; i < out_refs.size(); ++i) {
               const auto it = out_groups.find(sinfo->output_ports[i]);
-              if (it != out_groups.end()) out_refs[i] = it->second;
+              if (it != out_groups.end())
+                out_refs[i] = it->second;
             }
 
-            v.job = [this,
-              sinfo,
-              algo,
-              hist_w,
-              in_refs = std::move(in_refs), out_refs = std::move(out_refs)]() {
+            v.job = [this, sinfo, algo, hist_w, in_refs = std::move(in_refs), out_refs = std::move(out_refs)]() {
               // ── 功能 1：周期节点输入取样 helper（时间触发无数据前序边，执行时才取样；
               //      const_accessor 只锁本端口历史槽，与 record_mesg 同端口写互斥、不同端口并发读）
               //   · collect_window：hist 声明端口 → 读 producer 字段历史槽最近 w 帧为 typed
@@ -898,10 +951,10 @@ namespace fins::rt {
                 {
                   util::TBBMap<std::deque<Message>>::const_accessor a;
                   if (message_hist_.find(a, pn)) {
-                    const auto &h = a->second;   // 队列按 timestamp 升序，尾部 = 最新真实帧
+                    const auto &h = a->second; // 队列按 timestamp 升序，尾部 = 最新真实帧
                     const size_t take = std::min(w, h.size());
                     for (size_t j = 0; j < take; ++j)
-                      vals[w - take + j] = *h[h.size() - take + j].p_shared<int>();   // 逐帧取真实值
+                      vals[w - take + j] = *h[h.size() - take + j].p_shared<int>(); // 逐帧取真实值
                   }
                 }
                 Message m;
@@ -914,11 +967,12 @@ namespace fins::rt {
                 {
                   util::TBBMap<std::deque<Message>>::const_accessor a;
                   if (message_hist_.find(a, pn) && !a->second.empty())
-                    m = a->second.back();   // 队列按 timestamp 升序，back = 最新一帧（拷贝，shared_ptr 保活）
+                    m = a->second.back(); // 队列按 timestamp 升序，back = 最新一帧（拷贝，shared_ptr 保活）
                 }
-                if (m.frame) return m;
+                if (m.frame)
+                  return m;
                 Message z;
-                *z.p_mutable<int>() = 0;   // 槽空（producer 尚未产出）→ 0 占位
+                *z.p_mutable<int>() = 0; // 槽空（producer 尚未产出）→ 0 占位
                 return z;
               };
 
@@ -930,11 +984,11 @@ namespace fins::rt {
                   const std::string &pn = sinfo->input_ports[i];
 
                   if (hist_w.count(pn))
-                    inputs[i] = collect_window(pn, hist_w.at(pn));   // hist 端口：N>2 帧窗口
+                    inputs[i] = collect_window(pn, hist_w.at(pn)); // hist 端口：N>2 帧窗口
                   else if (sinfo->period > 0)
-                    inputs[i] = read_latest(pn);   // 周期节点未声明 hist：标量读最新一帧
+                    inputs[i] = read_latest(pn); // 周期节点未声明 hist：标量读最新一帧
                   else
-                    inputs[i] = in_refs[i].empty() ? Message{} : in_refs[i][0].get();   // 事件节点：绑定边预解析帧
+                    inputs[i] = in_refs[i].empty() ? Message{} : in_refs[i][0].get(); // 事件节点：绑定边预解析帧
                 }
                 return inputs;
               };
@@ -942,22 +996,24 @@ namespace fins::rt {
               // ── 功能 3：execute + record_exec（耗时统计：execute 前后 steady_clock 计时 us，
               //      不含输入打包/输出路由；按算法键（info.name）环形队列，expand_hp 重建保留不清）──
               auto execute_and_time = [this, sinfo, algo](std::vector<Message> &inputs) {
-                std::vector<Message> outputs(sinfo->output_ports.size());   // 输出按端口序预构造 array（算法按位置写）
+                std::vector<Message> outputs(sinfo->output_ports.size()); // 输出按端口序预构造 array（算法按位置写）
 
                 const auto _t0 = std::chrono::steady_clock::now();
 
 #ifdef FINS_EXPORT_TRACING_PATH
-                fins::util::trace_record(fins::util::TraceKind::EXECUTE, sinfo->id);   // 执行（job 开始）
+                fins::util::trace_record(fins::util::TraceKind::EXECUTE, sinfo->id); // 执行（job 开始）
 #endif
 
-                algo->execute(inputs, outputs);   // 配置已建图期注入 algo 实例（AlgoFunc configs_ 类型化帧，execute 零解析）
+                algo->execute(inputs,
+                              outputs); // 配置已建图期注入 algo 实例（AlgoFunc configs_ 类型化帧，execute 零解析）
 
 #ifdef FINS_EXPORT_TRACING_PATH
-                fins::util::trace_record(fins::util::TraceKind::COMPLETE, sinfo->id);   // 执行（job 完成）
+                fins::util::trace_record(fins::util::TraceKind::COMPLETE, sinfo->id); // 执行（job 完成）
 #endif
 
-                record_exec(sinfo->name, std::chrono::duration<double, std::micro>(
-                    std::chrono::steady_clock::now() - _t0).count());   // 键 = 算法键（非节点 id：多实例/多节点同类算法归并聚合）
+                record_exec(sinfo->name,
+                            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - _t0)
+                                .count()); // 键 = 算法键（非节点 id：多实例/多节点同类算法归并聚合）
 
                 return outputs;
               };
@@ -965,16 +1021,17 @@ namespace fins::rt {
               // ── 功能 4：路由输出（写预解析下游引用共享帧；字段有周期读者才存历史槽）──
               auto route_outputs = [this, sinfo, &out_refs](std::vector<Message> &outputs) {
                 for (size_t i = 0; i < outputs.size(); ++i) {
-                  for (auto &e : out_refs[i])
-                    e.get() = outputs[i];   // 写全部下游绑定边（生产者消费者共享帧）
+                  for (auto &e: out_refs[i])
+                    e.get() = outputs[i]; // 写全部下游绑定边（生产者消费者共享帧）
                   const std::string &pn = sinfo->output_ports[i];
-                  const auto cap_it = mesg_hist_cap.find(pn);   // 锁外执行：const 查找避 operator[] 并发写 UB
-                  if (cap_it != mesg_hist_cap.end() && cap_it->second > 0)   // 字段有周期读者才存历史（cap>0）；record_mesg 满 cap 丢最旧
+                  const auto cap_it = mesg_hist_cap.find(pn); // 锁外执行：const 查找避 operator[] 并发写 UB
+                  if (cap_it != mesg_hist_cap.end() &&
+                      cap_it->second > 0) // 字段有周期读者才存历史（cap>0）；record_mesg 满 cap 丢最旧
                     record_mesg(pn, outputs[i]);
                 }
               };
 
-              auto inputs  = pack_inputs();
+              auto inputs = pack_inputs();
               auto outputs = execute_and_time(inputs);
               route_outputs(outputs);
             };
@@ -992,7 +1049,7 @@ namespace fins::rt {
     void seed_ready() {
       std::vector<std::string> ids;
       dag.for_each_vertex([&](const std::string &id, const Workload &) { ids.push_back(id); });
-      for (const auto &id : ids)
+      for (const auto &id: ids)
         if (id.rfind("tp:", 0) != 0 && pred_left_[id] == 0)
           ready_.push({id, ready_seq_++, 0});
     }
@@ -1012,9 +1069,9 @@ namespace fins::rt {
      * @retval 无
      */
     void expand_hp(const Pipeline &pipeline, const Library &library) {
-      hyper_start_ms = fins::util::now_ms();   // 新配置展开起点 = 当前真实时钟（勿残留上次回绕后的起点）
-      mesg_hist_cap.clear();   // 只清容量表（新配置重算）；message_hist_ 历史槽跨重建保留不清（同 exec_us_hist_）
-      pred_left_.clear();   // 就绪增量状态：空配置早退也一致清空
+      hyper_start_ms = fins::util::now_ms(); // 新配置展开起点 = 当前真实时钟（勿残留上次回绕后的起点）
+      mesg_hist_cap.clear(); // 只清容量表（新配置重算）；message_hist_ 历史槽跨重建保留不清（同 exec_us_hist_）
+      pred_left_.clear(); // 就绪增量状态：空配置早退也一致清空
       in_degree_.clear();
       dag.clear();
 
@@ -1029,9 +1086,12 @@ namespace fins::rt {
       tp_order_.clear();
       tp_released_ = 0;
 
-      const auto nodes = pipeline.nodes;   // 入参快照（拷贝，防外部改）
+      const auto nodes = pipeline.nodes; // 入参快照（拷贝，防外部改）
       const auto so_ctx = library.so_ctx;
-      if (nodes.empty()) { ++graph_version; return; }   // 空配置 → 空图（幂等；结构已清空，同样发失效信号）
+      if (nodes.empty()) {
+        ++graph_version;
+        return;
+      } // 空配置 → 空图（幂等；结构已清空，同样发失效信号）
 
       // ① 端口索引：producers/consumers + 一跳邻居
       std::map<std::string, std::vector<std::string>> producers, consumers;
@@ -1072,7 +1132,7 @@ namespace fins::rt {
       // ⑨b 初始就绪（seed_ready，私有函数，见 bind_job 之后）
       seed_ready();
 
-      ++graph_version;   // 结构重建完成 → makespan 结构缓存失效信号（须在全部建图步骤后）
+      ++graph_version; // 结构重建完成 → makespan 结构缓存失效信号（须在全部建图步骤后）
 
 #ifdef FINS_EXPORT_DGRAPH_PATH
       std::ofstream(FINS_EXPORT_DGRAPH_PATH) << export_dag().dump(2);
@@ -1102,31 +1162,34 @@ namespace fins::rt {
       const double hp_ = hyper_period_ms;
       if (hp_ > 0.0) {
         const double delta = fins::util::now_ms() - hyper_start_ms;
-        double k = 1.0;                                  // 至少推进一拍
-        if (delta > 0.0) {                               // ceil(delta/H)，保证下一拍 ≥ now 的最近边界
+        double k = 1.0; // 至少推进一拍
+        if (delta > 0.0) { // ceil(delta/H)，保证下一拍 ≥ now 的最近边界
           const double d = delta / hp_;
           k = std::floor(d);
-          if (d > k) k += 1.0;
+          if (d > k)
+            k += 1.0;
         }
 #if FINS_ROLLOVER_LATE_REANCHOR
         // 过载（k≥2，排空晚于边界）→ “提前到这一拍”：不以完工时刻跳往未来边界空等，而是立刻以
         // “此刻”为新起点重启一拍（相位重置到完工时刻），之后按新节拍 now+j·H 继续——不漏掉空闲
         // 空洞、流水不断；代价是每次过载相位相对原绝对网格漂移一次。早完工（k==1）仍对齐下一拍。
         if (k >= 2.0) {
-          FINS_LOG_WARN("[rollover_hp] 超周期过载：排空晚于边界，提前到这一拍（此刻重锚，跳过 {} 个漏拍，新起点 {:.1f}ms）",
-                        (long long)(k - 1.0), delta);
-          hyper_start_ms = fins::util::now_ms();         // 相位重置到“这一拍”完工时刻
+          FINS_LOG_WARN(
+              "[rollover_hp] 超周期过载：排空晚于边界，提前到这一拍（此刻重锚，跳过 {} 个漏拍，新起点 {:.1f}ms）",
+              (long long) (k - 1.0), delta);
+          hyper_start_ms = fins::util::now_ms(); // 相位重置到“这一拍”完工时刻
         } else {
-          hyper_start_ms += hp_;                         // 未过载：仍严格等下一拍
+          hyper_start_ms += hp_; // 未过载：仍严格等下一拍
         }
 #else
         // 过载 → “严格等下一拍”：跳过已错过的整拍、对齐下一未来网格边界（相位不漂移，但空等 + 丢拍）
         if (k >= 2.0)
-          FINS_LOG_WARN("[rollover_hp] 超周期过载：排空晚于边界，跳过 {} 个释放拍，下一边界对齐 {:.1f}ms", (long long)(k - 1.0), hyper_start_ms + k * hp_);
+          FINS_LOG_WARN("[rollover_hp] 超周期过载：排空晚于边界，跳过 {} 个释放拍，下一边界对齐 {:.1f}ms",
+                        (long long) (k - 1.0), hyper_start_ms + k * hp_);
         hyper_start_ms += k * hp_;
 #endif
       } else {
-        hyper_start_ms = fins::util::now_ms();           // 无显式周期（理论上不进回绕）保持旧行为
+        hyper_start_ms = fins::util::now_ms(); // 无显式周期（理论上不进回绕）保持旧行为
       }
 
 #if FINS_CAL_WCET
@@ -1140,21 +1203,24 @@ namespace fins::rt {
 #endif
 
 #if FINS_STATIC_PRIORITY
-      for (auto &item : ready_.data())
+      for (auto &item: ready_.data())
         item.prio = priority_updater(dag, dag.vertex(item.id), num_worker);
-      ready_.rebuild();   // 按最新 prio 重建堆（O(n)）
+      ready_.rebuild(); // 按最新 prio 重建堆（O(n)）
 #endif
 
-      ++done_gen_;   // 世代化 clear：O(1) 重置，免释放 done_ 的 unordered_map 节点（原 std::set::clear 每顶点一次释放）
+      ++done_gen_; // 世代化 clear：O(1) 重置，免释放 done_ 的 unordered_map 节点（原 std::set::clear 每顶点一次释放）
       done_count_ = 0;
-      ready_.clear();   // 图静止时应空，防御清（LazyMaxHeap 为 vector，clear 保容量 O(1)）
-      ready_seq_ = 0;   // 入队序号随就绪集重置（新周期从头计序）
-      tp_released_ = 0;   // tp 全部重新释放（tp_order_ 不清——同一批时间点按原序重放）
+      ready_.clear(); // 图静止时应空，防御清（LazyMaxHeap 为 vector，clear 保容量 O(1)）
+      ready_seq_ = 0; // 入队序号随就绪集重置（新周期从头计序）
+      tp_released_ = 0; // tp 全部重新释放（tp_order_ 不清——同一批时间点按原序重放）
 
       // pred_left 重置回入度基准：两 map 键集相同且均按键有序 → 锁步遍历，O(n) 免逐顶点 at() 查找
       {
         auto it_deg = in_degree_.begin();
-        for (auto &[id, pl] : pred_left_) { pl = it_deg->second; ++it_deg; }
+        for (auto &[id, pl]: pred_left_) {
+          pl = it_deg->second;
+          ++it_deg;
+        }
       }
     }
 
@@ -1183,18 +1249,19 @@ namespace fins::rt {
      *                   nullptr = 无就绪顶点
      */
     Workload *grab_ready_workload() {
-      if (ready_.empty()) return nullptr;
+      if (ready_.empty())
+        return nullptr;
 
 #if FINS_DYNAMIC_PRIORITY
       update_abs_deadline();
 
-      for (auto &item : ready_.data())
+      for (auto &item: ready_.data())
         item.prio = priority_updater(dag, dag.vertex(item.id), num_worker);
 #endif
 
-      ready_.rebuild();                                // 按最新 prio 重建堆（O(n)）
+      ready_.rebuild(); // 按最新 prio 重建堆（O(n)）
 
-      const ReadyItem item = ready_.pop_max();         // 取 prio 最高者；相等按 seq FIFO（O(log n)
+      const ReadyItem item = ready_.pop_max(); // 取 prio 最高者；相等按 seq FIFO（O(log n)
       Workload *picked = nullptr;
       dag.mutate_vertex(item.id, [&picked](Workload &x) { picked = &x; });
 
@@ -1210,9 +1277,10 @@ namespace fins::rt {
      * @retval Workload* 图内时间点顶点指针；nullptr = 无待释放时间点
      */
     Workload *grab_delay_workload() {
-      if (tp_released_ >= tp_order_.size()) return nullptr;   // 空配置/一次性图/已全部释放
+      if (tp_released_ >= tp_order_.size())
+        return nullptr; // 空配置/一次性图/已全部释放
 
-      const std::string id = tp_order_[tp_released_++];       // 按预排顺序取下一个（每 tp 恰一次，游标前移天然防重）
+      const std::string id = tp_order_[tp_released_++]; // 按预排顺序取下一个（每 tp 恰一次，游标前移天然防重）
       Workload *picked = nullptr;
       dag.mutate_vertex(id, [&picked](Workload &x) { picked = &x; });
 
@@ -1229,24 +1297,29 @@ namespace fins::rt {
      *         worker：只有新增就绪才值得唤醒（空闲 worker 仅在就绪堆为空时存在；叶子/无后继的
      *         完成不新增 → 不空唤醒全池，减惊群与锁抖动）。
      */
-    std::unordered_map<std::string, uint64_t> done_;   // 顶点 id → 完成世代号（世代化 clear：rollover O(1) 重置，免释放节点）
-    uint64_t done_gen_{0};                              // 当前世代号（rollover/expand 递增；done_[id]==gen ⇒ 本世代已完成）
-    size_t done_count_{0};                              // 本世代已完成顶点数（is_hp_done 用；rollover 归零）
+    std::unordered_map<std::string, uint64_t>
+        done_; // 顶点 id → 完成世代号（世代化 clear：rollover O(1) 重置，免释放节点）
+    uint64_t done_gen_{0}; // 当前世代号（rollover/expand 递增；done_[id]==gen ⇒ 本世代已完成）
+    size_t done_count_{0}; // 本世代已完成顶点数（is_hp_done 用；rollover 归零）
     bool trigger_workload_ready(const std::string &id) {
       bool enqueued = false;
-      {   // 幂等防御（世代化 done_：本世代已完成 → 跳过；正常每顶点每超周期恰完成一次）
+      { // 幂等防御（世代化 done_：本世代已完成 → 跳过；正常每顶点每超周期恰完成一次）
         auto it = done_.find(id);
-        if (it != done_.end() && it->second == done_gen_) return false;   // 本代已处理过 → 无新增
-        if (it == done_.end()) done_.emplace(id, done_gen_);
-        else it->second = done_gen_;
+        if (it != done_.end() && it->second == done_gen_)
+          return false; // 本代已处理过 → 无新增
+        if (it == done_.end())
+          done_.emplace(id, done_gen_);
+        else
+          it->second = done_gen_;
         ++done_count_;
       }
 
-      for (const auto &s : dag.out_nodes(id)) {
+      for (const auto &s: dag.out_nodes(id)) {
         auto it = pred_left_.find(s);
-        if (it == pred_left_.end() || it->second == 0) continue;   // 未知/已就绪 → 跳过（防重复递减）
-        if (--it->second == 0 && s.rfind("tp:", 0) != 0) {   // 减到 0 = 恰好一次就绪
-          ready_.push({s, ready_seq_++, 0});   // 推刚就绪的后继 s（勿推已完成前序 id）
+        if (it == pred_left_.end() || it->second == 0)
+          continue; // 未知/已就绪 → 跳过（防重复递减）
+        if (--it->second == 0 && s.rfind("tp:", 0) != 0) { // 减到 0 = 恰好一次就绪
+          ready_.push({s, ready_seq_++, 0}); // 推刚就绪的后继 s（勿推已完成前序 id）
           enqueued = true;
         }
       }
@@ -1268,11 +1341,12 @@ namespace fins::rt {
       const double now = fins::util::now_ms();
       const double period = hyper_period_ms;
       dag.for_each_vertex([&](const std::string &, Workload &v) {
-        if (!v.job) return;
+        if (!v.job)
+          return;
         double start = hyper_start_ms;
         if (period > 0 && now > start + period)
           start += std::floor((now - start) / period) * period;
-        v.ddl = start + (double)(v.k + 1) * v.deadline;
+        v.ddl = start + (double) (v.k + 1) * v.deadline;
       });
     }
 
@@ -1286,15 +1360,18 @@ namespace fins::rt {
      */
     void update_wcet_estimation() {
       dag.for_each_vertex([&](const std::string &, Workload &v) {
-        if (!v.job) return;
+        if (!v.job)
+          return;
         if (v.id.rfind("tp:", 0) != 0)
-          TBBMAP_READ(exec_us_hist_, v.name, [&](const auto &hist) {   // 键 = 算法键（record_exec 用 info.name；v.id = {name}:{k} 对不上）
-            if (!hist.empty() && wcet_updater) {
-              std::deque<double> vals;          // 统计槽只要用时序列（wcet_updater 槽签名 deque<double>）
-              for (const auto &s : hist) vals.push_back(s.us);
-              v.wcet = wcet_updater(vals);
-            }
-          });
+          TBBMAP_READ(exec_us_hist_, v.name,
+                      [&](const auto &hist) { // 键 = 算法键（record_exec 用 info.name；v.id = {name}:{k} 对不上）
+                        if (!hist.empty() && wcet_updater) {
+                          std::deque<double> vals; // 统计槽只要用时序列（wcet_updater 槽签名 deque<double>）
+                          for (const auto &s: hist)
+                            vals.push_back(s.us);
+                          v.wcet = wcet_updater(vals);
+                        }
+                      });
       });
     }
 
@@ -1305,32 +1382,31 @@ namespace fins::rt {
      */
     nlohmann::json export_dag() {
       nlohmann::json j;
-      j["hyper_start_ms"]  = hyper_start_ms;
+      j["hyper_start_ms"] = hyper_start_ms;
       j["hyper_period_ms"] = hyper_period_ms;
 
       j["vertices"] = nlohmann::json::array();
       dag.for_each_vertex([&](const std::string &id, const Workload &v) {
         j["vertices"].push_back({
-          {"id", id},
-          {"name", v.name},
-          {"k", v.k},
-          {"period", v.period},
-          {"deadline", v.deadline},
-          {"wcet", v.wcet},
-          {"ddl", v.ddl},
-          {"has_job", static_cast<bool>(v.job)},
-          {"kind", id.rfind("tp:", 0) == 0 ? "timepoint" : "job"},
+            {"id", id},
+            {"name", v.name},
+            {"k", v.k},
+            {"period", v.period},
+            {"deadline", v.deadline},
+            {"wcet", v.wcet},
+            {"ddl", v.ddl},
+            {"has_job", static_cast<bool>(v.job)},
+            {"kind", id.rfind("tp:", 0) == 0 ? "timepoint" : "job"},
         });
       });
 
       j["edges"] = nlohmann::json::array();
-      dag.for_each_edge([&](const std::string &from, const std::string &to,
-                            const std::string &tag, const Message &m) {
+      dag.for_each_edge([&](const std::string &from, const std::string &to, const std::string &tag, const Message &m) {
         j["edges"].push_back({
-          {"from", from},
-          {"to", to},
-          {"tag", tag},
-          {"message", {{"has_frame", m.frame != nullptr}, {"type", m.type_name}}},
+            {"from", from},
+            {"to", to},
+            {"tag", tag},
+            {"message", {{"has_frame", m.frame != nullptr}, {"type", m.type_name}}},
         });
       });
 

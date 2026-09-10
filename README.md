@@ -30,7 +30,7 @@ FINS 是一个**可观测的实时调度实验床**:把"传感器 → 感知/计
 | DAG 整体 makespan / 超周期过载检查 | Graham's bound(1979)→ Multi-Path Bound(He et al. 2023) | `schedule/makespan_updater.hpp` |
 | 就绪队列该先跑谁 | 静态 FIFO/RM/DM/SJF/density + 图结构 depth/height + 动态 EDF/LLF | `schedule/priority_updater.hpp` |
 | 怎么造可控的验证负载 | UniFast 按目标利用率 u 摊算忙等 | `tool/uload.ipynb` |
-| 怎么知道真的达标 | 线程级生命周期 trace → 实测 u / 开销 / 绑核 | `include/utils/tracing.hpp` + `tool/plot.ipynb` |
+| 怎么知道真的达标 | 线程级生命周期 trace → 实测 u / 开销 / 绑核 | `include/utils/tracing.hpp` + `tool/plot_main.ipynb` |
 
 调度器槽位(`wcet/makespan/priority_updater`)都是"一行装配的 `std::function`",宏或枚举即切策略,
 方便横向对比。
@@ -189,7 +189,7 @@ sudo tool/agent.sh 1-6 6     # 独占核 1-6 + 6 worker 起 bin/client
 2. **采集** `tool/test.ipynb` — 扫 cfg → 每份起 client+server 跑 `dur_s` → 搬原始 trace 到
    `tool/test/<镜像目录>/trace_<...>.csv`(默认纯搬运不算指标);`test(..., cores="1-6")` 走
    `sudo tool/agent.sh` 独占核;
-3. **分析** `tool/plot.ipynb` — 画调度时间线 / 每周期开销 / pack·algo·post / rollover 开销;
+3. **分析** `tool/plot_main.ipynb` — 画调度时间线 / 每周期开销 / pack·algo·post / rollover 开销;
    `tool/viewer.html` — 拖入 meta/cfg/dag 可视化设计图(pipeline,带端口锚点)与运行图(dag,
    按释放 tp 分列、每算法实例一色、hist 隐式依赖虚线、自环↻仅设计图)。
 
