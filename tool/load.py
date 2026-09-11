@@ -197,7 +197,7 @@ CONFIG = {
         # Random seed.
         "seed_base": 20260910,
 
-        # Output directory.
+        # Output directory（相对仓库根；绝对路径则原样使用）。
         "out_dir": "pipeline",
     },
 
@@ -2112,6 +2112,18 @@ def generate_configuration(kind, u, m, config=None, ):
 # 22. Generate entire experiment
 # ============================================================
 
+def repo_root():
+    """仓库根（含 bin/client 与 tool/）；找不到返回 None。"""
+    d = os.path.abspath(os.getcwd())
+    while True:
+        if os.path.isfile(os.path.join(d, "bin", "client")) and os.path.isdir(os.path.join(d, "tool")):
+            return d
+        p = os.path.dirname(d)
+        if p == d:
+            return None
+        d = p
+
+
 def generate_all(config=None):
     cfg = (
         CONFIG
@@ -2123,9 +2135,15 @@ def generate_all(config=None):
         "workload"
     ]
 
+    # out_dir 相对**仓库根**解析，这样 notebook（cwd=tool/）和命令行（cwd=仓库根）写的是同一处
     out_dir = workload[
         "out_dir"
     ]
+    if not os.path.isabs(out_dir):
+        root = repo_root()
+        if root is None:
+            raise RuntimeError("找不到仓库根（需含 bin/client 与 tool/）")
+        out_dir = os.path.join(root, out_dir)
 
     os.makedirs(
         out_dir,

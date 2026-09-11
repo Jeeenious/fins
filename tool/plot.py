@@ -72,6 +72,10 @@ def build_lifecycles(df):
         current, pending_wake = None, None
         for r in g.itertuples(index=False):
             k = r.kind
+            # overhead 收尾段的右端：complete→finished 之后遇到的第一个 sleep/wake
+            if (k in ("sleep", "wake") and current is not None
+                    and current["fin"] is not None and current["post_end"] is None):
+                current["post_end"] = r.t_us
             if k == "wake":
                 pending_wake = r.t_us
 
@@ -86,7 +90,8 @@ def build_lifecycles(df):
                 current = dict(tid=int(tid), wak_rel=wak, wak_T=wak,
                                rel=r.t_us, rel_cpu=int(r.cpu),
                                exc=None, exc_cpu=None, com=None, com_cpu=None,
-                               fin=None, fin_cpu=None, slp=None, tag=None, segs=[])
+                               fin=None, fin_cpu=None, slp=None, post_end=None,
+                               tag=None, segs=[])
                 pending_wake = None
 
             elif k == "execute" and current is not None:
@@ -111,7 +116,7 @@ def build_lifecycles(df):
                 pending_wake = None
 
         if current is not None and current["fin"] is not None:
-            jobs.append(current)          # trace 截断：slp 未知，保留其余锚点
+            jobs.append(current)  # trace 截断：slp 未知，保留其余锚点
 
     for i, j in enumerate(jobs):
         j["jid"] = i
@@ -160,12 +165,19 @@ def attach_segments(jobs, df):
 
 def build_job_table(jobs):
     """每 job 一行；列名与旧 `_parse_hierarchy_data` 完全一致（下游 cell 不用改），
-    另加分段相关的新列。"""
+    另加分段相关的新列。
+
+    线程额外开销（thread_overhead）口径：
+        [wake → release → execute]  +  [complete → finished → 下一个 sleep/wake]
+    即算法段两侧紧邻的线程占用；算法段本身（execute→complete）是 Active，
+    收尾边界之后的时间（等下一个 job）算 Idle。找得到 sleep/wake 就用它，
+    找不到（trace 截断 / 背靠背无新 wake）退化成 finished。
+    """
     t0 = min((j["rel"] for j in jobs if j["rel"] is not None), default=0.0)
     rows = []
     for j in jobs:
         if j["exc"] is None or j["com"] is None or j["fin"] is None or j["slp"] is None:
-            continue                                   # 锚点不全，跳过（保持旧口径）
+            continue  # 锚点不全，跳过（保持旧口径）
         tag = j["tag"] or "unknown"
         segs = j["segs"]
         cores = [s["cpu"] for s in segs]
@@ -173,7 +185,10 @@ def build_job_table(jobs):
         algo_span = j["com"] - j["exc"]
         wake_2_held = (j["rel"] - j["wak_rel"]) if j["wak_rel"] is not None else np.nan
         thread_pre = (j["exc"] - j["wak_T"]) if j["wak_T"] is not None else np.nan
-        thread_ovh = ((j["slp"] - j["wak_T"]) - algo_span) if j["wak_T"] is not None else np.nan
+        post_end = j["post_end"] if j["post_end"] is not None else j["fin"]
+        thread_post = post_end - j["com"]
+        # 没有 wake 的背靠背 job：pre 记 NaN（图中单列），但 overhead 里按 0 计
+        thread_ovh = (0.0 if pd.isna(thread_pre) else thread_pre) + thread_post
 
         m = {
             "wake_2_held_lat": wake_2_held,
@@ -182,12 +197,12 @@ def build_job_table(jobs):
             "exec_2_route_lat": j["fin"] - j["com"],
             "route_2_sleep_lat": j["slp"] - j["fin"],
             "thread_pre_exec_lat": thread_pre,
-            "thread_post_exec_lat": j["slp"] - j["com"],
+            "thread_post_exec_lat": thread_post,
             "thread_overhead": thread_ovh,
         }
         rows.append({
             "jid": j["jid"], "tid": j["tid"], "algo": tag,
-            "core_id": str(j["exc_cpu"]),              # 执行起点核（兼容旧列）
+            "core_id": str(j["exc_cpu"]),  # 执行起点核（兼容旧列）
             "rel_cpu": j["rel_cpu"], "exc_cpu": j["exc_cpu"], "com_cpu": j["com_cpu"],
             "fin_cpu": j["fin_cpu"],
             # 分段信息（新）
@@ -205,6 +220,15 @@ def build_job_table(jobs):
             if not (pd.isna(algo_span) or pd.isna(thread_ovh)) else np.nan,
             "algo_exec_ms": algo_span / 1000.0,
             "t_min_global": t0,
+            # 6 阶段：7 个锚点（wake/release/execute/working/complete/finished/sleep）
+            # 之间的 6 段墙钟时间，sum = slp − wak_T。working 段只取**第一段**的边界 w1，
+            # 多段 job（algo_seg_n>1）的其余部分都含在 ph_w1_com 里。
+            "ph_wake_rel": (j["rel"] - j["wak_T"]) if j["wak_T"] is not None else np.nan,
+            "ph_rel_exec": j["exc"] - j["rel"],
+            "ph_exec_w1": (segs[0]["end"] - j["exc"]) if segs else np.nan,
+            "ph_w1_com": (j["com"] - segs[0]["end"]) if segs else np.nan,
+            "ph_com_fin": j["fin"] - j["com"],
+            "ph_fin_slp": j["slp"] - j["fin"],
             **m,
         })
     return pd.DataFrame(rows)
@@ -222,9 +246,51 @@ def build_segment_table(df_jobs, jobs):
                 next_core_id=str(s["next_cpu"]), seg=s["seg"], nseg=len(j["segs"]),
                 start=s["start"], end=s["end"], dur_us=s["dur"], dur_ms=s["dur"] / 1000.0,
                 start_ms=(s["start"] - r.t_min_global) / 1000.0,
-                migrated=bool(s["migrated"]) or (len({x["cpu"] for x in j["segs"]}) > 1),
+                end_ms=(s["end"] - r.t_min_global) / 1000.0,
+                # migrated: 这一段的**结束处**发生了迁移（本段核 != 下一段核），迁移点就在 end_ms
+                # job_migrated: 整个 job 是否跨核（筛选用）
+                migrated=bool(s["migrated"]),
                 job_migrated=bool(r.algo_migrated),
             ))
+    return pd.DataFrame(rows)
+
+
+def build_working_segments(df):
+    rows = []
+
+    work = df[df["kind"] == "working"].copy()
+
+    for r in work.itertuples(index=False):
+        p = parse_working(r.tag)
+        if p is None:
+            continue
+
+        node, working_cpu, dur_us = p
+
+        end_us = float(r.t_us)
+        start_us = end_us - float(dur_us)
+
+        event_cpu = int(r.cpu)
+
+        rows.append({
+            "tid": int(r.tid),
+            "seq": int(r.seq),
+            "node": node,
+
+            # tag 中明确声明的执行 CPU
+            "cpu": int(working_cpu),
+
+            # tracepoint event 实际发生的 CPU
+            "event_cpu": event_cpu,
+
+            "start_us": start_us,
+            "end_us": end_us,
+            "dur_us": float(dur_us),
+
+            # 两者不一致则标记
+            "migrated": int(working_cpu) != event_cpu,
+        })
+
     return pd.DataFrame(rows)
 
 
@@ -289,65 +355,164 @@ def algo_color_map(algos):
 
 
 def _clip(df_seg, win):
-    """win=(t0_ms, t1_ms)：只看这个时间窗内的段（与 start_ms 同一坐标系）。"""
+    """win=(t0_ms, t1_ms)：只看这个时间窗内的段（与 start_ms / end_ms 同一坐标系）。"""
     if win is None:
         return df_seg
     lo, hi = win
-    return df_seg[(df_seg["end"] / 1000.0 >= lo) & (df_seg["start_ms"] <= hi)].copy()
+    return df_seg[(df_seg["end_ms"] >= lo) & (df_seg["start_ms"] <= hi)].copy()
 
 
-def draw_core_gantt(df_seg, win=None, only_migrated=False, show_migration=True,
-                    title=None):
-    """每核心一条泳道：直接用 working 给出的显式区间画，不在事件时刻上做推导。
-
-    win=(t0_ms, t1_ms) 只看窗口；only_migrated=True 只看跨核 job 的段。
-    """
+def draw_core_gantt(
+    df_seg,
+    win=None,
+    show_migration=True,
+    title=None,
+):
     if df_seg is None or df_seg.empty:
         print("无分段数据")
         return None
-    sg = _clip(df_seg, win)
-    if only_migrated:
-        sg = sg[sg["job_migrated"]]
+
+    sg = df_seg.copy()
+
+    # ------------------------------------------------------------
+    # 1. 时间窗口
+    # ------------------------------------------------------------
+    if win is not None:
+        lo, hi = win
+
+        sg = sg[
+            (sg["end_ms"] >= lo) &
+            (sg["start_ms"] <= hi)
+        ].copy()
+
     if sg.empty:
         print("窗口内无段")
         return None
 
-    fig = px.bar(sg, base="start_ms", x="dur_ms", y="core_id", color="algo",
-                 orientation="h", opacity=0.85,
-                 color_discrete_map=algo_color_map(sg["algo"]),
-                 category_orders={"algo": algo_order(sg["algo"])},
-                 title=title or ("Core Timeline — 每段显式区间"
-                                 + ("（仅迁移 job）" if only_migrated else "")),
-                 hover_data={"tid": True, "algo": True, "core_id": True, "nseg": True,
-                             "seg": True, "job_migrated": True,
-                             "start_ms": ":.3f", "dur_ms": ":.3f"},
-                 labels={"start_ms": "Time (ms)", "dur_ms": "Duration (ms)",
-                         "core_id": "Core", "algo": "Algo"})
-    fig.update_layout(barmode="overlay", plot_bgcolor="white",
-                      height=240 + 90 * sg["core_id"].nunique(),
-                      yaxis_title="Core", xaxis_title="Time (ms)")
+    # ------------------------------------------------------------
+    # 2. 固定 CPU lane 顺序
+    #
+    # 注意：
+    # core_order 从原始 df_seg 获取，而不是 sg。
+    # 这样过滤某个 node 后，CPU lane 不会重新排列。
+    # ------------------------------------------------------------
+    core_order = sorted(
+        df_seg["core_id"].astype(str).unique(),
+        key=lambda x: int(x),
+    )
 
-    if show_migration:
-        mg = sg[sg["migrated"]]
-        if not mg.empty:
-            fig.add_trace(go.Scatter(
-                x=mg["end"] / 1000.0, y=mg["core_id"], mode="markers", name="迁移",
-                marker=dict(symbol="line-ns-open", size=15, color="black", line_width=2),
-                customdata=mg[["algo", "tid", "dur_us"]].values,
-                hovertemplate=("迁移点<br>algo=%{customdata[0]} tid=%{customdata[1]}<br>"
-                               "本段 %{customdata[2]} us<extra></extra>")))
+    # ------------------------------------------------------------
+    # 3. 固定算法/节点颜色
+    #
+    # 也从完整 df_seg 获取，避免过滤节点后颜色重新分配。
+    # ------------------------------------------------------------
+    all_algo_order = algo_order(df_seg["algo"])
+    all_algo_colors = algo_color_map(df_seg["algo"])
+
+    # ------------------------------------------------------------
+    # 4. Gantt
+    # ------------------------------------------------------------
+    fig = px.bar(
+        sg,
+        base="start_ms",
+        x="dur_ms",
+        y="core_id",
+        color="algo",
+        orientation="h",
+        opacity=0.85,
+
+        color_discrete_map=all_algo_colors,
+
+        category_orders={
+            "core_id": core_order,
+            "algo": all_algo_order,
+        },
+
+        hover_data=[
+            "jid",
+            "tid",
+            "algo",
+            "core_id",
+            "next_core_id",
+            "seg",
+            "start_ms",
+            "end_ms",
+            "dur_us",
+            "migrated",
+        ],
+    )
+
+    fig.update_layout(
+        barmode="overlay",
+        plot_bgcolor="white",
+
+        # 使用完整 CPU 数量，而不是 sg 中的 CPU 数量
+        height=240 + 90 * len(core_order),
+
+        yaxis_title="CPU",
+        xaxis_title="Time (ms)",
+        title=title,
+    )
+
+    # ------------------------------------------------------------
+    # 5. 时间窗口
+    # ------------------------------------------------------------
     if win is not None:
         fig.update_xaxes(range=[win[0], win[1]])
+
+    # ------------------------------------------------------------
+    # 6. migration marker
+    # ------------------------------------------------------------
+    if show_migration:
+        mg = sg[sg["migrated"]]
+
+        if not mg.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=mg["end_ms"],
+                    y=mg["next_core_id"],
+                    mode="markers",
+                    name="迁移",
+
+                    marker=dict(
+                        symbol="x",
+                        size=10,
+                    ),
+
+                    customdata=mg[
+                        [
+                            "jid",
+                            "tid",
+                            "algo",
+                            "core_id",
+                            "next_core_id",
+                            "end_ms",
+                        ]
+                    ],
+
+                    hovertemplate=(
+                        "jid=%{customdata[0]}<br>"
+                        "tid=%{customdata[1]}<br>"
+                        "algo=%{customdata[2]}<br>"
+                        "CPU=%{customdata[3]} → "
+                        "%{customdata[4]}<br>"
+                        "time=%{customdata[5]:.3f} ms"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
     return fig
 
 
 def draw_core_utilization(df_raw, df_seg, df_jobs, title=None):
     """每核时间都花在哪：Active = 该核上算法段之和；Overhead = 线程前后开销。
 
-    注意与旧版口径的差别：旧版按 job 的 `core_id` 把整段 algo 记到一个核上，
-    线程跨核时会算错；这里 Active 直接来自每段的真实所在核。
-    Overhead 按发生位置拆：pre(release 前转身) 记 rel_cpu，post(收尾到 sleep) 记 fin_cpu。
-    Idle = 墙钟 − Active − Overhead。
+    口径：
+        Active   = Σ 每段 dur（按段真实所在核归属）
+        Overhead = [wake → release → execute] + [complete → finished → 下一个 sleep/wake]
+                   pre 记 release 所在核（rel_cpu），post 记 finished 所在核（fin_cpu）
+        Idle     = 墙钟 − Active − Overhead（不夹断：三态应严格等于墙钟）
     """
     if df_jobs is None or df_jobs.empty:
         print("无 job 数据")
@@ -364,7 +529,9 @@ def draw_core_utilization(df_raw, df_seg, df_jobs, title=None):
     for c in cores:
         a = float(active.get(c, 0.0))
         o = float(pre.get(c, 0.0) or 0.0) + float(post.get(c, 0.0) or 0.0)
-        i = max(0.0, wall - a - o)
+        i = wall - a - o
+        if i < 0:
+            print(f"⚠️ CPU{c}: Active+Overhead 超过墙钟 {(-i) / 1000:.1f} ms，口径仍有重叠")
         rec += [dict(core_id=c, State="1. Active", pct=a / wall * 100),
                 dict(core_id=c, State="2. Overhead", pct=o / wall * 100),
                 dict(core_id=c, State="3. Idle", pct=i / wall * 100)]
@@ -377,4 +544,120 @@ def draw_core_utilization(df_raw, df_seg, df_jobs, title=None):
                  labels={"pct": "Percentage of wall clock (%)", "core_id": "Core"})
     fig.update_layout(plot_bgcolor="white", xaxis=dict(range=[0, 105], ticksuffix="%"),
                       height=200 + 40 * len(cores), legend_title="")
+    return fig
+
+
+# --------------------------------------------------------------------------- 额外开销
+
+def _short_wakeups(df, max_gap_us=1000.0):
+    """短唤醒：同一 tid 上相邻事件恰为 sleep/wake 且间隔 ≤ max_gap_us（线程空转轮询对）。
+
+    按**较早那个事件**所在核归属。返回 DataFrame(core_id, dur_us, first_kind)。
+    """
+    rows = []
+    for _, g in df.groupby("tid", sort=False):
+        ev = list(g.itertuples(index=False))
+        for a, b in zip(ev, ev[1:]):
+            if {a.kind, b.kind} == {"sleep", "wake"} and (b.t_us - a.t_us) <= max_gap_us:
+                rows.append((str(int(a.cpu)), float(b.t_us - a.t_us), a.kind))
+    return pd.DataFrame(rows, columns=["core_id", "dur_us", "first_kind"])
+
+
+def cpu_overhead_breakdown(df_raw, df_jobs, df_seg, max_short_us=1000.0,
+                           include_exec_gap=True, verbose=True):
+    """各 CPU 的额外开销占比。
+
+    计算开销 `compute` = 该核上算法段的真实占核时间（Σ seg.dur）——已经明确，不重复计入。
+
+    额外开销 = 短唤醒(sleep↔wake，间隔 ≤ max_short_us)
+             + wake→release
+             + release→execute（抢占/排队）
+             + execute→finished 的**非计算**部分（跨段间隙 + 发布收尾）
+             + finished→(之后第一个 wake 或 sleep)
+
+    归属核：前两段记 release 所在核、execute→finished 记 execute 所在核、
+    收尾段记 finished 所在核、短唤醒记较早事件的核。
+    `include_exec_gap=False` 时不把 execute→finished 的非计算部分计入。
+
+    返回每核一行的 DataFrame（含各阶段与占比），verbose=True 时打印百分比表。
+    """
+    if df_jobs is None or df_jobs.empty:
+        print("无 job 数据")
+        return pd.DataFrame()
+
+    wall = float(df_raw["t_us"].max() - df_raw["t_us"].min())
+    short = _short_wakeups(df_raw, max_short_us)
+
+    j = df_jobs.copy()
+    j["exc_fin"] = j["exec_2_route_lat"] + j["algo_exec_span"]  # finished − execute
+    j["fin_next"] = (j["thread_post_exec_lat"] - j["exec_2_route_lat"]).clip(lower=0)  # post_end − finished
+
+    def s(col, key):
+        return j.groupby(j[key].astype(str))[col].sum().to_dict()
+
+    stages = {
+        "wake_rel": s("wake_2_held_lat", "rel_cpu"),
+        "rel_exec": s("held_2_exec_lat", "rel_cpu"),
+        "exc_fin": s("exc_fin", "exc_cpu"),
+        "fin_next": s("fin_next", "fin_cpu"),
+        "short_wake": short.groupby("core_id")["dur_us"].sum().to_dict() if len(short) else {},
+        "fin_next_wake": s("fin_next", "fin_cpu"),  # 收尾段（端点可能是 wake 或 sleep）
+    }
+    compute = df_seg.groupby("core_id")["dur_us"].sum().to_dict() if len(df_seg) else {}
+
+    cores = sorted(set(stages["exc_fin"]) | set(stages["wake_rel"]) | set(stages["fin_next"])
+                   | set(compute) | set(stages["short_wake"]), key=lambda x: _algo_num(x))
+
+    rec = []
+    for c in cores:
+        src = {k: float(v.get(c, 0.0) or 0.0) for k, v in stages.items()}
+        comp = float(compute.get(c, 0.0))
+        gap = max(0.0, src["exc_fin"] - comp)  # job 内的非计算时间
+        ovh = src["short_wake"] + src["wake_rel"] + src["rel_exec"] + src["fin_next"]
+        if include_exec_gap:
+            ovh += gap
+        rec.append(dict(core_id=c, wall_us=wall, compute_us=comp, compute_pct=comp / wall * 100,
+                        short_wake_us=src["short_wake"], wake_rel_us=src["wake_rel"],
+                        rel_exec_us=src["rel_exec"], exc_fin_us=src["exc_fin"],
+                        exec_gap_us=gap, fin_next_us=src["fin_next"],
+                        overhead_us=ovh, overhead_pct=ovh / wall * 100,
+                        other_pct=(wall - comp - ovh) / wall * 100))
+    df = pd.DataFrame(rec).sort_values("overhead_pct", ascending=False).reset_index(drop=True)
+
+    if verbose:
+        t = df.copy()
+        for c in [x for x in t.columns if x.endswith("_us")]:
+            t[c[: -len("_us")]] = (t[c] / 1000).round(2)  # µs -> ms
+        t = t.drop(columns=[x for x in t.columns if x.endswith("_us")])
+        print(f"额外开销占比（分母 = 墙钟 {wall / 1000:.0f} ms；"
+              f"短唤醒阈值 {max_short_us:.0f} µs，{'计入' if include_exec_gap else '不计入'} execute→finished 的非计算部分）")
+        print(t.round(3).to_string(index=False))
+        fin_next, ovh = df["fin_next_us"].sum(), df["overhead_us"].sum()
+        if ovh > 0 and fin_next > 0.5 * ovh and fin_next > wall:
+            print("⚠️ 收尾段 finished→wake/sleep 占了大头：这份 trace 的 sleep/wake 是线程级轮询，"
+                  "该段量到的是线程空等而不是 job 开销。\n"
+                  "   要么把这段从额外开销里剔除（只看短唤醒/wake→release/release→execute/exc→fin 间隙），"
+                  "要么改用 FINS 标准化后的 trace。")
+    return df
+
+
+def draw_cpu_overhead(df_ovh, title=None):
+    """各 CPU 额外开销占比堆叠图（占比 %，分母为墙钟）。"""
+    if df_ovh is None or df_ovh.empty:
+        print("无数据")
+        return None
+    stages = [("short_wake_us", "短唤醒 sleep↔wake"), ("wake_rel_us", "wake→release"),
+              ("rel_exec_us", "release→execute(抢占)"), ("exec_gap_us", "execute→finished 非计算"),
+              ("fin_next_us", "finished→wake/sleep")]
+    long = df_ovh.melt(id_vars=["core_id", "wall_us"], value_vars=[k for k, _ in stages],
+                       var_name="stage", value_name="us")
+    long["pct"] = long["us"] / long["wall_us"] * 100
+    cmap = dict(zip([k for k, _ in stages],
+                    ["#D6A531", "#D4834A", "#A6192E", "#925E9F", "#8CAA8C"]))
+    fig = px.bar(long, x="pct", y="core_id", color="stage", orientation="h", barmode="stack",
+                 color_discrete_map=cmap, category_orders={"core_id": list(df_ovh["core_id"])},
+                 title=title or "Per-core Overhead Breakdown (% of wall clock)",
+                 labels={"pct": "% of wall clock", "core_id": "Core", "stage": ""})
+    fig.update_layout(plot_bgcolor="white", height=180 + 60 * len(df_ovh),
+                      legend=dict(orientation="h", y=-0.25))
     return fig

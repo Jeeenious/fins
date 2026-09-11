@@ -2,15 +2,15 @@
 # coding: utf-8
 
 # # test — 自动化数据采集（pipeline 测试）
-# 
-# 配套 `tool/uload.ipynb` 生成的 `{kind}_u.._m.._ms<桶号>_s<seed>.json`：
+#
+# 配套 `load.py` 生成的 `{kind}_u.._m.._ms<桶号>_s<seed>.json`：
 # 对每份 cfg，以 workers=m 起 `bin/client` + `bin/server` 灌 cfg，跑 `dur_s` 秒 → 终止 →
 # 把 client 导出的 trace（`tool/temp/tracing.csv`）**复制**到结果目录（原件保留在 tool/temp，不删）。**只搬运原始 trace，不算指标**；
 # **默认每份测一轮(trials=1)**。
 # 
 # ## 结果存放（镜像输入目录）
-# - 输入目录 = `cfg_dir`（默认 `tool/uload/`，可递归含子目录）；
-# - 结果根 = `test_dir`（默认 `tool/test/`），镜像 `cfg_dir` 的子目录结构；
+# - 输入目录 = `cfg_dir`（默认 `pipeline/`，可递归含子目录）；
+# - 结果根 = `test_dir`（默认 `result/`），镜像 `cfg_dir` 的子目录结构；
 # - 每份 cfg → 同目录 `trace_<cfg名去cfg_前缀>.csv`；`trials>1` 加 `_r<rep>`。
 # 
 # ## tool/temp（run 导出中间目录）
@@ -146,7 +146,7 @@ def test(directory, out, temp_dir="tool/temp", dur_s=5.0, warm_s=1.0, trials=1, 
     if u is not None: cfgs = [c for c in cfgs if abs(c[1] - u) < 1e-9]
     if m is not None: cfgs = [c for c in cfgs if c[2] == m]
     if not cfgs:
-        print(f"[test] {directory} 下没找到 *.json（先到 tool/uload.ipynb 生成）")
+        print(f"[test] {directory} 下没找到 *.json（先跑 load.py / main.ipynb 第 1 步生成）")
         return 0
     moved = 0
     for rel, uu, mm, kind, seed in cfgs:
@@ -190,10 +190,10 @@ def test(directory, out, temp_dir="tool/temp", dur_s=5.0, warm_s=1.0, trials=1, 
 # - `directory/out/temp_dir` 相对路径按仓库根解析；client 启动 cwd=仓库根 → 导出目录固定 `root/<temp_dir>`。
 
 
-# ── 参数（可配置）────────────────────────────
-cfg_dir   = "tool/pipeline/"   # 目标 json(cfg)存放目录
-test_dir = "tool/fins/"          # 结果根(镜像 cfg_dir 子目录结构)
-temp_dir = "tool/temp/"              # client(client)导出目录(./tool/temp/tracing.csv，相对仓库根)
+# ── 参数（可配置，相对路径按仓库根解析）────────────
+cfg_dir   = "pipeline/"       # 目标 json(cfg)存放目录（load.py 的输出）
+test_dir  = "result/"         # 结果根(镜像 cfg_dir 子目录结构)
+temp_dir  = "tool/temp/"      # client 导出目录(./tool/temp/tracing.csv，相对仓库根)
 dur_s     = 10.0                  # ★ 测试时长(秒)：每份 cfg 跑多久
 warm_s    = 2                  # 启动 client 后/计时前预热
 trials    = 1                    # 每份测几轮(默认 1)

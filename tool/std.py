@@ -17,10 +17,10 @@ working 行格式与 ROS 导出一致：`n7 [CPU 2, 22793 us]`，位置在 `exec
 
 用法：只需要给定三个目录（原始 trace / pipeline JSON / 标准化输出）
 
-    python3 std.py fins pipeline fins_std          # 逐份配对 <stem>.csv + <stem>.json
+    python3 std.py result pipeline result_std      # 逐份配对 <stem>.csv + <stem>.json
 
     import std
-    std.standardize("fins", "pipeline", "fins_std")   # 目录里所有同名 csv/json 配对转换
+    std.standardize("result", "pipeline", "result_std")   # 目录里所有同名 csv/json 配对转换
 
 没有匹配 JSON 的 trace 会被跳过（不会退化成整段算一个核）。
 """
