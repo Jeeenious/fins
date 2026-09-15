@@ -47,7 +47,6 @@
 #include "mesg/mesg.hpp"
 #include "third_party/json.hpp"
 #include "utils/time.hpp"
-#include "utils/tracing.hpp"
 
 namespace fins::rt {
   struct Library;
@@ -1000,16 +999,8 @@ namespace fins::rt {
 
                 const auto _t0 = std::chrono::steady_clock::now();
 
-#ifdef FINS_EXPORT_TRACING_PATH
-                fins::util::trace_record(fins::util::TraceKind::EXECUTE, sinfo->id); // 执行（job 开始）
-#endif
-
                 algo->execute(inputs,
                               outputs); // 配置已建图期注入 algo 实例（AlgoFunc configs_ 类型化帧，execute 零解析）
-
-#ifdef FINS_EXPORT_TRACING_PATH
-                fins::util::trace_record(fins::util::TraceKind::COMPLETE, sinfo->id); // 执行（job 完成）
-#endif
 
                 record_exec(sinfo->name,
                             std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - _t0)

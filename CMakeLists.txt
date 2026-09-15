@@ -14,6 +14,8 @@ endif()
 find_package(TBB REQUIRED)
 find_package(fmt REQUIRED)
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LTTngUST REQUIRED lttng-ust)
 
 # 头文件已从 sdk/fins/ 迁移到仓库根 include/，按新布局修正 include 目录：
 #   ${SDK_ROOT}/include        头文件根（顶层 *.hpp、algo/、mesg/、utils/）
@@ -27,10 +29,38 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin")
 set(LIBRARY_OUTPUT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/lib")
 
 include_directories(
-    ${SDK_ROOT}/include
-    ${SDK_ROOT}/include/utils
     ${SDK_ROOT}
+    ${SDK_ROOT}/core
+    ${SDK_ROOT}/core/utils
+    ${SDK_ROOT}/core/algo
+    ${SDK_ROOT}/core/mesg
+    ${LTTngUST_INCLUDE_DIRS}
 )
+
+# =================================================================
+# 1. 功能测试主程序 + 配置客户端（手动运行，不 POST_BUILD 自动跑）
+#    client [rpc_port] [plugin_dir] — 装配 RPC/loader/pool + 持续调度循环，收外部 JSON
+#    server [interval|cfg.json] [port] — 轮换发配置 / 单次发配置
+#    算法插件 = plugins/plugin.so（含 usr_* 全部算法；plugin_dir 指向该目录）
+# =================================================================
+add_executable(client
+        trace/core_tracepoints.cpp
+        example/client.cpp)
+target_include_directories(client PRIVATE
+        ${SDK_ROOT}/trace
+        ${SDK_ROOT}/core
+        ${SDK_ROOT}/core/utils
+        ${SDK_ROOT}/core/algo
+        ${SDK_ROOT}/core/mesg
+        ${LTTngUST_INCLUDE_DIRS}
+)
+target_link_libraries(client PRIVATE TBB::tbb dl fmt::fmt Threads::Threads ${LTTngUST_LIBRARIES})
+
+add_executable(server
+        example/server.cpp)
+target_include_directories(server PRIVATE
+)
+target_link_libraries(server PRIVATE TBB::tbb dl fmt::fmt Threads::Threads)
 
 # =================================================================
 # 2. 用户算法插件（单个 .so 装全部算法）
@@ -39,86 +69,14 @@ include_directories(
 #    library_g.so_ctx "命中任一即可"——无需多份内容相同的 .so（PLUGIN_ID 未使用）
 # =================================================================
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/example/plugins.cpp")
-    add_library(plugin SHARED example/plugins.cpp)
+    add_library(plugin SHARED
+            trace/algo_tracepoints.cpp
+            example/plugins.cpp)
     target_include_directories(plugin PRIVATE
-        ${SDK_ROOT}/include/utils
-        ${SDK_ROOT}/include
-        ${SDK_ROOT}
+        ${SDK_ROOT}/trace
+        ${SDK_ROOT}/core
+        ${LTTngUST_INCLUDE_DIRS}
     )
+    target_link_libraries(plugin PRIVATE ${LTTngUST_LIBRARIES})
     set_target_properties(plugin PROPERTIES PREFIX "")
 endif()
-
-# ── OpenCV 模块化插件：按 OpenCV 模块各一独立 .so（cv::Mat 为跨边载荷；同 .so 内
-#    typeid 自洽，cv::Mat 的 typeinfo/ABI 标签来自共享 libopencv_core，跨 .so 亦一致；
-#    每个源文件单文件自包含，dlopen 时自执行 cv::setNumThreads(0) 禁用其后台线程池）──
-find_package(OpenCV REQUIRED)
-foreach(OCV_MOD core imgproc photo features2d imgcodecs videoio calib3d objdetect video ml dnn)
-  set(OCV_SRC "${CMAKE_CURRENT_SOURCE_DIR}/example/plugins_opencv_${OCV_MOD}.cpp")
-  if(EXISTS "${OCV_SRC}")
-    add_library(fins_opencv_${OCV_MOD} SHARED "${OCV_SRC}")
-    target_include_directories(fins_opencv_${OCV_MOD} PRIVATE
-        ${SDK_ROOT}/include/utils
-        ${SDK_ROOT}/include
-        ${SDK_ROOT}
-        ${OpenCV_INCLUDE_DIRS}
-    )
-    target_link_libraries(fins_opencv_${OCV_MOD} PRIVATE ${OpenCV_LIBS})
-    set_target_properties(fins_opencv_${OCV_MOD} PROPERTIES PREFIX ""
-        OUTPUT_NAME "plugins_opencv_${OCV_MOD}")
-  endif()
-endforeach()
-
-# ── PCL 模块化插件：按 PCL 库各一独立 .so（载荷 pcl::PointCloud<...>，跨 .so 的 ABI
-#    标签来自共享 libpcl_*（util::ABITag<PointCloud<PointT>>=PCL 版本）；每源文件先 include
-#    PCL 头再 include xmacro.hpp 以让 tag_ABI 生效。
-#    PCLConfig 会把整条 VTK/MPI/Qt 依赖链拖进来（本机 VTK 引用 MPI::MPI_C 等易碎），故
-#    绕开它：include 目录取自 pkg-config，链接只用手工解析出的核心非 VTK pcl 库 + FLANN。
-#    源文件单文件自包含，无共享私有头）──
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(PCL_PC QUIET pcl_common)   # 仅取其 include 目录（pcl/eigen 路径）
-set(PCL_CORE_LIBS "")
-foreach(_pl common kdtree octree search sample_consensus filters ml features segmentation registration)
-  find_library(_pcl_lib_${_pl} NAMES pcl_${_pl})
-  if(_pcl_lib_${_pl})
-    list(APPEND PCL_CORE_LIBS "${_pcl_lib_${_pl}}")
-  endif()
-endforeach()
-find_library(PCL_FLANN_LIB NAMES flann)
-find_library(PCL_FLANN_CPP_LIB NAMES flann_cpp)
-foreach(PCL_MOD common filters segmentation features registration)
-  set(PCL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/example/plugins_pcl_${PCL_MOD}.cpp")
-  if(EXISTS "${PCL_SRC}")
-    add_library(fins_pcl_${PCL_MOD} SHARED "${PCL_SRC}")
-    target_include_directories(fins_pcl_${PCL_MOD} PRIVATE
-        ${SDK_ROOT}/include/utils
-        ${SDK_ROOT}/include
-        ${SDK_ROOT}
-        ${PCL_PC_INCLUDE_DIRS}
-    )
-    target_link_libraries(fins_pcl_${PCL_MOD} PRIVATE
-        ${PCL_CORE_LIBS} ${PCL_FLANN_LIB} ${PCL_FLANN_CPP_LIB})
-    set_target_properties(fins_pcl_${PCL_MOD} PROPERTIES PREFIX ""
-        OUTPUT_NAME "plugins_pcl_${PCL_MOD}")
-  endif()
-endforeach()
-
-# =================================================================
-# 8. 功能测试主程序 + 配置客户端（手动运行，不 POST_BUILD 自动跑）
-#    client [rpc_port] [plugin_dir] — 装配 RPC/loader/pool + 持续调度循环，收外部 JSON
-#    server [interval|cfg.json] [port] — 轮换发配置 / 单次发配置
-#    算法插件 = plugins/plugin.so（含 usr_* 全部算法；plugin_dir 指向该目录）
-# =================================================================
-add_executable(client example/client.cpp)
-target_include_directories(client PRIVATE
-    ${SDK_ROOT}/include
-    ${SDK_ROOT}/include/utils
-    ${SDK_ROOT}
-)
-target_link_libraries(client PRIVATE TBB::tbb dl fmt::fmt Threads::Threads)
-
-add_executable(server example/server.cpp)
-target_include_directories(server PRIVATE
-    ${SDK_ROOT}/include
-    ${SDK_ROOT}
-)
-target_link_libraries(server PRIVATE TBB::tbb dl fmt::fmt Threads::Threads)

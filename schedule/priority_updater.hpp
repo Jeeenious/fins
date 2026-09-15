@@ -27,9 +27,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../include/utils/form.hpp"
-#include "../include/utils/time.hpp"
-#include "../include/g_state.hpp"
+#include "form.hpp"
+#include "time.hpp"
+#include "g_state.hpp"
 
 namespace fins::sched {
 

@@ -34,8 +34,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../include/utils/form.hpp"
-#include "../include/g_state.hpp"
+#include "form.hpp"
+#include "g_state.hpp"
 
 namespace fins::sched {
 

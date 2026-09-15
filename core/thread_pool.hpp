@@ -17,6 +17,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -97,6 +98,8 @@ namespace fins::rt {
     ThreadPool &operator=(const ThreadPool &) = delete;
 
     void working(int idx) {
+      // ★ 线程名（comm）：内核 sched_switch 的 prev_comm/next_comm 读的就是它。
+      set_thread_name("fins_worker-" + std::to_string(idx));
       bind_core(idx + 1);  // 跳过 core 0
       set_realtime(1);    // SCHED_FIFO 实时优先级：同核 CFS（主线程/计时线程）不能抢占忙等待
       FINS_LOG_INFO("[ThreadPool] worker {} -> core {}", idx, idx + 1);
@@ -117,6 +120,13 @@ namespace fins::rt {
           FINS_LOG_ERROR("[ThreadPool] worker {} callback threw unknown exception", idx);
         }
       }
+    }
+
+    /// 设置当前线程名（comm）。仅影响可观测性（sched_switch prev_comm/next_comm、top -H、
+    /// ps -T、perf、gdb），失败（如名字超长 / 权限）只告警，不影响调度正确性。
+    static void set_thread_name(const std::string &name) {
+      if (pthread_setname_np(pthread_self(), name.c_str()) != 0)
+        FINS_LOG_WARN("[ThreadPool] set thread name '{}' failed: {}", name, strerror(errno));
     }
 
     static void bind_core(int core) {
