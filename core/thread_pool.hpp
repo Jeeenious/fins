@@ -99,9 +99,9 @@ namespace fins::rt {
 
     void working(int idx) {
       // ★ 线程名（comm）：内核 sched_switch 的 prev_comm/next_comm 读的就是它。
-      set_thread_name("fins_worker-" + std::to_string(idx));
-      bind_core(idx + 1);  // 跳过 core 0
-      set_realtime(1);    // SCHED_FIFO 实时优先级：同核 CFS（主线程/计时线程）不能抢占忙等待
+      set_thread_name("fins_worker/" + std::to_string(idx+1));
+      bind_core(idx+1);  // 跳过 core 0
+      set_realtime(50);    // SCHED_FIFO 实时优先级，工作线程可以主动让出核心，其他线程临时使用核心允许，但工作线程有任务时将抢占
       FINS_LOG_INFO("[ThreadPool] worker {} -> core {}", idx, idx + 1);
 
       {  // 宣布就绪：start() 据此得知所有 worker 已绑定核、即将在取任务回调上等待

@@ -162,7 +162,7 @@ int main(int argc, char **argv) {
       tracepoint(fins, sleep);
 
       // grab 取空（无积压）→ 睡 1ms。★ 这里 w 是 if 初始化的 nullptr，**不可**解引用 w->id
-      graph_g.cv.wait_for(lk, std::chrono::milliseconds(100));   // 无积压才睡：等完成/回绕/expand_hp/停止（notify 快路径 + 1ms 超时兜底 lost wakeup）
+      graph_g.cv.wait_for(lk, std::chrono::milliseconds(10));   // 无积压才睡：等完成/回绕/expand_hp/停止（notify 快路径 + 1ms 超时兜底 lost wakeup）
 
     }
   });
@@ -179,6 +179,7 @@ int main(int argc, char **argv) {
   //    + notify（与 worker 完成事件共同唤醒主线程调度循环）。tp 顶点在 pin_sync 建图时已写入
   //    job = sleep_until（绝对释放时刻，job 内实时读 hyper_start_ms → rollover 平移自动对齐）──
   std::thread timer_th([&] {
+
 
     std::unique_lock tl(graph_g.mtx);
     for (;;) {
@@ -200,7 +201,7 @@ int main(int argc, char **argv) {
         continue;
       }
 
-      graph_g.cv.wait_for(tl, std::chrono::milliseconds(100));   // 无待释放时间点 → 等事件（notify 快路径 + 1ms 超时兜底 lost wakeup）
+      graph_g.cv.wait_for(tl, std::chrono::milliseconds(10));   // 无待释放时间点 → 等事件（notify 快路径 + 1ms 超时兜底 lost wakeup）
 
     }
   });
