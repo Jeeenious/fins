@@ -1,30 +1,78 @@
 from pathlib import Path
+from collections import defaultdict
+
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 
-WORKER = "fins_worker"
-# WORKER = "cie_container"
+# 目标 worker 的 comm 前缀（按实验场景选一个或全开）
+WORKER_PREFIXES = (
+    "fins_worker",
+    "cie_container",
+    "mte_container",
+)
+
+
+def _is_worker(comm_str: str) -> bool:
+    return comm_str.startswith(WORKER_PREFIXES)
+
+
+def _subtract_intervals(block_start, block_end, occupied):
+    """
+    从 [block_start, block_end] 中减去 occupied 里的所有区间。
+    occupied: list of (start, end)，需已排序、互不重叠。
+    返回剩余子区间列表 [(s, e), ...]。
+    """
+    remaining = []
+    cursor = block_start
+    for s, e in occupied:
+        if e <= cursor:
+            continue
+        if s >= block_end:
+            break
+        if s > cursor:
+            remaining.append((cursor, min(s, block_end)))
+        cursor = max(cursor, e)
+        if cursor >= block_end:
+            break
+    if cursor < block_end:
+        remaining.append((cursor, block_end))
+    return remaining
+
 
 def generate_execution_gantt(
-        preempt_csv: str = "feedback_u70_m3_ms05_s20632672_135004_preempt.csv",
-        timeline_csv: str = "feedback_u70_m3_ms05_s20632672_135004_timeline.csv",
+        preempt_csv: str,
+        timeline_csv: str,
         zoom_window_ms=None,
         output_html: str = "cpu_activate_timeline.html",
+        show_overhead: bool = True,
+        overhead_color: str = "#FFB347",
 ):
-    """生成对齐内核调度、同时展示应用层任务物理执行与 CPU Idle 状态的甘特图"""
+    """
+    生成 CPU 执行甘特图：
+      - 有色块 = 目标 worker 执行 job 的时间段
+      - 橙色块 = 目标 worker 在 CPU 上但不属于任何 job 的时间（Overhead）
+      - 非 worker 的时间不画（留白）
+    """
     print("正在读取数据 (Gantt)...")
     df_preempt = pd.read_csv(preempt_csv)
     df_timeline = pd.read_csv(timeline_csv)
 
-    global_t0 = df_timeline["t_us"].min()
+    # ---- 统一时间基准 ----
+    # 两个 CSV 应共享同一 t0，且第一行 t_us 已归零。
+    # 为稳妥，仍以两者各自最小值为基准做一次线性对齐。
+    preempt_t0 = df_preempt["t_us"].min()
+    timeline_t0 = df_timeline["t_us"].min()
 
-    def to_ms(ts_us):
-        return (ts_us - global_t0) / 1000.0
+    def preempt_ms(ts_us):
+        return (ts_us - preempt_t0) / 1000.0
 
-    # 1. 建立内核 CPU 运行区间表 (包括有效任务和 Idle/swapper)
-    cpu_intervals = []
-    idle_intervals = []
+    def timeline_ms(ts_us):
+        return (ts_us - timeline_t0) / 1000.0
+
+    # ============================================================
+    # 1. 从 preempt.csv 构造每个 CPU 上"目标 worker"的运行片段
+    # ============================================================
+    cpu_intervals = []   # 只保留目标 worker 的片段
 
     for cpu, group in df_preempt.groupby("cpu"):
         group = group.sort_values("t_us")
@@ -33,40 +81,32 @@ def generate_execution_gantt(
         tids = group["next_tid"].values
 
         for i in range(len(times) - 1):
-            start_us = times[i]
-            end_us = times[i + 1]
-            comm = comms[i]
-            tid = tids[i]
-
-            start_ms = to_ms(start_us)
-            end_ms = to_ms(end_us)
+            start_ms = preempt_ms(times[i])
+            end_ms = preempt_ms(times[i + 1])
             dur_ms = end_ms - start_ms
-            comm_str = str(comm)
+            if dur_ms <= 0:
+                continue
 
-            if dur_ms > 0:
-                if comm_str.startswith("fins_worker") or comm_str.startswith("cie_container") or comm_str.startswith("mte_container"):
-                    cpu_intervals.append({
-                        "cpu_id": int(cpu),
-                        "start_ms": start_ms,
-                        "end_ms": end_ms,
-                        "dur_ms": dur_ms,
-                        "tid": int(tid),
-                        "comm": comm,
-                    })
-                else:
-                    # ★ 修改处：任何非 fins_worker 的线程（包括 swapper、kworker、系统杂务等）统一归入 Idle/系统底噪
-                    idle_intervals.append({
-                        "core_id": f"CPU {int(cpu)}",
-                        "start_ms": start_ms,
-                        "end_ms": end_ms,
-                        "dur_ms": dur_ms,
-                        "algo": "Idle",
-                    })
+            comm_str = str(comms[i])
+            if not _is_worker(comm_str):
+                continue    # 非 worker 不画
+
+            cpu_intervals.append({
+                "cpu_id": int(cpu),
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "dur_ms": dur_ms,
+                "tid": int(tids[i]),
+                "comm": comm_str,
+            })
 
     df_cpu_blocks = pd.DataFrame(cpu_intervals)
-    df_idle = pd.DataFrame(idle_intervals)
+    if df_cpu_blocks.empty:
+        print("⚠️ 没有匹配到任何目标 worker 的 sched_switch 片段，图将为空。")
 
-    # 2. 提取应用层 Job 的执行生命周期
+    # ============================================================
+    # 2. 从 timeline.csv 提取 job 生命周期 (execute → complete)
+    # ============================================================
     def clean_tag(val):
         if pd.isna(val):
             return None
@@ -84,40 +124,45 @@ def generate_execution_gantt(
         if not algo:
             continue
 
-        matched_comp = comp_df[(comp_df["tid"] == tid) & (comp_df["t_us"] >= t_start)]
-        if not matched_comp.empty:
-            t_end = matched_comp.iloc[0]["t_us"]
-            jobs.append({
-                "tid": tid,
-                "algo": algo,
-                "job_start_ms": to_ms(t_start),
-                "job_end_ms": to_ms(t_end),
-            })
+        matched_comp = comp_df[
+            (comp_df["tid"] == tid) & (comp_df["t_us"] >= t_start)
+        ]
+        if matched_comp.empty:
+            continue
+
+        t_end = matched_comp.iloc[0]["t_us"]
+        jobs.append({
+            "tid": tid,
+            "algo": algo,
+            "job_start_ms": timeline_ms(t_start),
+            "job_end_ms": timeline_ms(t_end),
+        })
 
     df_jobs = pd.DataFrame(jobs)
 
-    # 3. 物理交集裁剪
+    # ============================================================
+    # 3. 任务块 = jobs ∩ cpu_intervals
+    # ============================================================
     refined_segments = []
-    for _, job in df_jobs.iterrows():
-        tid = job["tid"]
-        algo = job["algo"]
-        j_start = job["job_start_ms"]
-        j_end = job["job_end_ms"]
+    if not df_jobs.empty and not df_cpu_blocks.empty:
+        for _, job in df_jobs.iterrows():
+            tid = job["tid"]
+            algo = job["algo"]
+            j_start = job["job_start_ms"]
+            j_end = job["job_end_ms"]
 
-        matched_blocks = df_cpu_blocks[
-            (df_cpu_blocks["tid"] == tid)
-            & (df_cpu_blocks["end_ms"] > j_start)
-            & (df_cpu_blocks["start_ms"] < j_end)
+            matched_blocks = df_cpu_blocks[
+                (df_cpu_blocks["tid"] == tid)
+                & (df_cpu_blocks["end_ms"] > j_start)
+                & (df_cpu_blocks["start_ms"] < j_end)
             ]
-
-        if not matched_blocks.empty:
             for _, block in matched_blocks.iterrows():
                 seg_start = max(j_start, block["start_ms"])
                 seg_end = min(j_end, block["end_ms"])
                 if seg_end > seg_start:
                     refined_segments.append({
-                        "core_id": f"CPU {block['cpu_id']}",
-                        "raw_core": block["cpu_id"],
+                        "core_id": f"CPU {int(block['cpu_id'])}",
+                        "raw_core": int(block["cpu_id"]),
                         "start_ms": seg_start,
                         "end_ms": seg_end,
                         "dur_ms": seg_end - seg_start,
@@ -126,43 +171,89 @@ def generate_execution_gantt(
                     })
 
     df_final_jobs = pd.DataFrame(refined_segments)
-    if not df_final_jobs.empty:
-        df_final_jobs["dur_ms"] = (
-                df_final_jobs["end_ms"] - df_final_jobs["start_ms"]
-        )
 
-    # 4. 配色与图表绘制
+    # ============================================================
+    # 4. Overhead = worker 片段 - 任务块
+    # ============================================================
+    df_overhead = pd.DataFrame()
+    if show_overhead and not df_cpu_blocks.empty:
+        # 按 tid 收集并合并 job 交集片段
+        jobs_by_tid = defaultdict(list)
+        if not df_final_jobs.empty:
+            for _, seg in df_final_jobs.iterrows():
+                jobs_by_tid[int(seg["tid"])].append((seg["start_ms"], seg["end_ms"]))
+
+        for tid in jobs_by_tid:
+            jobs_by_tid[tid].sort()
+            merged = []
+            for s, e in jobs_by_tid[tid]:
+                if merged and s <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                else:
+                    merged.append((s, e))
+            jobs_by_tid[tid] = merged
+
+        overhead_segments = []
+        for _, block in df_cpu_blocks.iterrows():
+            tid = int(block["tid"])
+            occupied = jobs_by_tid.get(tid, [])
+            for s, e in _subtract_intervals(block["start_ms"], block["end_ms"], occupied):
+                if e > s:
+                    overhead_segments.append({
+                        "core_id": f"CPU {block['cpu_id']}",
+                        "raw_core": int(block["cpu_id"]),
+                        "start_ms": s,
+                        "end_ms": e,
+                        "dur_ms": e - s,
+                        "algo": "Overhead",
+                        "tid": tid,
+                    })
+        df_overhead = pd.DataFrame(overhead_segments)
+
+    # ============================================================
+    # 5. 组装绘图数据
+    # ============================================================
+    parts = []
+    if not df_overhead.empty:
+        parts.append(df_overhead)
+    if not df_final_jobs.empty:
+        parts.append(df_final_jobs)
+
+    if not parts:
+        print("⚠️ 没有可绘制的区间（任务块与 Overhead 均为空）。")
+        return None
+
+    df_plot_all = pd.concat(parts, ignore_index=True)
+
+    # ============================================================
+    # 6. 配色与图例顺序
+    # ============================================================
     discrete_sci_colors = [
-        "#3B5998",
-        "#5E8B61",
-        "#A6192E",
-        "#D6A531",
-        "#709BFF",
-        "#925E9F",
-        "#0099B4",
-        "#FDAF91",
-        "#4D4D4D",
-        "#ADB6B6",
+        "#3B5998", "#5E8B61", "#A6192E", "#D6A531", "#709BFF",
+        "#925E9F", "#0099B4", "#FDAF91", "#4D4D4D", "#ADB6B6",
     ]
 
-    core_order = sorted(df_cpu_blocks["cpu_id"].unique())
+    # CPU 泳道顺序
+    if not df_cpu_blocks.empty:
+        core_order = sorted(df_cpu_blocks["cpu_id"].unique())
+    else:
+        core_order = sorted(df_plot_all["raw_core"].unique())
     core_lane_order = [f"CPU {c}" for c in core_order]
 
-    # 算法列表与颜色映射（不含 Idle）
-    all_algo_order = sorted(list(df_final_jobs["algo"].unique()))
+    # 算法颜色
+    all_algo_order = sorted(df_final_jobs["algo"].unique()) if not df_final_jobs.empty else []
     all_algo_colors = {
         a: discrete_sci_colors[i % len(discrete_sci_colors)]
         for i, a in enumerate(all_algo_order)
     }
+    all_algo_colors["Overhead"] = overhead_color
 
-    # 将 Idle 加入颜色映射（统一设为浅灰色）
-    all_algo_colors["Idle"] = "#E5E5E5"
-    full_algo_order = all_algo_order + ["Idle"]
+    # 图例顺序：Overhead 在最后（画在最上层，视觉上不会被任务块盖住也不影响）
+    full_algo_order = all_algo_order + (["Overhead"] if show_overhead and not df_overhead.empty else [])
 
-    # 合并 Idle 数据和有效任务数据以便统一画图，或者通过多次 add_trace/px 叠加
-    # 这里我们先用 df_idle 作为底图绘制 Idle，再用 px 绘制任务，或者直接组合 DataFrame
-    df_plot_all = pd.concat([df_idle, df_final_jobs], ignore_index=True)
-
+    # ============================================================
+    # 7. 绘图
+    # ============================================================
     fig = px.bar(
         df_plot_all,
         base="start_ms",
@@ -170,18 +261,16 @@ def generate_execution_gantt(
         y="core_id",
         color="algo",
         orientation="h",
-        opacity=0.85,
+        opacity=0.9,
         color_discrete_map=all_algo_colors,
         category_orders={"core_id": core_lane_order, "algo": full_algo_order},
-        custom_data=df_plot_all[
-            ["algo", "start_ms", "dur_ms", "end_ms"]
-        ],
+        custom_data=df_plot_all[["algo", "start_ms", "dur_ms", "end_ms", "tid"]],
     )
 
-    # 优化 Hover 提示（对 Idle 和 Task 分别处理或兼顾）
     fig.update_traces(
         hovertemplate=(
-            "status/algo: %{customdata[0]}<br>"
+            "algo: %{customdata[0]}<br>"
+            "tid: %{customdata[4]}<br>"
             "start: %{customdata[1]:.3f} ms<br>"
             "dura: %{customdata[2]:.3f} ms<br>"
             "end: %{customdata[3]:.3f} ms<extra></extra>"
@@ -195,7 +284,7 @@ def generate_execution_gantt(
         height=200 + 40 * len(core_lane_order),
         yaxis_title="<b>CPU Core</b>",
         xaxis_title="<b>Time (ms from Trace Start)</b>",
-        title="<b>CPU Execution Timeline (with Idle)</b>",
+        title="<b>CPU Execution Timeline (Task + Overhead)</b>",
         template="plotly_white",
         legend=dict(
             orientation="v",
@@ -203,7 +292,7 @@ def generate_execution_gantt(
             y=0.5,
             xanchor="left",
             x=1.02,
-            title=None
+            title=None,
         ),
     )
 
@@ -216,4 +305,24 @@ def generate_execution_gantt(
     fig.update_layout(**layout_kwargs)
     fig.write_html(output_html)
     print(f"甘特图已保存至: {output_html}")
+
+    # 顺便打印一下统计
+    total_task_ms = df_final_jobs["dur_ms"].sum() if not df_final_jobs.empty else 0.0
+    total_over_ms = df_overhead["dur_ms"].sum() if not df_overhead.empty else 0.0
+    total_worker_ms = total_task_ms + total_over_ms
+    if total_worker_ms > 0:
+        print(f"  worker 总 CPU 时间 : {total_worker_ms:.3f} ms")
+        print(f"    - 任务    : {total_task_ms:.3f} ms ({total_task_ms / total_worker_ms * 100:.1f}%)")
+        print(f"    - Overhead: {total_over_ms:.3f} ms ({total_over_ms / total_worker_ms * 100:.1f}%)")
+
     return fig
+
+
+if __name__ == "__main__":
+    generate_execution_gantt(
+        preempt_csv="feedback_u70_m3_ms05_s20632672_135004_preempt.csv",
+        timeline_csv="feedback_u70_m3_ms05_s20632672_135004_timeline.csv",
+        zoom_window_ms=None,
+        output_html="cpu_activate_timeline.html",
+        show_overhead=True,
+    )

@@ -10,7 +10,8 @@ from datetime import datetime
 # ================= 配置区 =================
 LAUNCH_DIR = "./result/CIE_FIFO_IPC_nuc12"  # JSON 配置文件目录
 RESULT_BASE_DIR = "./result/CIE_FIFO_IPC_nuc12"  # 评测结果输出目录
-WARMUP_TIME = 2.0  # 预热时间 (s)
+LTTNG_WARMUP_TIME = 1.0 # 预热时间 (s)
+FINS_WARMUP_TIME = 1.0  # 预热时间 (s)
 RUN_TIME = 2.0  # 持续运行时间 (s)
 PORT = 18080  # 通信端口
 
@@ -58,7 +59,7 @@ def parse_m_from_filename(filename):
     return 2  # 默认兜底值
 
 
-def run_once(cfg_rel_path, cfg_dir, result_base_dir, sudo_password, warmup_time=2.0, run_time=10.0,
+def run_once(cfg_rel_path, cfg_dir, result_base_dir, sudo_password, lttng_warm_up = 1.0, fins_warmup_time=2.0, run_time=10.0,
              port=18080, use_cgroup=True, cpu_offset=1):
     """单次测试执行函数：自动根据文件名中的 m 确定 worker 数与独占核范围"""
     root = repo_root()
@@ -117,11 +118,13 @@ def run_once(cfg_rel_path, cfg_dir, result_base_dir, sudo_password, warmup_time=
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     subprocess.run(["lttng", "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.0)
+    print(f"  [2/5] 等待 LTTng 预热 {lttng_warm_up}s 并推送配置...")
+    time.sleep(lttng_warm_up)
 
     # 3. 启动 Client (使用 sudo -S 通过标准输入传入密码)
     cl_log = os.path.join(test_result_dir, "client.log")
     if use_cgroup:
+        client_script = os.path.join(root, "tool", "client.sh")
         client_script = os.path.join(root, "tool", "client.sh")
         cmd = ["sudo", "-S", client_script, cores_range, str(workers)]
         print(f"  [2/5] 启动 Client 进程 (独占核 {cores_range}, workers={workers})...")
@@ -150,8 +153,8 @@ def run_once(cfg_rel_path, cfg_dir, result_base_dir, sudo_password, warmup_time=
             pass
 
     # 4. 稳健的固定预热并推送配置
-    print(f"  [3/5] 等待客户端预热 {warmup_time}s 并推送配置...")
-    time.sleep(warmup_time)
+    print(f"  [3/5] 等待客户端预热 {fins_warmup_time}s 并推送配置...")
+    time.sleep(fins_warmup_time)
 
     cfg_full_path = os.path.join(root, cfg_dir, cfg_rel_path)
     server_bin = os.path.join(root, "bin", "server")
@@ -267,7 +270,8 @@ def run_all(target_cfg_dir, target_result_dir, run_time=10.0, cpu_offset=1):
             cfg_dir=target_cfg_dir,
             result_base_dir=target_result_dir,
             sudo_password=sudo_password,
-            warmup_time=WARMUP_TIME,
+            lttng_warm_up=LTTNG_WARMUP_TIME,
+            fins_warmup_time=FINS_WARMUP_TIME,
             run_time=run_time,
             use_cgroup=PIN_EXPERIMENT_TO_CPUS,
             cpu_offset=cpu_offset
