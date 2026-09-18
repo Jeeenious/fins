@@ -66,8 +66,6 @@ server
 # log
 *.log
 
-!*.cpp
-
 # tool
 */kernel*
 */pipeline*

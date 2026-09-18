@@ -144,7 +144,16 @@ int main(int argc, char **argv) {
 
         tracepoint(fins, release);
 
-        w->job();
+        // ★ 异常兜底：job 抛异常也必须走下面的完成事件。否则该顶点永不完成 → is_hp_done()
+        //   永为假 → 主循环永不 rollover_hp() → 整个超周期静默停摆（实测只留几行 ERROR，
+        //   之后零翻页）。记日志后继续，让问题暴露在日志里而不是卡死调度。
+        try {
+          w->job();
+        } catch (const std::exception &e) {
+          FINS_LOG_ERROR("[agent] job {} threw: {}", w->id, e.what());
+        } catch (...) {
+          FINS_LOG_ERROR("[agent] job {} threw unknown exception", w->id);
+        }
 
         tracepoint(fins, finished);
 
@@ -179,7 +188,6 @@ int main(int argc, char **argv) {
   //    + notify（与 worker 完成事件共同唤醒主线程调度循环）。tp 顶点在 pin_sync 建图时已写入
   //    job = sleep_until（绝对释放时刻，job 内实时读 hyper_start_ms → rollover 平移自动对齐）──
   std::thread timer_th([&] {
-
 
     std::unique_lock tl(graph_g.mtx);
     for (;;) {

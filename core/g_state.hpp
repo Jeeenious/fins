@@ -876,8 +876,9 @@ namespace fins::rt {
      *        输出路由下游绑定边 + record_mesg 维护字段历史槽，运行时不再接触原始 JSON。
      *        闭包捕获稳定解析态（shared_ptr<const NodeInfo> 每节点 1 份按 k 共享）+ 算法实例 by_id；
      *        输入打包：事件节点逐输入端口取绑定边帧；显式周期（period>0）节点——hist 声明的端口读
-     *        producer 字段历史槽窗口（长度 N>2，恒长 N、未满头部 0 补位，直出 typed std::vector<int>，
-     *        方案 A：插件侧声明 std::vector<int> 接收），未声明 hist 的输入读“最新一帧”标量 int。
+     *        producer 字段历史槽最近 N 帧（线格式 vector<Message>，只拷句柄、payload 共享；
+     *        插件侧声明 fins::rt::History<T> 只读视图接收，零 payload 拷贝，长度 ≤ N 不补空帧），
+     *        未声明 hist 的输入读“最新一帧”原始类型。
      *        历史容量 mesg_hist_cap[输出端口] = 该字段全部周期读者的保留长度 max（hist N 或 1），
      *        只对被周期读的字段建历史槽；单写者约束保证每输出端口唯一 producer；message_hist_ 跨重建保留不清。
      * @param nodes 解析态节点表（只读）
@@ -885,8 +886,9 @@ namespace fins::rt {
      * @param node_count 节点 id → job 实例数（只读）
      * @retval 无
      */
-    void bind_job(const std::vector<NodeInfo> &nodes, const std::map<std::string, std::shared_ptr<AlgoBase>> &by_id,
-                  const std::map<std::string, size_t> &node_count) {
+    void bind_job(const std::vector<NodeInfo> &nodes,
+              const std::map<std::string, std::shared_ptr<AlgoBase>> &by_id,
+              const std::map<std::string, size_t> &node_count) {
       // ── 段 1：历史容量表 mesg_hist_cap[输出端口]（记录条件 + 保留长度）──
       //  仅显式周期节点的输入从 producer 字段历史槽取样（hist 端口读 N>2 帧窗口、未声明读最新单帧），
       //  故其每个输入对应字段都要建历史槽：保留容量 = 该字段全部周期读者的 max（hist N 或 1）。同字段
@@ -895,6 +897,7 @@ namespace fins::rt {
       for (const auto &info: nodes)
         for (const auto &pn: info.output_ports)
           out_ports.insert(pn);
+
       for (const auto &info: nodes) {
         if (info.period <= 0)
           continue; // 仅显式周期节点从字段历史槽取样（事件节点无历史读）
@@ -913,111 +916,113 @@ namespace fins::rt {
         auto sinfo = std::make_shared<const NodeInfo>(info); // 闭包捕获稳定共享解析态
         const auto &algo = by_id.at(info.id);
         const size_t n = node_count.at(info.id);
-        const auto hist_w = info.hist; // hist 端口 → 窗口长度 N（>2；未声明的周期输入走“最新单帧”标量读）
+        const auto hist_w = info.hist; // hist 端口 → 窗口长度 N（>2；未声明的周期输入走“最新单帧”）
 
         for (size_t k = 0; k < n; ++k) {
           const std::string vtx = info.id + ":" + std::to_string(k); // 顶点名现拼（无 JobInst）
+
           dag.mutate_vertex(vtx, [this, sinfo, algo, vtx, hist_w](Workload &v) {
-            v.id = vtx; // Workload.id 实际填充（grab_ready_workload 返回 Workload* 含 id，装配点直做完成事件用）
+            v.id = vtx; // Workload.id 实际填充
 
             // 按 tag 分组一次性解析（O(边数) 替代 O(端口×边数) 的逐端口 edges_to/from）
             auto in_groups = dag.edges_to_grouped(vtx);
             auto out_groups = dag.edges_from_grouped(vtx);
-            std::vector<std::vector<std::reference_wrapper<Message>>> in_refs(sinfo->input_ports.size());
+
+            std::vector<std::vector<std::reference_wrapper<Message>>> in_refs(
+                sinfo->input_ports.size());
             for (size_t i = 0; i < in_refs.size(); ++i)
-              if (sinfo->period <= 0) { // 事件节点输入端口：查绑定边分组表（单写者 → 至多一条）；周期节点无绑定边
+              if (sinfo->period <= 0) { // 事件节点输入端口：查绑定边分组表（单写者 → 至多一条）
                 const auto it = in_groups.find(sinfo->input_ports[i]);
                 if (it != in_groups.end())
                   in_refs[i] = it->second;
               }
-            std::vector<std::vector<std::reference_wrapper<Message>>> out_refs(sinfo->output_ports.size());
+
+            std::vector<std::vector<std::reference_wrapper<Message>>> out_refs(
+                sinfo->output_ports.size());
             for (size_t i = 0; i < out_refs.size(); ++i) {
               const auto it = out_groups.find(sinfo->output_ports[i]);
               if (it != out_groups.end())
                 out_refs[i] = it->second;
             }
 
-            v.job = [this, sinfo, algo, hist_w, in_refs = std::move(in_refs), out_refs = std::move(out_refs)]() {
-              // ── 功能 1：周期节点输入取样 helper（时间触发无数据前序边，执行时才取样；
-              //      const_accessor 只锁本端口历史槽，与 record_mesg 同端口写互斥、不同端口并发读）
-              //   · collect_window：hist 声明端口 → 读 producer 字段历史槽最近 w 帧为 typed
-              //     std::vector<int>（w = hist N>2，恒长 w、未满头部 0 占位、尾部覆盖最近真实帧；
-              //     producer 未产出过（槽空）→ 全 0）；
-              //   · read_latest：未声明 hist 的周期输入 → 标量读“最新一帧”（int；槽空 → 0 占位）。
-              auto collect_window = [this](const std::string &pn, size_t w) {
-                std::vector<int> vals;
-                vals.resize(w);
-                {
-                  util::TBBMap<std::deque<Message>>::const_accessor a;
-                  if (message_hist_.find(a, pn)) {
-                    const auto &h = a->second; // 队列按 timestamp 升序，尾部 = 最新真实帧
-                    const size_t take = std::min(w, h.size());
-                    for (size_t j = 0; j < take; ++j)
-                      vals[w - take + j] = *h[h.size() - take + j].p_shared<int>(); // 逐帧取真实值
-                  }
+            v.job = [this, sinfo, algo, hist_w,
+                     in_refs = std::move(in_refs),
+                     out_refs = std::move(out_refs)]() {
+
+              // ── 功能 1：周期节点输入取样 helper ──
+              // collect_window：hist 端口 → 最近 w 帧（尾部 = 最新；不足 w 有多少给多少，不补空帧）
+              auto collect_window = [this](const std::string &pn, size_t w)
+                  -> std::vector<Message> {
+                std::vector<Message> frames;
+                frames.reserve(w);
+
+                util::TBBMap<std::deque<Message>>::const_accessor a;
+                if (message_hist_.find(a, pn)) {
+                  const auto &h = a->second; // 按 timestamp 升序，尾部 = 最新真实帧
+                  const size_t take = std::min(w, h.size());
+                  for (size_t j = 0; j < take; ++j)
+                    frames.push_back(h[h.size() - take + j]); // 拷贝 Message（shared_ptr 保活）
                 }
+                return frames;
+              };
+
+              // read_latest：未声明 hist 的周期输入 → 最新一帧；槽空 → 空 Message（插件侧需容错）
+              auto read_latest = [this](const std::string &pn) -> Message {
                 Message m;
-                *m.p_mutable<std::vector<int>>() = std::move(vals);
+
+                util::TBBMap<std::deque<Message>>::const_accessor a;
+                if (message_hist_.find(a, pn) && !a->second.empty())
+                  m = a->second.back();
+
                 return m;
               };
 
-              auto read_latest = [this](const std::string &pn) {
-                Message m;
-                {
-                  util::TBBMap<std::deque<Message>>::const_accessor a;
-                  if (message_hist_.find(a, pn) && !a->second.empty())
-                    m = a->second.back(); // 队列按 timestamp 升序，back = 最新一帧（拷贝，shared_ptr 保活）
-                }
-                if (m.frame)
-                  return m;
-                Message z;
-                *z.p_mutable<int>() = 0; // 槽空（producer 尚未产出）→ 0 占位
-                return z;
-              };
-
-              // ── 功能 2：打包输入 array——hist 声明端口 → 窗口读（collect_window）；周期未声明 →
-              //      标量读最新（read_latest）；事件节点 → 绑定边帧（按端口序，算法按位置取不碰端口名）──
+              // ── 功能 2：按端口序打包输入 array ──
               auto pack_inputs = [this, sinfo, hist_w, collect_window, read_latest, &in_refs]() {
                 std::vector<Message> inputs(sinfo->input_ports.size());
                 for (size_t i = 0; i < inputs.size(); ++i) {
                   const std::string &pn = sinfo->input_ports[i];
 
-                  if (hist_w.count(pn))
-                    inputs[i] = collect_window(pn, hist_w.at(pn)); // hist 端口：N>2 帧窗口
-                  else if (sinfo->period > 0)
-                    inputs[i] = read_latest(pn); // 周期节点未声明 hist：标量读最新一帧
-                  else
-                    inputs[i] = in_refs[i].empty() ? Message{} : in_refs[i][0].get(); // 事件节点：绑定边预解析帧
+                  if (hist_w.count(pn)) {
+                    // hist 端口：最近 N 帧窗口。线格式 = vector<Message>（只拷句柄、payload 共享），
+                    // 插件侧由 AlgoFunc::decode_input_ 翻成 History<E> 只读视图
+                    Message m;
+                    *m.p_mutable<std::vector<Message>>() = collect_window(pn, hist_w.at(pn));
+                    inputs[i] = std::move(m);
+                  } else if (sinfo->period > 0) {
+                    // 周期节点未声明 hist：最新一帧（原始类型）
+                    inputs[i] = read_latest(pn);
+                  } else {
+                    // 事件节点：绑定边预解析帧
+                    inputs[i] = in_refs[i].empty() ? Message{} : in_refs[i][0].get();
+                  }
                 }
                 return inputs;
               };
 
-              // ── 功能 3：execute + record_exec（耗时统计：execute 前后 steady_clock 计时 us，
-              //      不含输入打包/输出路由；按算法键（info.name）环形队列，expand_hp 重建保留不清）──
+              // ── 功能 3：execute + record_exec ──
               auto execute_and_time = [this, sinfo, algo](std::vector<Message> &inputs) {
-                std::vector<Message> outputs(sinfo->output_ports.size()); // 输出按端口序预构造 array（算法按位置写）
+                std::vector<Message> outputs(sinfo->output_ports.size());
 
                 const auto _t0 = std::chrono::steady_clock::now();
 
-                algo->execute(inputs,
-                              outputs); // 配置已建图期注入 algo 实例（AlgoFunc configs_ 类型化帧，execute 零解析）
+                algo->execute(inputs, outputs);
 
                 record_exec(sinfo->name,
-                            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - _t0)
-                                .count()); // 键 = 算法键（非节点 id：多实例/多节点同类算法归并聚合）
+                            std::chrono::duration<double, std::micro>(
+                                std::chrono::steady_clock::now() - _t0).count());
 
                 return outputs;
               };
 
-              // ── 功能 4：路由输出（写预解析下游引用共享帧；字段有周期读者才存历史槽）──
+              // ── 功能 4：路由输出 ──
               auto route_outputs = [this, sinfo, &out_refs](std::vector<Message> &outputs) {
                 for (size_t i = 0; i < outputs.size(); ++i) {
                   for (auto &e: out_refs[i])
                     e.get() = outputs[i]; // 写全部下游绑定边（生产者消费者共享帧）
                   const std::string &pn = sinfo->output_ports[i];
                   const auto cap_it = mesg_hist_cap.find(pn); // 锁外执行：const 查找避 operator[] 并发写 UB
-                  if (cap_it != mesg_hist_cap.end() &&
-                      cap_it->second > 0) // 字段有周期读者才存历史（cap>0）；record_mesg 满 cap 丢最旧
+                  if (cap_it != mesg_hist_cap.end() && cap_it->second > 0)
                     record_mesg(pn, outputs[i]);
                 }
               };

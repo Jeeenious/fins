@@ -2,16 +2,26 @@
  ******************************************************************************/
 #pragma once
 
+#include <optional>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
 #include <typeinfo>
 #include <utility>
 #include <vector>
 
+#include "../mesg/hist.hpp"
 #include "../third_party/json.hpp"
 #include "algo_base.hpp"
 
 namespace fins::rt {
+
+  /// 判定是否为 History<T>（hist 窗口参数）。视图类型不会被生产者当载荷发布，
+  /// 故"参数是 History"即"该输入槽是窗口"，无需运行时哨兵标记。
+  template <typename T>
+  struct is_history : std::false_type {};
+  template <typename T>
+  struct is_history<History<T>> : std::true_type {};
 
   template <typename Arg>
   struct AlgoFunc;
@@ -47,36 +57,35 @@ namespace fins::rt {
     }
 
   private:
-    template <size_t... Is>
-    void invoke_func_(
-      const std::vector<Message> &configs,
-      const std::vector<Message> &inputs,
-      std::vector<Message> &output,
-      std::index_sequence<Is...>) {
-      auto ref_tuple = std::forward_as_tuple(
-        [&]() -> decltype(auto) {
-          if constexpr (Is < sizeof...(Args)) {
-            using ParamType = std::decay_t<std::tuple_element_t<Is, ArgsTuple>>;
+    /// 第 I 个参数的退化类型（decode_cfg_ / decode_input_ / invoke_func_ 同一套定位基准）
+    template <size_t I>
+    using ParamT = std::decay_t<std::tuple_element_t<I, ArgsTuple>>;
 
-            // 参数序列 = 配置段 + 输入段 + 输出段（configs inputs outputs 顺着来），
-            // 全部按运行时边界定位（无端口名/计数）。
-            if (Is < configs.size()) {
-              // 配置段（前置）：类型化帧已由 configure 注入时预解码，直接 sub 取（零解析）
-              return *(configs[Is].p_shared<ParamType>());
-            } else if (Is < configs.size() + inputs.size()) {
-              // 输入段：从输入数组对应序取帧（共享，只读）
-              const size_t r = Is - configs.size();
-              return *(inputs[r].p_shared<ParamType>());
-            } else {
-              // 输出段：在输出数组对应序 pub 分配帧传给用户函数写
-              const size_t r = Is - configs.size() - inputs.size();
-              return *(output[r].p_mutable<ParamType>());
-            }
-          }
-        }() ...
-      );
+    template <size_t I>
+    std::optional<ParamT<I>> decode_input_(const std::vector<Message> &inputs, size_t ncfg) {
+      using P = ParamT<I>;
+      if (I < ncfg || I >= ncfg + inputs.size())
+        return {};   // 非输入段
 
-      std::apply(user_func_, ref_tuple);
+      const Message &f = inputs[I - ncfg];
+      if (f.frame == nullptr) {   // 空帧 → 默认值
+        if constexpr (std::is_default_constructible_v<P>)
+          return P{};
+        return {};
+      }
+
+      // 槽必是窗口线格式（视图不可作为载荷发布）；p_shared 自带 type_hash/size/abi 三重校验
+      if constexpr (is_history<P>::value) {
+        using E = typename P::value_type;
+        const auto &w = *f.p_shared<std::vector<Message>>();
+        std::vector<std::shared_ptr<const E>> sps;
+        sps.reserve(w.size());
+        for (const auto &fr: w)
+          sps.push_back(fr.p_shared<E>());   // 只拷句柄，载荷不拷贝
+        return P{std::move(sps)};
+      }
+
+      return {};
     }
 
     template <size_t Is = 0>
@@ -84,7 +93,13 @@ namespace fins::rt {
       if constexpr (Is < sizeof...(Args)) {
         if (Is == idx) {
           using CfgType = std::decay_t<std::tuple_element_t<Is, ArgsTuple>>;
-          if constexpr (nlohmann::detail::has_from_json<nlohmann::json, CfgType>::value) {
+
+          // 视图不可作配置：先挡掉，否则 has_from_json 探测会为它实例化 nlohmann 容器路径
+          // （std::insert_iterator<History>）→ 视图没有 insert，硬报错
+          if constexpr (is_history<CfgType>::value) {
+            throw std::runtime_error(
+                "[Fins Fatal] History 视图不可作配置参数: " + std::string(typeid(CfgType).name()));
+          } else if constexpr (nlohmann::detail::has_from_json<nlohmann::json, CfgType>::value) {
             Message m;
             *(m.p_mutable<CfgType>()) = json.get<CfgType>();
             return m;
@@ -98,6 +113,42 @@ namespace fins::rt {
       }
       throw std::runtime_error(
           "[Fins Fatal] Config index out of function signature: " + std::to_string(idx));
+    }
+
+
+    template <size_t... Is>
+    void invoke_func_(
+      const std::vector<Message> &configs,
+      const std::vector<Message> &inputs,
+      std::vector<Message> &output,
+      std::index_sequence<Is...>) {
+      const size_t ncfg = configs.size();
+
+      // 输入段参数先解码（生存期锚：forward_as_tuple 存的是引用，临时活不过 std::apply）。
+      // make_tuple 实参求值顺序未指定（GCC 右到左）→ decode_input_ 内不可有顺序依赖副作用。
+      auto cache = std::make_tuple(decode_input_<Is>(inputs, ncfg)...);
+
+      auto ref_tuple = std::forward_as_tuple(
+        [&]() -> decltype(auto) {
+          if constexpr (Is < sizeof...(Args)) {
+            // 参数序列 = 配置段 + 输入段 + 输出段，按运行时边界定位（无端口名/计数）
+            if (Is < ncfg) {
+              // 配置段：已由 configure 预解码，直接取（零解析）
+              return *(configs[Is].p_shared<ParamT<Is>>());
+            } else if (Is < ncfg + inputs.size()) {
+              // 输入段：代造值（hist 窗口 / 空帧默认值）优先，否则原路取帧
+              if (auto &c = std::get<Is>(cache); c.has_value())
+                return *c;
+              return *(inputs[Is - ncfg].p_shared<ParamT<Is>>());
+            } else {
+              // 输出段：pub 分配帧传给用户函数写
+              return *(output[Is - ncfg - inputs.size()].p_mutable<ParamT<Is>>());
+            }
+          }
+        }() ...
+      );
+
+      std::apply(user_func_, ref_tuple);
     }
   };
 

@@ -40,27 +40,27 @@
 #include "algo/algo_base.hpp"
 #include "algo/algo_func.hpp"
 #include "mesg/mesg.hpp"
+#include "mesg/hist.hpp"
 
 // 元素处理器（FINS_ALGO_LIST 的 F）
-#define FINS_ALGO_NAME_(f)   #f,
-#define FINS_ALGO_COUNT_(f)  + 1
-#define FINS_ALGO_CREATE_(f) \
-  if (k == std::string(#f) + ":" + ver) return new fins::rt::AlgoFunc<decltype(&f)>(f);
+#define FINS_ALGO_NAME_(f) #f,
+#define FINS_ALGO_COUNT_(f) +1
+#define FINS_ALGO_CREATE_(f)            \
+  if (k == std::string(#f) + ":" + ver) \
+    return new fins::rt::AlgoFunc<decltype(&f)>(f);
 
-#define FINS_ALGO_EXPORT(version) \
-  extern "C" { \
-    static const char *const kFinsAlgoNames[] = { FINS_ALGO_LIST(FINS_ALGO_NAME_) }; \
-    static constexpr int kFinsAlgoCount = 0 FINS_ALGO_LIST(FINS_ALGO_COUNT_); \
-    int get_plugin_count() { return kFinsAlgoCount; } \
-    const char *get_algo_name(int i) { \
-      return (i >= 0 && i < kFinsAlgoCount) ? kFinsAlgoNames[i] : ""; \
-    } \
-    const char *get_algo_version(int) { return version; } \
-    fins::rt::AlgoBase *create_algo(const char *key) { \
-      const std::string k(key); \
-      const std::string ver(version); \
-      FINS_ALGO_LIST(FINS_ALGO_CREATE_) \
-      return nullptr; \
-    } \
-    void destroy_plugin(fins::rt::AlgoBase *p) { delete p; } \
+#define FINS_ALGO_EXPORT(version)                                                                      \
+  extern "C" {                                                                                         \
+  static const char *const kFinsAlgoNames[] = {FINS_ALGO_LIST(FINS_ALGO_NAME_)};                       \
+  static constexpr int kFinsAlgoCount = 0 FINS_ALGO_LIST(FINS_ALGO_COUNT_);                            \
+  int get_plugin_count() { return kFinsAlgoCount; }                                                    \
+  const char *get_algo_name(int i) { return (i >= 0 && i < kFinsAlgoCount) ? kFinsAlgoNames[i] : ""; } \
+  const char *get_algo_version(int) { return version; }                                                \
+  fins::rt::AlgoBase *create_algo(const char *key) {                                                   \
+    const std::string k(key);                                                                          \
+    const std::string ver(version);                                                                    \
+    FINS_ALGO_LIST(FINS_ALGO_CREATE_)                                                                  \
+    return nullptr;                                                                                    \
+  }                                                                                                    \
+  void destroy_plugin(fins::rt::AlgoBase *p) { delete p; }                                             \
   }
