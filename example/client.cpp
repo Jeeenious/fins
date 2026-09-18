@@ -159,7 +159,11 @@ int main(int argc, char **argv) {
 
         lk.lock();
 
-        if (graph_g.trigger_workload_ready(w->id))   // ★ 仅本完成新增了就绪才唤醒空闲 worker 帮忙(并行吃 batch)；叶子/无后继完成的完成不再空唤醒全池 → 减惊群
+        // ★ 唤醒条件：① 本完成新增了就绪后继 → 唤醒空闲 worker 帮忙吃 batch（叶子/无后继的完成
+        //   不空唤醒全池，减惊群）；② 本完成让超周期完工 → 唤醒主循环翻页/应用新配置。②不可省：
+        //   叶子节点无后继，完工事件否则无人通知，主循环只能等自身超时兜底才发现 is_hp_done()，
+        //   翻页被推迟 → 释放间隔不再等于标称周期（实测 +0.56ms 且全为正）。
+        if (graph_g.trigger_workload_ready(w->id) || graph_g.is_hp_done())
           graph_g.cv.notify_all();
 
         continue;   // ★ 积压快路径：不回池重进(免 ThreadPool 再调 cb + 重新抢锁)，持锁回循环顶
@@ -170,8 +174,8 @@ int main(int argc, char **argv) {
 
       tracepoint(fins, sleep);
 
-      // grab 取空（无积压）→ 睡 1ms。★ 这里 w 是 if 初始化的 nullptr，**不可**解引用 w->id
-      graph_g.cv.wait_for(lk, std::chrono::milliseconds(10));   // 无积压才睡：等完成/回绕/expand_hp/停止（notify 快路径 + 1ms 超时兜底 lost wakeup）
+      // grab 取空（无积压）→ 睡（10ms 兜底）。★ 这里 w 是 if 初始化的 nullptr，**不可**解引用 w->id
+      graph_g.cv.wait_for(lk, std::chrono::milliseconds(10));   // 无积压才睡：等完成/回绕/expand_hp/停止（notify 快路径 + 10ms 超时兜底 lost wakeup）
 
     }
   });
@@ -179,7 +183,8 @@ int main(int argc, char **argv) {
 
   // ── 停止信号：SIGINT/SIGTERM → 只置原子停止位（async-signal-safe；不调 cv.notify_all——
   //    condition_variable 非 async-signal-safe，信号上下文调 stdlib 是 UB）。
-  //    主循环/worker/计时线程全部 cv.wait_for(1ms) 兜底超时，1ms 内自行醒来看到 stopped 退出。──
+  //    各线程的等待都带超时兜底（worker/计时线程 10ms、主循环 100ms），超时后自行看到 stopped 退出；
+  //    正常收尾走下方 teardown 的 stopped=true + notify_all 立即唤醒。──
   std::signal(SIGINT,  [](int) { graph_g.stopped = true; });
   std::signal(SIGTERM, [](int) { graph_g.stopped = true; });
   FINS_LOG_INFO("[agent] listening on :{} plugin_dir={}", rpc_port, plugin_dir);
@@ -203,13 +208,14 @@ int main(int argc, char **argv) {
 
         tl.lock(); // 回锁直做完成事件：置 done + 传播 pred_left（释放后继 job 顶点）；返回是否新增就绪
 
-        if (graph_g.trigger_workload_ready(tp->id))   // ★ 仅 tp 释放确有新 job 就绪才唤醒 worker；空时间点/无后继不空唤醒
+        // 同 worker 完成路径：新增就绪唤醒 worker；超周期完工唤醒主循环（tp 可能是最后一个顶点）
+        if (graph_g.trigger_workload_ready(tp->id) || graph_g.is_hp_done())
           graph_g.cv.notify_all();
 
         continue;
       }
 
-      graph_g.cv.wait_for(tl, std::chrono::milliseconds(10));   // 无待释放时间点 → 等事件（notify 快路径 + 1ms 超时兜底 lost wakeup）
+      graph_g.cv.wait_for(tl, std::chrono::milliseconds(10));   // 无待释放时间点 → 等事件（notify 快路径 + 10ms 超时兜底 lost wakeup）
 
     }
   });
@@ -250,7 +256,7 @@ int main(int argc, char **argv) {
             if (!lib_keys.contains(key)) { ready = false; break; }
           if (!ready) {
             FINS_LOG_INFO("[agent] algo not ready, defer (pending kept, wait plugin load)");
-            graph_g.cv.wait_for(lk, std::chrono::milliseconds(1));   // 等热加载 notify 唤醒重试
+            graph_g.cv.wait_for(lk, std::chrono::milliseconds(100));   // 等热加载 notify 唤醒重试（100ms 仅兜底）
             continue;   // 保留 pending，不丢弃配置
           }
         }
@@ -277,7 +283,7 @@ int main(int argc, char **argv) {
         continue;
       }
 
-      graph_g.cv.wait_for(lk, std::chrono::milliseconds(1));   // 纯事件等待（notify 快路径 + 1ms 超时兜底 lost wakeup）
+      graph_g.cv.wait_for(lk, std::chrono::milliseconds(100));   // 纯事件等待（所有状态跃迁都有 notify；100ms 仅兜底 lost wakeup）
 
     }
   }

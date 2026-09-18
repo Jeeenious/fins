@@ -31,7 +31,7 @@
 #include <ctime>
 #include <vector>
 
-static size_t mesg_size = 7;
+static size_t mesg_size = 1024*1024;
 
 namespace {
 

@@ -832,12 +832,21 @@ namespace fins::rt {
         v.id = id;
         v.name = "time";
         v.wcet = off - prev_off;
+        // tp job：睡到释放时刻 hyper_start_ms + off。job 内实时读 hyper_start_ms → rollover
+        // 重锚自动对齐。用绝对时刻睡眠（内核 hrtimer 精确唤醒），仅以 10ms 为上限分批——
+        // 既保留停止响应（stopped 置位后最多 10ms 退出），又不把释放时刻量化掉：
+        // 原 while(now<until) sleep_for(1ms) 每拍醒 ~100 次，且醒来必晚 0~1ms（实测释放偏差
+        // 中位 505µs / 最大 1023µs，而 n5 自身 wcet 仅 193µs）。
         v.job = [this, off]() {
-          const double at = hyper_start_ms + off;
-          const auto until = std::chrono::steady_clock::now() +
-                             std::chrono::microseconds((long long) (at - fins::util::now_ms()) * 1000ll);
-          while (!stopped.load() && std::chrono::steady_clock::now() < until)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          while (!stopped.load()) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto target =   // 目标释放时刻（已过则为过去时刻 → sleep_until 立即返回）
+                now + std::chrono::microseconds(
+                          (long long) ((hyper_start_ms + off - fins::util::now_ms()) * 1000.0));
+            if (target <= now)
+              break;
+            std::this_thread::sleep_until(std::min(target, now + std::chrono::milliseconds(10)));
+          }
         };
         dag.add_node(id, std::move(v));
 
