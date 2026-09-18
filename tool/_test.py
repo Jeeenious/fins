@@ -41,7 +41,7 @@ def repo_root():
     """自动定位仓库根目录"""
     d = os.path.abspath(os.getcwd())
     while True:
-        if os.path.isfile(os.path.join(d, "bin", "client")) and os.path.isdir(os.path.join(d, "tool")):
+        if os.path.isfile(os.path.join(d, "build", "bin", "client")) and os.path.isdir(os.path.join(d, "tool")):
             return d
         p = os.path.dirname(d)
         if p == d: return None
@@ -64,7 +64,7 @@ def run_once(cfg_rel_path, cfg_dir, result_base_dir, sudo_password, lttng_warm_u
     """单次测试执行函数：自动根据文件名中的 m 确定 worker 数与独占核范围"""
     root = repo_root()
     if not root:
-        raise RuntimeError("❌ 错误: 找不到仓库根目录 (需包含 bin/client 与 tool/)")
+        raise RuntimeError("❌ 错误: 找不到仓库根目录 (需包含 build/bin/client 与 tool/)")
 
     cfg_name = os.path.basename(cfg_rel_path)
     test_name = os.path.splitext(cfg_name)[0]
@@ -125,12 +125,11 @@ def run_once(cfg_rel_path, cfg_dir, result_base_dir, sudo_password, lttng_warm_u
     cl_log = os.path.join(test_result_dir, "client.log")
     if use_cgroup:
         client_script = os.path.join(root, "tool", "client.sh")
-        client_script = os.path.join(root, "tool", "client.sh")
         cmd = ["sudo", "-S", client_script, cores_range, str(workers)]
         print(f"  [2/5] 启动 Client 进程 (独占核 {cores_range}, workers={workers})...")
     else:
-        client_bin = os.path.join(root, "bin", "client")
-        lib_dir = os.path.join(root, "lib")
+        client_bin = os.path.join(root, "build", "bin", "client")
+        lib_dir = os.path.join(root, "build", "lib")
         cmd = [client_bin, str(port), lib_dir, str(workers)]
         print(f"  [2/5] 启动 Client 进程 (裸跑模式, workers={workers})...")
 
@@ -157,7 +156,7 @@ def run_once(cfg_rel_path, cfg_dir, result_base_dir, sudo_password, lttng_warm_u
     time.sleep(fins_warmup_time)
 
     cfg_full_path = os.path.join(root, cfg_dir, cfg_rel_path)
-    server_bin = os.path.join(root, "bin", "server")
+    server_bin = os.path.join(root, "build", "bin", "server")
 
     srv_res = subprocess.run([server_bin, cfg_full_path, str(port)],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=root)

@@ -23,10 +23,11 @@ pkg_check_modules(LTTngUST REQUIRED lttng-ust)
 #   ${SDK_ROOT}                仓库根（RPC_listener.hpp 等内 third_party/... 引用）
 set(SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 # 输出目录（现代变量；LIBRARY_OUTPUT_PATH/EXECUTABLE_OUTPUT_PATH 是遗留变量）：
-#   client/server  → 仓库根 bin/（tool/run.sh 默认 bin/client；无 server 启动脚本，直接 bin/server）
-#   plugin.so      → 仓库根 lib/（loader 的 plugin_dir 指向该目录；client 缺省 ./plugins 由调用侧覆盖）
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin")
-set(LIBRARY_OUTPUT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/lib")
+#   全部产物统一落在仓库根 build/ 下（与 cmake 二进制目录无关，CLion / 命令行构建都一致）：
+#     client/server → build/bin/（tool/client.sh 默认 build/bin/client）
+#     plugin.so     → build/lib/（loader 的 plugin_dir 指向该目录）
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build/bin")
+set(LIBRARY_OUTPUT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/build/lib")
 
 include_directories(
     ${SDK_ROOT}

@@ -1473,8 +1473,10 @@ def _make_pipeline(sk, trig, T, C_ms):
 
     for i, nd in enumerate(sk):
 
+        node_id = f"n{i}"
+
         node = {
-            "id": f"n{i}",
+            "id": node_id,
 
             "name": nd["algo"],
 
@@ -1486,14 +1488,21 @@ def _make_pipeline(sk, trig, T, C_ms):
                 C_ms[i]
             ),
 
+            # parameters 为**位置式取值表**（NodeInfo 只取 value，顺序 = AlgoFunc 配置段序号）：
+            #   [0] 节点 id（string）——插件签名首个配置参数（如 usr_* 的 `const std::string& name`），
+            #       被 spin_cost_us 当作 tracepoint 的 node_id，时间线上据此标出是哪个节点
+            #   [1] cfg（int）—— 每拍忙等时长 µs
             "parameters": [
+                {
+                    "value": node_id
+                },
                 {
                     "value": int(
                         round(
                             C_ms[i] * 1000.0
                         )
                     )
-                }
+                },
             ],
         }
 
@@ -2097,10 +2106,10 @@ def generate_configuration(kind, u, m, config=None, ):
 # ============================================================
 
 def repo_root():
-    """仓库根（含 bin/client 与 tool/）；找不到返回 None。"""
+    """仓库根（含 build/bin/client 与 tool/）；找不到返回 None。"""
     d = os.path.abspath(os.getcwd())
     while True:
-        if os.path.isfile(os.path.join(d, "bin", "client")) and os.path.isdir(os.path.join(d, "tool")):
+        if os.path.isfile(os.path.join(d, "build", "bin", "client")) and os.path.isdir(os.path.join(d, "tool")):
             return d
         p = os.path.dirname(d)
         if p == d:
@@ -2130,7 +2139,7 @@ def generate_all(out_dir=None, config=None):
     if not os.path.isabs(out_dir):
         root = repo_root()
         if root is None:
-            raise RuntimeError("找不到仓库根（需含 bin/client 与 tool/）")
+            raise RuntimeError("找不到仓库根（需含 build/bin/client 与 tool/）")
         out_dir = os.path.join(root, out_dir)
 
     os.makedirs(

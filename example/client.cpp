@@ -16,7 +16,7 @@
                                         //   0 = 严格等下一拍：跳到下一未来网格边界（跳漏拍、空等、相位不漂移）
                                         //   1 = 提前到这一拍：立刻以此刻为新起点重启（相位重置、无空闲空洞、之后按新节拍 now+j·H 跑）
 
-#define FINS_ALGO_LIB_PATH "./lib"   // 插件目录（可通过命令行参数覆盖）
+#define FINS_ALGO_LIB_PATH "./build/lib"   // 插件目录（可通过命令行参数覆盖）
 #define FINS_CLIENT_IP "0.0.0.0"     // orchestrator 上报端口（可通过命令行参数覆盖）
 #define FINS_CLIENT_PORT 18080
 #define FINS_SERVER_IP "0.0.0.0"    // orchestrator 监听端口（可通过命令行参数覆盖）

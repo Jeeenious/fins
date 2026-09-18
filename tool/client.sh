@@ -7,7 +7,7 @@ RT_CONF=/etc/security/limits.d/50-fins-rt.conf
 RT_PRIO=95
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
-CLIENT_BIN="${CLIENT_BIN:-$ROOT/bin/client}"
+CLIENT_BIN="${CLIENT_BIN:-$ROOT/build/bin/client}"
 
 create_partition() {
   local cpus="$1"
@@ -51,7 +51,7 @@ case "${1:-}" in
     CPUS="$1"; shift
     WORKERS="$1"; shift
     PORT="${1:-18080}"
-    PDIR="${2:-$ROOT/lib}"
+    PDIR="${2:-$ROOT/build/lib}"
     run_in_partition "$CPUS" "$CLIENT_BIN" "$PORT" "$PDIR" "$WORKERS"
     ;;
 esac

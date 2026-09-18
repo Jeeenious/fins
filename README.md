@@ -56,7 +56,8 @@ tool/               uload.ipynb(生成) · test.ipynb(采集) · plot.ipynb(分�
                     viewer.html(设计/运行图可视化) · agent.sh(独占核脚本)
 docs/               4 篇调度/DAG 语义设计
 third_party/        单头依赖 nlohmann/json.hpp · cpp-httplib.h
-bin/ lib/ tool/temp/     构建产物(client/server · plugin.so · tool/temp 导出的 trace)gitignore 不入库
+build/bin/ build/lib/     构建产物(client/server · plugin.so),gitignore 不入库
+tool/temp/               导出的 trace / dag.json,gitignore 不入库
 ```
 
 **数据流闭环**:
@@ -128,7 +129,7 @@ bin/ lib/ tool/temp/     构建产物(client/server · plugin.so · tool/temp �
 
 ## 4. 算法插件
 
-仓库当前在库的**参考插件族**是 `usr_*`(`example/plugins.cpp` → `lib/plugin.so`,**33 个算法**),
+仓库当前在库的**参考插件族**是 `usr_*`(`example/plugins.cpp` → `build/lib/plugin.so`,**33 个算法**),
 职责 = "提供端口形状 + 烧指定 µs",作为负载/拓扑实验的算力载体:
 
 | 形状 | 算法 | 说明 |
@@ -141,7 +142,7 @@ bin/ lib/ tool/temp/     构建产物(client/server · plugin.so · tool/temp �
 
 > CMake 另预留了**按领域拆 .so 的模块插件钩子**(OpenCV 各模块 / PCL 各库,载荷 `cv::Mat` /
 > `pcl::PointCloud<...>`):往 `example/` 放入 `plugins_opencv_*.cpp` / `plugins_pcl_*.cpp`
-> 即自动编出 `lib/plugins_opencv_*.so` 等;当前工作区未含演示源,故不产出。
+> 即自动编出 `build/lib/plugins_opencv_*.so` 等;当前工作区未含演示源,故不产出。
 
 **加新算法**:按形状族仿写一个函数 + 注册(参考 `example/plugins.cpp` 头注释),`cfg` 侧加
 `parameters` 即插即用;配一份 `plugin.meta.json` 可被 viewer 展示端口/参数。
@@ -169,19 +170,19 @@ bin/ lib/ tool/temp/     构建产物(client/server · plugin.so · tool/temp �
 
 ```bash
 cmake -S . -B cmake-build-debug && cmake --build cmake-build-debug -j
-# 产物: bin/client · bin/server · lib/plugin.so(usr_* 33 算法)
+# 产物: build/bin/client · build/bin/server · build/lib/plugin.so(usr_* 33 算法)
 
 # 冒烟(无独占):开 client,另开终端发一份配置,跑一会儿 Ctrl-C
-./bin/client 18080 ./lib
-./bin/server tool/uload/cfg_fork_u20_m6_s10011.json 18080   # 发一份 → client 重建运行图
+./build/bin/client 18080 ./build/lib
+./build/bin/server tool/uload/cfg_fork_u20_m6_s10011.json 18080   # 发一份 → client 重建运行图
 
 # 正式实验(独占核 + RT,需 root):见 tool/agent.sh
 sudo tool/agent.sh -g        # 一次性授 RT(写 limits.d,重登生效)
-sudo tool/agent.sh 1-6 6     # 独占核 1-6 + 6 worker 起 bin/client
+sudo tool/agent.sh 1-6 6     # 独占核 1-6 + 6 worker 起 build/bin/client
 ```
 
 产物约定(均 gitignore):client(agent) 退出写 `tool/temp/tracing.csv`(表头 `tid,seq,kind,t_us,cpu,tag`,
-目录自建)与结构重建时的 `tool/temp/dag.json`;插件 .so 在 `lib/`。
+目录自建)与结构重建时的 `tool/temp/dag.json`;插件 .so 在 `build/lib/`。
 
 **实验工作流**(每个 notebook 自包含):
 
