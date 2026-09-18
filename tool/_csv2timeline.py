@@ -16,6 +16,30 @@ def _is_worker(comm_str: str) -> bool:
     return comm_str.startswith(WORKER_PREFIXES)
 
 
+def _pair_jobs(df_timeline):
+    """按 tid **顺序**配对 execute→complete，返回 [(tid, algo, t_start_us, t_end_us), ...]。
+
+    顺序配对（而不是"时间上第一个 complete"）：后者在"开头缺 execute"（导出裁剪正好落在一对
+    中间）时会把每个 execute 配到**下一个任务**的 complete → 所有时长被拉长、且同一个 complete
+    被两个 execute 复用。这里按事件流顺序闭合：
+      · complete 出现但没有待闭合的 execute（开头被裁）→ 丢弃该 complete；
+      · execute 到流末尾仍未闭合（结尾被裁）→ 丢弃该 execute。
+    """
+    out = []
+    for tid, grp in df_timeline.groupby("tid"):
+        grp = grp[grp["kind"].isin(("execute", "complete"))].sort_values("t_us")
+        pending = None
+        for _, r in grp.iterrows():
+            if r["kind"] == "execute":
+                pending = r
+            elif pending is not None:
+                algo = pending["clean_tag"]
+                if algo:
+                    out.append((int(tid), algo, pending["t_us"], r["t_us"]))
+                pending = None
+    return out
+
+
 def _subtract_intervals(block_start, block_end, occupied):
     """
     从 [block_start, block_end] 中减去 occupied 里的所有区间。
@@ -57,17 +81,14 @@ def generate_execution_gantt(
     df_preempt = pd.read_csv(preempt_csv)
     df_timeline = pd.read_csv(timeline_csv)
 
-    # ---- 统一时间基准 ----
-    # 两个 CSV 应共享同一 t0，且第一行 t_us 已归零。
-    # 为稳妥，仍以两者各自最小值为基准做一次线性对齐。
-    preempt_t0 = df_preempt["t_us"].min()
-    timeline_t0 = df_timeline["t_us"].min()
+    # ---- 统一时间基准：两个 CSV 必须用**同一个** t0 ----
+    # 两份 CSV 的 t_us 是同一时钟的绝对值；若各取各自的最小值归一化，则 job 区间会整体平移
+    # （实测两文件 min 可差 ~2.6ms）。下面的 job ∩ CPU块 求交会因此错位 → Active 低估、
+    # Overhead 虚高（实测最多 7 倍）。
+    t0 = min(df_preempt["t_us"].min(), df_timeline["t_us"].min())
 
-    def preempt_ms(ts_us):
-        return (ts_us - preempt_t0) / 1000.0
-
-    def timeline_ms(ts_us):
-        return (ts_us - timeline_t0) / 1000.0
+    def to_ms(ts_us):
+        return (ts_us - t0) / 1000.0
 
     # ============================================================
     # 1. 从 preempt.csv 构造每个 CPU 上"目标 worker"的运行片段
@@ -81,8 +102,8 @@ def generate_execution_gantt(
         tids = group["next_tid"].values
 
         for i in range(len(times) - 1):
-            start_ms = preempt_ms(times[i])
-            end_ms = preempt_ms(times[i + 1])
+            start_ms = to_ms(times[i])
+            end_ms = to_ms(times[i + 1])
             dur_ms = end_ms - start_ms
             if dur_ms <= 0:
                 continue
@@ -113,30 +134,16 @@ def generate_execution_gantt(
         return str(val).split()[0]
 
     df_timeline["clean_tag"] = df_timeline["tag"].apply(clean_tag)
-    exec_df = df_timeline[df_timeline["kind"] == "execute"].sort_values("t_us")
-    comp_df = df_timeline[df_timeline["kind"] == "complete"].sort_values("t_us")
 
-    jobs = []
-    for _, ex_row in exec_df.iterrows():
-        tid = int(ex_row["tid"])
-        t_start = ex_row["t_us"]
-        algo = ex_row["clean_tag"]
-        if not algo:
-            continue
-
-        matched_comp = comp_df[
-            (comp_df["tid"] == tid) & (comp_df["t_us"] >= t_start)
-        ]
-        if matched_comp.empty:
-            continue
-
-        t_end = matched_comp.iloc[0]["t_us"]
-        jobs.append({
+    jobs = [
+        {
             "tid": tid,
             "algo": algo,
-            "job_start_ms": timeline_ms(t_start),
-            "job_end_ms": timeline_ms(t_end),
-        })
+            "job_start_ms": to_ms(t_start),
+            "job_end_ms": to_ms(t_end),
+        }
+        for tid, algo, t_start, t_end in _pair_jobs(df_timeline)
+    ]
 
     df_jobs = pd.DataFrame(jobs)
 

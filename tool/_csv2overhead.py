@@ -1,4 +1,6 @@
+from collections import defaultdict
 from pathlib import Path
+
 import pandas as pd
 import plotly.express as px
 
@@ -12,6 +14,28 @@ WORKER_PREFIXES = (
 
 def _is_worker(comm_str: str) -> bool:
     return comm_str.startswith(WORKER_PREFIXES)
+
+
+def _pair_jobs(df_timeline):
+    """按 tid **顺序**配对 execute→complete，返回 [(tid, algo, t_start_us, t_end_us), ...]。
+    （与 _csv2timeline._pair_jobs 同一逻辑，两模块各自独立、一并维护。）
+
+    顺序配对（而不是"时间上第一个 complete"）：后者在"开头缺 execute"（导出裁剪正好落在一对
+    中间）时会把每个 execute 配到**下一个任务**的 complete → 时长拉长、同一 complete 被复用。
+    """
+    out = []
+    for tid, grp in df_timeline.groupby("tid"):
+        grp = grp[grp["kind"].isin(("execute", "complete"))].sort_values("t_us")
+        pending = None
+        for _, r in grp.iterrows():
+            if r["kind"] == "execute":
+                pending = r
+            elif pending is not None:
+                algo = pending["clean_tag"]
+                if algo:
+                    out.append((int(tid), algo, pending["t_us"], r["t_us"]))
+                pending = None
+    return out
 
 
 def _merge_intervals(intervals):
@@ -53,15 +77,13 @@ def analyze_cpu_utilization(
     df_preempt = pd.read_csv(preempt_csv)
     df_timeline = pd.read_csv(timeline_csv)
 
-    # ---- 统一时间基准 ----
-    preempt_t0 = df_preempt["t_us"].min()
-    timeline_t0 = df_timeline["t_us"].min()
+    # ---- 统一时间基准：两个 CSV 必须用**同一个** t0 ----
+    # 两份 CSV 的 t_us 是同一时钟的绝对值；若各取各自的最小值归一化，job 区间会整体平移
+    # （实测两文件 min 可差 ~2.6ms）→ job ∩ worker块 求交错位 → Active 低估、Overhead 虚高。
+    t0 = min(df_preempt["t_us"].min(), df_timeline["t_us"].min())
 
-    def preempt_ms(ts_us):
-        return (ts_us - preempt_t0) / 1000.0
-
-    def timeline_ms(ts_us):
-        return (ts_us - timeline_t0) / 1000.0
+    def to_ms(ts_us):
+        return (ts_us - t0) / 1000.0
 
     window_start_ms, window_end_ms = (
         analysis_window_ms if analysis_window_ms else (-float("inf"), float("inf"))
@@ -94,8 +116,8 @@ def analyze_cpu_utilization(
         tids = group["next_tid"].values
 
         for i in range(len(times) - 1):
-            s_ms = preempt_ms(times[i])
-            e_ms = preempt_ms(times[i + 1])
+            s_ms = to_ms(times[i])
+            e_ms = to_ms(times[i + 1])
             clipped = clip(s_ms, e_ms)
             if clipped is None:
                 continue
@@ -121,23 +143,10 @@ def analyze_cpu_utilization(
         return str(val).split()[0]
 
     df_timeline["clean_tag"] = df_timeline["tag"].apply(clean_tag)
-    exec_df = df_timeline[df_timeline["kind"] == "execute"].sort_values("t_us")
-    comp_df = df_timeline[df_timeline["kind"] == "complete"].sort_values("t_us")
 
     jobs = []
-    for _, ex_row in exec_df.iterrows():
-        tid = int(ex_row["tid"])
-        t_start = ex_row["t_us"]
-        algo = ex_row["clean_tag"]
-        if not algo:
-            continue
-        matched_comp = comp_df[(comp_df["tid"] == tid) & (comp_df["t_us"] >= t_start)]
-        if matched_comp.empty:
-            continue
-
-        j_start_ms = timeline_ms(t_start)
-        j_end_ms = timeline_ms(matched_comp.iloc[0]["t_us"])
-        clipped = clip(j_start_ms, j_end_ms)
+    for tid, algo, t_start, t_end in _pair_jobs(df_timeline):
+        clipped = clip(to_ms(t_start), to_ms(t_end))
         if clipped is None:
             continue
         jobs.append({
@@ -154,23 +163,23 @@ def analyze_cpu_utilization(
     cpu_active_segments = {cpu: [] for cpu in all_cpus}
 
     if not df_jobs.empty:
+        # 按 tid 分组，避免 job × 全量 worker 片段的双层扫描（原为 ~10^7 次 Python 迭代）
+        jobs_by_tid = defaultdict(list)
+        for _, job in df_jobs.iterrows():
+            jobs_by_tid[int(job["tid"])].append((job["job_start_ms"], job["job_end_ms"]))
+
         for cpu in all_cpus:
-            worker_segs = cpu_worker_segments[cpu]
-            if not worker_segs:
-                continue
-            worker_tids = {seg["tid"] for seg in worker_segs}
-            cpu_jobs = df_jobs[df_jobs["tid"].isin(worker_tids)]
-            for _, job in cpu_jobs.iterrows():
-                tid = job["tid"]
-                j_start = job["job_start_ms"]
-                j_end = job["job_end_ms"]
-                for block in worker_segs:
-                    if block["tid"] != tid:
-                        continue
-                    seg_start = max(j_start, block["start_ms"])
-                    seg_end = min(j_end, block["end_ms"])
-                    if seg_end > seg_start:
-                        cpu_active_segments[cpu].append((seg_start, seg_end))
+            segs_by_tid = defaultdict(list)
+            for seg in cpu_worker_segments[cpu]:
+                segs_by_tid[seg["tid"]].append((seg["start_ms"], seg["end_ms"]))
+
+            for tid, jlist in jobs_by_tid.items():
+                for b_start, b_end in segs_by_tid.get(tid, ()):
+                    for j_start, j_end in jlist:
+                        seg_start = max(j_start, b_start)
+                        seg_end = min(j_end, b_end)
+                        if seg_end > seg_start:
+                            cpu_active_segments[cpu].append((seg_start, seg_end))
 
     cpu_active_ms = {cpu: _sum_merged(cpu_active_segments[cpu]) for cpu in all_cpus}
 
