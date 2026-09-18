@@ -47,8 +47,6 @@ namespace {
   // 线程计时工具（不受核心分时复用影响）
   void spin_cost_us(const std::string& name, long long us) {
 
-    tracepoint(algo, execute, name.c_str());
-
     if (us <= 0)
       return;
 
@@ -96,28 +94,37 @@ namespace {
         segment_start_cpu_us = current_cpu_us;
       }
     }
-
-    tracepoint(algo, complete, name.c_str());
-
   }
 
   // ── 基础：源 / 汇 / 链 ──
   void usr_src(const std::string& name, int cfg,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   } // 0 输入 / 1 输出
   void usr_sink(const std::string& name, int cfg,
     const std::string &i1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
+
+    tracepoint(algo, complete, name.c_str());
   } // 1 输入 / 0 输出
   void usr_relay(const std::string& name, int cfg,
     const std::string &i1,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   } // 1 输入 / 1 输出
 
   // ── 扇出 1→k（k=2..10）──
@@ -125,21 +132,29 @@ namespace {
     const std::string &i1,
     std::string &o1,
     std::string &o2) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
     o2.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_fork3(const std::string& name, int cfg,
     const std::string &i1,
     std::string &o1,
     std::string &o2,
     std::string &o3) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
     o2.resize(mesg_size);
     o3.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_fork4(const std::string& name, int cfg,
     const std::string &i1,
@@ -147,12 +162,16 @@ namespace {
     std::string &o2,
     std::string &o3,
     std::string &o4) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
     o2.resize(mesg_size);
     o3.resize(mesg_size);
     o4.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_fork5(const std::string& name, int cfg,
     const std::string &i1,
@@ -161,6 +180,8 @@ namespace {
     std::string &o3,
     std::string &o4,
     std::string &o5) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
@@ -168,6 +189,8 @@ namespace {
     o3.resize(mesg_size);
     o4.resize(mesg_size);
     o5.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_fork6(const std::string& name, int cfg,
     const std::string &i1,
@@ -177,6 +200,8 @@ namespace {
     std::string &o4,
     std::string &o5,
     std::string &o6) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
@@ -185,6 +210,8 @@ namespace {
     o4.resize(mesg_size);
     o5.resize(mesg_size);
     o6.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_fork7(const std::string& name, int cfg,
     const std::string &i1,
@@ -195,6 +222,8 @@ namespace {
     std::string &o5,
     std::string &o6,
     std::string &o7) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
@@ -204,6 +233,8 @@ namespace {
     o5.resize(mesg_size);
     o6.resize(mesg_size);
     o7.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_fork8(const std::string& name, int cfg,
     const std::string &i1,
@@ -215,6 +246,8 @@ namespace {
     std::string &o6,
     std::string &o7,
     std::string &o8) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
@@ -225,6 +258,8 @@ namespace {
     o6.resize(mesg_size);
     o7.resize(mesg_size);
     o8.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_fork9(const std::string& name, int cfg,
     const std::string &i1,
@@ -237,6 +272,8 @@ namespace {
     std::string &o7,
     std::string &o8,
     std::string &o9) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
@@ -248,6 +285,8 @@ namespace {
     o7.resize(mesg_size);
     o8.resize(mesg_size);
     o9.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_fork10(const std::string& name, int cfg,
     const std::string &i1,
@@ -261,6 +300,8 @@ namespace {
     std::string &o8,
     std::string &o9,
     std::string &o10) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
@@ -273,6 +314,8 @@ namespace {
     o8.resize(mesg_size);
     o9.resize(mesg_size);
     o10.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
 
   // ── 扇入 k→1（k=2..10）──
@@ -280,18 +323,26 @@ namespace {
     const std::string &i1,
     const std::string &i2,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_join3(const std::string& name, int cfg,
     const std::string &i1,
     const std::string &i2,
     const std::string &i3,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_join4(const std::string& name, int cfg,
     const std::string &i1,
@@ -299,9 +350,13 @@ namespace {
     const std::string &i3,
     const std::string &i4,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_join5(const std::string& name, int cfg,
     const std::string &i1,
@@ -310,9 +365,13 @@ namespace {
     const std::string &i4,
     const std::string &i5,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_join6(const std::string& name, int cfg,
     const std::string &i1,
@@ -322,9 +381,13 @@ namespace {
     const std::string &i5,
     const std::string &i6,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_join7(const std::string& name, int cfg,
     const std::string &i1,
@@ -335,9 +398,13 @@ namespace {
     const std::string &i6,
     const std::string &i7,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_join8(const std::string& name, int cfg,
     const std::string &i1,
@@ -349,9 +416,13 @@ namespace {
     const std::string &i7,
     const std::string &i8,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_join9(const std::string& name, int cfg,
     const std::string &i1,
@@ -364,9 +435,13 @@ namespace {
     const std::string &i8,
     const std::string &i9,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_join10(const std::string& name, int cfg,
     const std::string &i1,
@@ -380,9 +455,13 @@ namespace {
     const std::string &i9,
     const std::string &i10,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
 
   // ── 反馈：1 外部输入 feed + k 路 loop 反馈（k=1..10），单输出 ──
@@ -391,18 +470,26 @@ namespace {
     const std::string &i1,
     const fins::rt::History<std::string>
     &hist, std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_acc2(const std::string& name, int cfg,
     const std::string &i1,
     const fins::rt::History<std::string> &h1,
     const fins::rt::History<std::string> &h2,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_acc3(const std::string& name, int cfg,
     const std::string &i1,
@@ -410,9 +497,13 @@ namespace {
     const fins::rt::History<std::string> &h2,
     const fins::rt::History<std::string> &h3,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_acc4(const std::string& name, int cfg,
     const std::string &i1,
@@ -421,9 +512,13 @@ namespace {
     const fins::rt::History<std::string> &h3,
     const fins::rt::History<std::string> &h4,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_acc5(const std::string& name, int cfg,
     const std::string &i1,
@@ -433,9 +528,13 @@ namespace {
     const fins::rt::History<std::string> &h4,
     const fins::rt::History<std::string> &h5,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_acc6(const std::string& name, int cfg,
     const std::string &i1,
@@ -446,9 +545,13 @@ namespace {
     const fins::rt::History<std::string> &h5,
     const fins::rt::History<std::string> &h6,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_acc7(const std::string& name, int cfg,
     const std::string &i1,
@@ -460,9 +563,13 @@ namespace {
     const fins::rt::History<std::string> &h6,
     const fins::rt::History<std::string> &h7,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_acc8(const std::string& name, int cfg,
     const std::string &i1,
@@ -475,9 +582,13 @@ namespace {
     const fins::rt::History<std::string> &h7,
     const fins::rt::History<std::string> &h8,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_acc9(const std::string& name, int cfg,
     const std::string &i1,
@@ -491,9 +602,13 @@ namespace {
     const fins::rt::History<std::string> &h8,
     const fins::rt::History<std::string> &h9,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
   void usr_acc10(const std::string& name, int cfg,
     const std::string &i1,
@@ -508,9 +623,13 @@ namespace {
     const fins::rt::History<std::string> &h9,
     const fins::rt::History<std::string> &h10,
     std::string &o1) {
+    tracepoint(algo, execute, name.c_str());
+
     spin_cost_us(name, cfg);
 
     o1.resize(mesg_size);
+
+    tracepoint(algo, complete, name.c_str());
   }
 
 #undef USR_SPIN_BODY
