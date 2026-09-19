@@ -111,7 +111,16 @@ CONFIG = {
     "temporal": {
 
         # Probability that a non-source node is timed.
+        #
+        # 对 hist 节点同样适用：未抽中 timed 的 hist 节点走 event（窗口读与事件触发
+        # 共存，见 _assign_temporal）。设 1.0 可退回"hist 必为 timed"的旧行为。
         "ptimed": 0.35,
+
+        # 抽稀倍数 N > 1 的抽样概率（仅对 hist 节点选为 event 时生效）：
+        # 支配节点每产出 N 帧本节点才触发 1 次 → 虚拟周期 = N × min(触发源周期)。
+        # N 取 H/T_min 的因子，使 N×T_min 仍整除标称 HP —— 运行时会自动拓宽不整除的配置，
+        # 但拓宽会让所有节点实例数一起翻倍，故生成期就避免。设 0.0 则恒 N=1（不抽稀）。
+        "pthin": 0.25,
 
         # T values are H / divisor.
         #
@@ -282,6 +291,7 @@ def _add(sk, algo, fo, ins=None, hist=None):
 
 ACC_PROB = 0.25  # 普通链节点被替换为 acc（hist 窗口）的概率
 HIST_N_RANGE = (3, 8)  # 额外 acc 的 hist 窗口长度（>2）
+THIN_MAX = 4  # event 抽稀倍数 N 的上限（候选 = H/T_min 在 [2, THIN_MAX] 内的因子）
 
 
 def _field_ref(idx, port):
@@ -477,9 +487,13 @@ def _sk_mixed(rng, nseg):
             _record(sk, produced, f, fan)
 
             tails = []
-            for _ in range(fan):
-                # 多输出：分支随机连 fork 任意端口
-                port = rng.randrange(fan)
+            # 分支端口**无放回**取（随机置换）：fork 的 fan 个输出端口恰好各接一条分支。
+            # 原为 rng.randrange(fan) 有放回 —— 两条分支可能连同一个端口，join 的输入里
+            # 就出现同一字段两次（算法签名要求 N 个输入，重复字段使 join 名不副实；
+            # 且该字段会在 event 声明里重复，被 C++ 解析器判非法）。
+            ports = rng.sample(range(fan), fan)
+            for bi in range(fan):
+                port = ports[bi]
                 feed = (f, port)
 
                 if rng.random() < 0.5:
@@ -607,13 +621,98 @@ def _valid_periods(H_ms, divisors):
 # 7. Temporal assignment
 # ============================================================
 
+def _input_field(pi, port):
+    """输入端口对应的字段名。
+
+    与 _make_pipeline 的 output_names 命名同源（p{生产者下标}_{输出序号}）——
+    _assign_temporal 拿不到 output_names 表，故按同一规则就地重建。
+    """
+    return f"p{pi}_{port}"
+
+
+def _event_ports(nd):
+    """声明 event 的端口（字段名）列表 = **非 hist** 的输入端口。
+
+    hist 端口是窗口读、不能同时作触发源（C++ check_topology ④ 拒绝 hist∩event
+    同端口），故触发源只能是其余输入。顺序 = inputs 顺序（确定性），**按首次出现去重**
+    —— 同一端口在 event 里出现两次会被 C++ 解析器判"重复声明"拒绝（inputs 允许重复，
+    event 不允许）。
+    """
+    hist = set(nd.get("hist", {}).keys())
+    seen = set()
+    out = []
+    for pi, port in nd.get("ins", []):
+        name = _input_field(pi, port)
+        if name in hist or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _event_thinning(sk, i, T):
+    """hist 节点选为 event 时的抽稀倍数 N = T[i] / min(非 hist 输入的前级周期)。
+
+    与 _assign_temporal 的取值同源；比例非整数（异常）时回落到 1（不抽稀）。
+    """
+    nd = sk[i]
+    hist = set(nd.get("hist", {}).keys())
+    feed = [
+        T[pi]
+        for pi, port in nd.get("ins", [])
+        if _input_field(pi, port) not in hist
+    ]
+    if not feed or any(p is None for p in feed):
+        return 1
+    ratio = T[i] / min(feed)
+    if abs(ratio - round(ratio)) > 1e-9 or ratio < 1:
+        return 1
+    return int(round(ratio))
+
+
+def _sample_thinning(rng, H_ms, T_min, pthin):
+    """抽样 event 端口的抽稀倍数 N（支配节点每产出 N 帧，本节点触发 1 次）。
+
+    N 必须整除 d = H_ms / T_min。C++ 侧已不再拒绝不整除的配置，而是把超周期拓宽到能容纳
+    N × T_min（build_dominance 第二趟），但**生成期仍主动避开**：拓宽会把 HP 拉长（如 100 → 200ms），
+    所有节点的实例数一起翻倍、静态展开变大、单次实验的有效拍数变少 —— 对采样语料没有任何好处。
+    故候选 = divisors(d) ∩ [2, THIN_MAX]；无可用候选（d 为质数等）或未抽中 → N = 1。
+    """
+    if pthin <= 0 or rng.random() >= pthin:
+        return 1
+
+    d = int(round(H_ms / T_min))
+
+    cands = [
+        k
+        for k in range(2, THIN_MAX + 1)
+        if d % k == 0
+    ]
+
+    if not cands:
+        return 1
+
+    return rng.choice(cands)
+
+
+def _virtual_period(rng, H_ms, t_min, pthin):
+    """event 节点的虚拟周期 = 抽稀倍数 N × min(触发源周期)。
+
+    与 C++ build_dominance 的支配端口规则一致：各 event 端口写同一个 N，故
+    min over 端口 (N × T_p) = N × min(T_p)。t_min 由调用方从**该节点已定的触发源周期**
+    里取最小（hist 节点只看非 hist 输入；其余节点看全部输入）。
+    """
+    return _sample_thinning(rng, H_ms, t_min, pthin) * t_min
+
+
 def _assign_temporal(
         sk,
         H_ms,
         seed,
         ptimed,
         period_divisors,
-        must_event=None):
+        must_event=None,
+        pthin=0.0):
     rng = random.Random(seed)
 
     if must_event is None:
@@ -622,6 +721,11 @@ def _assign_temporal(
     _validate_probability(
         "ptimed",
         ptimed,
+    )
+
+    _validate_probability(
+        "pthin",
+        pthin,
     )
 
     periods = _valid_periods(
@@ -665,21 +769,46 @@ def _assign_temporal(
         # ----------------------------------------------------
         # hist（窗口读）节点
         #
-        # hist 声明在显式周期节点上：发起节点必须是 timed，
-        # 不允许通过 predecessor 推导周期。
+        # 窗口读与事件触发**可以共存**（2026-09-19 起）：hist 节点按 ptimed 概率
+        #   ① timed —— 由显式周期释放，窗口量由周期表达；
+        #   ② event —— 由**非 hist 输入**的 producer 完成事件释放，hist 端口仍读窗口
+        #      （hist 是窗口读、不能同端口兼任触发源）。
+        #
+        # 前级周期未知（拓扑序未保证）或无非 hist 输入时一律回落 timed：宁可退回旧行为，
+        # 也不写出与 C++ 支配规则不一致的 T（否则 makespan/利用率与实际运行不符）。
         # ----------------------------------------------------
 
         if hist:
-            trig[i] = "timed"
-            T[i] = _choice(
-                rng,
-                periods,
-            )
+            feed_periods = [
+                T[pi]
+                for pi, port in ins
+                if _input_field(pi, port) not in hist
+            ]
+
+            if (
+                    feed_periods
+                    and all(p is not None for p in feed_periods)
+                    and rng.random() >= ptimed
+            ):
+                trig[i] = "event"
+                T[i] = _virtual_period(rng, H_ms, min(feed_periods), pthin)
+
+            else:
+                trig[i] = "timed"
+                T[i] = _choice(
+                    rng,
+                    periods,
+                )
 
             continue
 
         # ----------------------------------------------------
         # Ordinary non-source node
+        #
+        # period 与 event 是二选一的触发模式，且**一律显式**：timed 写 period、
+        # event 写 event 声明（见 _make_pipeline）。不再产出"既不写 period 也不写
+        # event"的隐式事件节点 —— 那种配置依赖运行时的隐式回退，触发方式在 JSON 里
+        # 读不出来（viewer 只能显示"旧式"，语义也不清晰）。
         # ----------------------------------------------------
 
         if i in must_event:
@@ -695,7 +824,7 @@ def _assign_temporal(
                     f"Node {i} must_event 但无前级周期。"
                 )
             trig[i] = "event"
-            T[i] = min(pred_periods)
+            T[i] = _virtual_period(rng, H_ms, min(pred_periods), pthin)
             continue
 
         if rng.random() < ptimed:
@@ -722,7 +851,7 @@ def _assign_temporal(
                     f"Node {i} has no predecessor period."
                 )
 
-            T[i] = min(pred_periods)
+            T[i] = _virtual_period(rng, H_ms, min(pred_periods), pthin)
 
     if H_ms not in T:
         raise RuntimeError(
@@ -1475,6 +1604,9 @@ def _make_pipeline(sk, trig, T, C_ms):
 
         node_id = f"n{i}"
 
+        # 字段顺序（2026-09-19 定，与 g_state.hpp NodeInfo 头注释同源）：
+        #   id / name / version / type / configs / wcet / inputs / outputs / hist / event|period
+        # 触发细节（period 或 event）一律**置末**：type 已标明模式，细节跟在最后便于扫读。
         node = {
             "id": node_id,
 
@@ -1482,32 +1614,33 @@ def _make_pipeline(sk, trig, T, C_ms):
 
             "version": "1.0.0",
 
-            "outputs": output_names[i],
+            # 触发模式显式声明（timer/event 二选一）；承载周期的字段与之匹配：
+            # timer → period，event → event（见 check_topology ⑦）
+            "type": "timer" if trig[i] == "timed" else "event",
 
-            "wcet": float(
-                C_ms[i]
-            ),
-
-            # parameters 为**位置式取值表**（NodeInfo 只取 value，顺序 = AlgoFunc 配置段序号）：
-            #   [0] 节点 id（string）——插件签名首个配置参数（如 usr_* 的 `const std::string& name`），
-            #       被 spin_cost_us 当作 tracepoint 的 node_id，时间线上据此标出是哪个节点
-            #   [1] cfg（int）—— 每拍忙等时长 µs
-            "parameters": [
+            # configs 为**位置式取值表**（NodeInfo 只取 value，顺序 = AlgoFunc 配置段序号）。
+            # 每项单键对象，键 = c{节点序号}_{配置序号}，与数据端口 p{i}_{j} 同一编号体系；
+            # C++ 会校验键的"配置序号"后缀等于下标、且"节点序号"等于本节点下标（写错即拒 → 配置自校验）：
+            #   c{i}_0 = 节点 id（string）——插件签名首个配置参数（usr_* 的 `const std::string& name`），
+            #           被 spin_cost_us 当作 tracepoint 的 node_id，时间线上据此标出是哪个节点
+            #   c{i}_1 = cfg（int）—— 每拍忙等时长 µs
+            "configs": [
                 {
-                    "value": node_id
+                    f"c{i}_0": node_id
                 },
                 {
-                    "value": int(
+                    f"c{i}_1": int(
                         round(
                             C_ms[i] * 1000.0
                         )
                     )
                 },
             ],
-        }
 
-        if trig[i] == "timed":
-            node["period"] = float(T[i])
+            "wcet": float(
+                C_ms[i]
+            ),
+        }
 
         # ----------------------------------------------------
         # inputs
@@ -1531,17 +1664,27 @@ def _make_pipeline(sk, trig, T, C_ms):
             ]
 
         # ----------------------------------------------------
+        # outputs：同样只有端口名（无初值），顺序 = 算法输出参数顺序
+        # ----------------------------------------------------
+
+        node["outputs"] = output_names[i]
+
+        # ----------------------------------------------------
         # hist（窗口读标记）
         #
+        # 写出形如 [{"p0_0": 5}, {"p1_0": 3}]（每元素单键对象），
+        # 与 event 字段同形（见 g_state.hpp check_topology ④⑥）。
+        #
         # 对应字段必须已在本节点 inputs 中；
-        # hist 仅允许 timed（显式周期）节点；窗口长度 N > 2。
+        # 窗口长度 N > 2；
+        # hist 允许 timed（显式周期）与 event（事件触发，见下 event 段）两类节点。
         # ----------------------------------------------------
 
         if nd.get("hist"):
 
-            if trig[i] != "timed":
+            if trig[i] not in ("timed", "event"):
                 raise RuntimeError(
-                    f"Node n{i}: hist 仅允许 timed(显式周期) 节点声明"
+                    f"Node n{i}: hist 节点须为 timed 或 event"
                 )
 
             inputs = node.get(
@@ -1549,7 +1692,7 @@ def _make_pipeline(sk, trig, T, C_ms):
                 [],
             )
 
-            hist_out = {}
+            hist_out = []
 
             for port, count in nd["hist"].items():
 
@@ -1570,9 +1713,41 @@ def _make_pipeline(sk, trig, T, C_ms):
                         f"hist count must be > 2, got {count}"
                     )
 
-                hist_out[port_name] = count
+                hist_out.append({port_name: count})
 
             node["hist"] = hist_out
+
+        # ----------------------------------------------------
+        # 触发细节（置末，与 type 对应）
+        #
+        # timer → period；event → event 声明。两者二选一且必须与 type 一致，
+        # 由 g_state.hpp check_topology ⑦ 校验（不一致直接拒配置）。
+        #
+        # event 的触发源 = 非 hist 输入端口（hist 是窗口读，不能同端口兼任触发源；对
+        # 非 hist 节点即全部输入）。各端口写同一个抽稀倍数 N = T[i] / min(触发源周期)，
+        # 与 _assign_temporal 的虚拟周期取值同源 → C++ build_dominance 算出的 T 与 T[i] 一致；
+        # 多端口时虚拟周期最小者即支配端口，只有它计入就绪等待（其余为非阻塞边）。
+        # ----------------------------------------------------
+
+        if trig[i] == "timed":
+
+            node["period"] = float(T[i])
+
+        else:
+
+            event_ports = _event_ports(nd)
+
+            if not event_ports:
+                raise RuntimeError(
+                    f"Node n{i}: event 节点无输入端口可作触发源"
+                )
+
+            thin = _event_thinning(sk, i, T)
+
+            node["event"] = [
+                {port_name: thin}
+                for port_name in event_ports
+            ]
 
         nodes.append(node)
 
@@ -1655,6 +1830,7 @@ def generate_candidate(kind, u, m, H_ms, seed, config=None):
         temporal_cfg["ptimed"],
         temporal_cfg["period_divisors"],
         must_event,
+        temporal_cfg.get("pthin", 0.0),
     )
 
     # --------------------------------------------------------
@@ -2221,51 +2397,50 @@ def generate_all(out_dir=None, config=None):
 # ============================================================
 
 def inspect_file(path):
+    """打印一份生成的 pipeline JSON 的可读摘要。
+
+    schema = **裸节点数组**（_make_pipeline 产物），逐节点只含：
+      id / name / version / outputs / wcet / parameters
+      + 可选 period（时间触发）、inputs、hist（窗口读）、event（事件触发 + 抽稀倍数）。
+
+    最终执行周期 T 与 trig 分类**不落 JSON**：运行时由 C++ 按支配规则现算（显式 period /
+    N×支配源周期 / 继承前级），故此处只打印 JSON 里真实存在的键。
+    """
     with open(path, "r") as f:
-        data = json.load(f)
+        nodes = json.load(f)
 
-    meta = data["meta"]
-
-    print(
-        f"kind       = {meta['kind']}"
-    )
-
-    print(
-        f"u          = {meta['u_target']}"
-    )
-
-    print(
-        f"m          = {meta['m']}"
-    )
-
-    print(
-        f"H          = {meta['H_ms']} ms"
-    )
-
-    print(
-        f"makespan   = "
-        f"{meta['makespan_ms']:.6f} ms"
-    )
-
-    print(
-        f"bucket     = "
-        f"{meta['makespan_bucket']['id']:02d}"
-    )
-
-    print(
-        f"seed       = {meta['seed']}"
-    )
-
+    print(f"file  = {path}")
+    print(f"nodes = {len(nodes)}")
     print()
 
-    for node in data["pipeline"]:
-        print(
-            f"[{node['id']:02d}] "
-            f"{node['algo']:12s} "
-            f"trig={node['trig']:5s} "
-            f"T={node['T_ms']:8.3f} ms "
-            f"C={node['cfg']:6d} us"
-        )
+    for node in nodes:
+
+        parts = [
+            f"[{node['id']:>3}] "
+            f"{node['name']:<12}"
+        ]
+
+        if "period" in node:
+            parts.append(f"period={node['period']:g}ms")
+
+        if node.get("inputs"):
+            parts.append(f"inputs={','.join(node['inputs'])}")
+
+        for entry in node.get("hist", []):
+            for port, n in entry.items():
+                parts.append(f"hist:{port}={n}")
+
+        for entry in node.get("event", []):
+            for port, n in entry.items():
+                parts.append(f"event:{port}x{n}")
+
+        # configs = [{c{i}_j: 值}, ...]，取各项的值按序展示（键只是自校验用的端口名）
+        cfgs = [next(iter(c.values())) for c in node.get("configs", [])]
+
+        if len(cfgs) > 1:
+            parts.append(f"cfg={cfgs[1]}us")
+
+        print("  ".join(parts))
 
 
 if __name__ == "__main__":

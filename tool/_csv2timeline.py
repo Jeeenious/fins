@@ -63,6 +63,43 @@ def _subtract_intervals(block_start, block_end, occupied):
     return remaining
 
 
+# ============================================================
+# 输入列校验
+# ============================================================
+# 两份 CSV 的必需列（列名由 tool/_lttng2csv.py 的 run_export 决定）：
+#   *_preempt.csv  = seq,t_us,cpu,prev_tid,prev_comm,prev_state,next_tid,next_comm,...
+#   *_timeline.csv = seq,t_us,cpu,tid,kind,tag
+# 传错文件时 pandas 只会抛裸 KeyError('next_comm')，看不出是"参数传反"还是"用了旧版导出脚本"
+# （旧版列名不同），故在读入处先做一次显式校验，把成因直接写进报错。
+_PREEMPT_COLS = ("t_us", "cpu", "next_tid", "next_comm")
+_TIMELINE_COLS = ("t_us", "tid", "kind", "tag")
+
+
+def _require_columns(df, cols, path: str, which: str):
+    """校验必需列，缺失时抛带诊断提示的 ValueError（不返回）。
+    :param df: pandas DataFrame
+    :param cols: 必需列名
+    :param path: CSV 路径（报错定位用）
+    :param which: 'preempt' / 'timeline'（报错文案用）
+    """
+    missing = [c for c in cols if c not in df.columns]
+    if not missing:
+        return
+
+    hint = ""
+    if which == "preempt" and "kind" in df.columns:
+        hint = " —— 实际列像 timeline CSV，preempt_csv / timeline_csv 两个参数传反了？"
+    elif which == "timeline" and "next_comm" in df.columns:
+        hint = " —— 实际列像 preempt CSV，两个参数传反了？"
+
+    raise ValueError(
+        f"{which} CSV '{path}' 缺少必需列 {missing}{hint}\n"
+        f"  实际列 = {list(df.columns)}\n"
+        f"  正确用法：preempt_csv='*_preempt.csv'（内核 sched_switch），"
+        f"timeline_csv='*_timeline.csv'（UST 事件）"
+    )
+
+
 def generate_execution_gantt(
         preempt_csv: str,
         timeline_csv: str,
@@ -80,6 +117,8 @@ def generate_execution_gantt(
     print("正在读取数据 (Gantt)...")
     df_preempt = pd.read_csv(preempt_csv)
     df_timeline = pd.read_csv(timeline_csv)
+    _require_columns(df_preempt, _PREEMPT_COLS, preempt_csv, "preempt")
+    _require_columns(df_timeline, _TIMELINE_COLS, timeline_csv, "timeline")
 
     # ---- 统一时间基准：两个 CSV 必须用**同一个** t0 ----
     # 两份 CSV 的 t_us 是同一时钟的绝对值；若各取各自的最小值归一化，则 job 区间会整体平移

@@ -54,7 +54,7 @@ schedule/           三件套:wcet / makespan / priority 自包含策略头
 example/            client(主程序 agent) · server(发 cfg) · plugins.cpp(usr_* 插件)
 tool/               uload.ipynb(生成) · test.ipynb(采集) · plot.ipynb(分析)
                     viewer.html(设计/运行图可视化) · agent.sh(独占核脚本)
-docs/               4 篇调度/DAG 语义设计
+docs/               6 篇调度/DAG 语义设计 + pipeline JSON schema
 third_party/        单头依赖 nlohmann/json.hpp · cpp-httplib.h
 build/bin/ build/lib/     构建产物(client/server · plugin.so),gitignore 不入库
 tool/temp/               导出的 trace / dag.json,gitignore 不入库
@@ -204,6 +204,7 @@ sudo tool/agent.sh 1-6 6     # 独占核 1-6 + 6 worker 起 build/bin/client
 | `docs/wcet_estimation.md` | 基于执行历史统计的 wcet 自整定 | 已落地 |
 | `docs/makespan_multipath_bound.md` | Graham → Multi-Path Bound 的 makespan/过载上界 | 已落地 |
 | `docs/priority_scheduling.md` | 静态 + 动态多策略优先级(默认 EDF) | 已落地 |
+| `docs/pipeline_json_schema.md` | pipeline JSON 可解析字段全表(id/name/version/type/configs/inputs/outputs/hist/event/period、校验规则、预留字段 cap) | 已落地 |
 
 各 `.hpp` 顶部注释是最新实现级文档(与设计文档冲突时以代码注释/文档"现行语义"节为准)。
 

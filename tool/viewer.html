@@ -39,6 +39,10 @@ main{flex:1;display:flex;position:relative}
 .edge.hl path{stroke-width:3 !important;filter:drop-shadow(0 0 4px rgba(37,99,235,.5))}
 .edge path{fill:none;stroke:#94a3b8;stroke-width:1.6;stroke-linejoin:round;stroke-linecap:round}
 .edge.self path{stroke:#f59e0b;stroke-dasharray:5 4}.edge.external path{stroke:#dc2626;stroke-dasharray:6 5}
+/* event 触发边（阻塞 = 支配端口）与非阻塞边（只传帧、不计入就绪等待） */
+.edge.evt path{stroke:#0891b2}
+.edge.nonblock path{stroke:#0891b2;stroke-dasharray:3 3;opacity:.6}
+.edge .ebadge{font-size:9.5px;fill:#0e7490;font-weight:700;paint-order:stroke;stroke:#fff;stroke-width:3px}
 .edge .elabel{font-size:11px;fill:#334155;font-weight:700;paint-order:stroke;stroke:#fff;stroke-width:3px;stroke-linejoin:round}
 .edge.hl .elabel{stroke:#dbeafe}
 .hedge path{fill:none;stroke:#d946ef;stroke-width:1.6;stroke-dasharray:7 5;stroke-linejoin:round;stroke-linecap:round;opacity:.9;pointer-events:stroke}
@@ -65,10 +69,10 @@ main{flex:1;display:flex;position:relative}
   <span class="tabs"><button class="tab active" id="tabDesign">设计图</button><button class="tab" id="tabRun">运行图</button></span>
   <span id="loadHint">点按钮/拖入 JSON 自动识别</span>
   <label class="toggle"><input type="checkbox" id="toggleSignal" checked>连线信号名</label>
-  <label class="toggle"><input type="checkbox" id="toggleHist" checked>hist 依赖</label>
+  <label class="toggle"><input type="checkbox" id="toggleHist" checked>隐式读(hist/最新)</label>
   <label class="toggle"><input type="checkbox" id="toggleTp" checked>tp 连线</label>
   <label class="toggle">布线<select id="edgeMode"><option value="smooth" selected>平滑曲线</option><option value="ortho">正交管道</option><option value="classic">经典贝塞尔</option></select></label>
-  <span id="stats"><span>节点 <b id="stNodes">0</b></span><span>连线 <b id="stEdges">0</b></span><span>信号 <b id="stSignals">0</b></span><span>hist <b id="stHist">0</b></span><span>深度 <b id="stDepth">0</b></span></span>
+  <span id="stats"><span>节点 <b id="stNodes">0</b></span><span>连线 <b id="stEdges">0</b></span><span>信号 <b id="stSignals">0</b></span><span>隐式读 <b id="stHist">0</b></span><span>event <b id="stEvt">0</b></span><span>深度 <b id="stDepth">0</b></span></span>
   <button class="btn" id="btnFit">适应视图</button>
   <button class="btn" id="btnZoomIn">＋</button>
   <button class="btn" id="btnZoomOut">－</button>
@@ -89,7 +93,9 @@ main{flex:1;display:flex;position:relative}
     <div class="item"><span class="dot" style="background:#ede9fe"></span>分支 usr_fork</div>
     <div class="item"><span class="dot" style="background:#ccfbf1"></span>汇聚 usr_join</div>
     <div class="item"><span class="dot" style="background:#ffedd5"></span>反馈 usr_acc</div>
-    <div class="item"><span class="dot" style="background:#fff;border:1.6px dashed #d946ef"></span>hist 隐式依赖</div>
+    <div class="item"><span class="dot" style="background:#fff;border:1.6px dashed #d946ef"></span>hist 窗口读 / 最新一帧读</div>
+    <div class="item"><span class="dot" style="background:#fff;border:1.6px solid #0891b2"></span>event 触发边（支配端口·阻塞）</div>
+    <div class="item"><span class="dot" style="background:#fff;border:1.6px dashed #0891b2"></span>event 非支配边（只传帧·不参与等齐）</div>
   </div>
   <div id="hint">拖拽节点移动 · 拖拽空白平移 · 滚轮缩放 · 悬停高亮 · 点击查看详情</div>
   <div id="detail"></div>
@@ -109,35 +115,94 @@ const TYPE_STYLE=[[/time/,{fill:'#fef9c3',stroke:'#facc15',text:'#854d0e'}],[/sr
 function nodeStyle(n){for(const[r,s]of TYPE_STYLE)if(r.test(n))return s;return{fill:'#f1f5f9',stroke:'#94a3b8',text:'#334155'}}
 const TYPECOL=[['#e0f2fe','#38bdf8','#0c4a6e'],['#dcfce7','#4ade80','#14532d'],['#fee2e2','#f87171','#7f1d1d'],['#ede9fe','#a78bfa','#4c1d95'],['#ffedd5','#fb923c','#7c2d12'],['#fce7f3','#f472b6','#831843'],['#cffafe','#22d3ee','#155e75'],['#fef9c3','#facc15','#713f12'],['#d1fae5','#34d399','#065f46'],['#e2e8f0','#94a3b8','#1e293b']];
 
+// hist / event 均为 [{端口: 数值}, ...]（每元素单键对象，同端口不重复）→ 归一成 {端口: 数值}。
+// 旧版 map 形态（{"p0_0": 5}）也接受，便于打开历史配置。
+function portMap(list){
+  const m={};
+  if(Array.isArray(list))list.forEach(e=>{if(e&&typeof e==='object')Object.entries(e).forEach(([k,v])=>{m[k]=v;});});
+  else if(list&&typeof list==='object')Object.entries(list).forEach(([k,v])=>{m[k]=v;});
+  return m;
+}
+function withMaps(n){if(!n.histMap)n.histMap=portMap(n.hist);if(!n.evMap)n.evMap=portMap(n.event);return n;}
+// 输入端口在运行期的读法（与 core/g_state.hpp NodeInfo::port_has_edge / pack_inputs 同规则）：
+//   'hist'   声明 hist  → 窗口读该字段最近 N 帧，无绑定边
+//   'event'  声明 event → 绑定边（触发源；值 = 抽稀倍数 N）
+//   'latest' 其余       → 无绑定边，读该字段历史槽最新一帧
+//                         （时间触发节点全部输入 / event 节点的非 event 输入）
+//   'edge'   旧式事件节点（无 period 无 event）→ 全部输入建绑定边
+function inputKind(n,port){
+  withMaps(n);
+  if(Object.prototype.hasOwnProperty.call(n.histMap,port))return 'hist';
+  if(Object.prototype.hasOwnProperty.call(n.evMap,port))return 'event';
+  if(n.type==='timer'||n.type==='event')return 'latest';  // 两种模式下非 event 端口都读历史槽
+  return 'edge';                                          // 缺 type（非法配置）→ 兜底按边画
+}
+// 触发方式概述（设计视图按 JSON 声明；运行视图的 period 已是解析后的最终周期）
+function triggerDesc(n){
+  const src=withMaps(n.task||n),ev=Object.keys(src.evMap),hs=Object.keys(src.histMap);
+  if(src.type==='timer')
+    return (src.period>0?'时间触发(timer) · period='+n1(src.period)+'ms':'⚠ type=timer 但缺 period（check_topology ⑦ 拒绝）');
+  if(src.type==='event'){
+    if(!ev.length)return '⚠ type=event 但未声明 event 端口（check_topology ⑦ 拒绝）';
+    return '事件触发(event) · 触发源 '+ev.join(', ')+'（抽稀 N='+ev.map(p=>src.evMap[p]).join('/')+'）'+(n.period>0?' → 最终周期 '+n1(n.period)+'ms':'');
+  }
+  return '⚠ 缺 type 字段（非法：须 timer 或 event；check_topology ⑦）'+(hs.length?' · 另声明了 hist':'');
+}
+
 function buildGraph(config){
   let rawNodes,rawEdges;const rawHistEdges=[];
   if(Array.isArray(config)){
-    const prod={};config.forEach(n=>(n.outputs||[]).forEach(s=>prod[s]=n.id));rawNodes=config.map(n=>({...n}));rawEdges=[];
-    config.forEach(n=>{
-      const hist=n.hist||{};
+    const prod={};config.forEach(n=>(n.outputs||[]).forEach(s=>prod[s]=n.id));
+    rawNodes=config.map(n=>withMaps({...n}));rawEdges=[];
+    config.forEach(n=>{withMaps(n);
       (n.inputs||[]).forEach(sig=>{
-        const from=prod[sig];
-        if(Object.prototype.hasOwnProperty.call(hist,sig)){
+        const from=prod[sig],kind=inputKind(n,sig);
+        if(kind==='hist'){
           // hist：窗口读该字段最近 win 帧 → 标为 hist 隐式依赖(反馈/历史边)，不进前序边
-          rawHistEdges.push({from:from??null,to:n.id,port:sig,mode:'win',win:hist[sig],self:from===n.id,external:from===undefined});
-          return;
+          rawHistEdges.push({from:from??null,to:n.id,port:sig,mode:'win',win:n.histMap[sig],self:from===n.id,external:from===undefined});
+        }else if(kind==='event'){
+          // event：绑定边（触发源）；抽稀倍数 N = 支配前级每产出 N 帧触发 1 次
+          rawEdges.push({from:from??null,to:n.id,signal:sig,message:null,self:from===n.id,external:from===undefined,event:true,thin:n.evMap[sig]});
+        }else if(kind==='latest'){
+          // 无绑定边：运行时读该字段历史槽最新一帧 → 同为隐式依赖（不是前序边）
+          rawHistEdges.push({from:from??null,to:n.id,port:sig,mode:'latest',win:1,self:from===n.id,external:from===undefined});
+        }else{
+          rawEdges.push({from:from??null,to:n.id,signal:sig,message:null,self:from===n.id,external:from===undefined});
         }
-        rawEdges.push({from:from??null,to:n.id,signal:sig,message:null,self:from===n.id,external:from===undefined});
       });
     });
   }else if(config&&Array.isArray(config.vertices)&&Array.isArray(config.edges)){
     rawNodes=config.vertices.map(v=>({id:v.id,name:v.name,kind:v.kind,period:v.period,wcet:v.wcet,deadline:v.deadline,ddl:v.ddl,has_job:v.has_job,k:v.k,inputs:v.inputs,outputs:v.outputs,loop:v.loop,hyper_period_ms:config.hyper_period_ms,hyper_start_ms:config.hyper_start_ms}));
-    rawEdges=config.edges.map(e=>({from:e.from,to:e.to,signal:e.tag,message:e.message,self:e.from===e.to,external:false}));
+    // blocking 由 DAG 导出直读（g_state export_dag）：false = 非阻塞边（event 非支配端口，只传帧）
+    rawEdges=config.edges.map(e=>({from:e.from,to:e.to,signal:e.tag,message:e.message,self:e.from===e.to,external:false,blocking:(e.blocking!==false)}));
   }else throw new Error('无法识别的配置格式');
   const byId={};rawNodes.forEach(n=>byId[n.id]=n);
+  // event 支配端口（= 阻塞边）：虚拟周期 = 抽稀倍数 N × 前级周期，取最小者；并列取端口名字典序首个
+  // （与 C++ build_dominance 同规则）。前级周期只有"显式 period"能从 JSON 直读，继承周期需运行期解析
+  // → 读不全就不标注 blocking（运行视图里的 blocking 是从 DAG 导出的真值，不依赖此推断）。
+  {const byNode={};rawEdges.forEach(e=>{if(e.event)(byNode[e.to]=byNode[e.to]||[]).push(e);});
+   Object.values(byNode).forEach(list=>{
+     const cand=list.map(e=>{const p=byId[e.from];return(p&&p.period>0)?e.thin*p.period:null;});
+     if(!cand.every(c=>c!=null))return;
+     let best=0;list.forEach((e,i)=>{if(cand[i]<cand[best]||(cand[i]===cand[best]&&e.signal<list[best].signal))best=i;});
+     list.forEach((e,i)=>{e.blocking=(i===best);});
+   });}
   rawEdges.forEach(e=>{if(!byId[e.from])e.external=true;});
   rawEdges.forEach(e=>{const f=byId[e.from],t=byId[e.to];if(f&&f.kind==='timepoint')e.timeLabel=f.id;else if(t&&t.kind==='timepoint')e.timeLabel=t.id;});
   if(config&&!Array.isArray(config)&&Array.isArray(config.hist_edges))config.hist_edges.forEach(h=>rawHistEdges.push({from:h.from,to:h.to,port:h.port,mode:h.mode,win:h.win,self:h.from===h.to,external:!byId[h.from]||!byId[h.to]}));
   if(!Array.isArray(config)&&S.pipeline){
     const pl=Array.isArray(S.pipeline)?S.pipeline:(S.pipeline.nodes||[]),pm={};pl.forEach(p=>pm[p.id]=p);
-    rawNodes.forEach(n=>{if(Array.isArray(n.inputs)&&Array.isArray(n.outputs))return;const i=n.id.lastIndexOf(':');if(i<=0)return;const p=pm[n.id.slice(0,i)];if(p){n.inputs=p.inputs||[];n.outputs=p.outputs||[];n.task=p;}});
+    // 顶点 id = {节点id}:{k} → 回填设计态端口序；hist/event 一并回填（画端口/依赖边要用），
+    // 但**不回填 period** —— 顶点的 period 是运行期已解析的最终周期，比设计态更权威
+    rawNodes.forEach(n=>{if(Array.isArray(n.inputs)&&Array.isArray(n.outputs))return;const i=n.id.lastIndexOf(':');if(i<=0)return;const p=pm[n.id.slice(0,i)];if(p){n.inputs=p.inputs||[];n.outputs=p.outputs||[];n.task=p;n.hist=p.hist;n.event=p.event;n.histMap=portMap(p.hist);n.evMap=portMap(p.event);}});
   }
-  rawNodes.forEach(n=>{if(!Array.isArray(n.inputs)&&!Array.isArray(n.outputs))return;const lk=new Set([...Object.keys(n.loop||{}),...Object.keys(n.hist||{})]);n.inList=(n.inputs||[]).filter(p=>!lk.has(p));n.outList=n.outputs||[];n.anchorOk=n.inList.length<=MAX_PORTS&&n.outList.length<=MAX_PORTS;n.metaObj=S.meta[n.name]||null;});
+  const isDesignView=Array.isArray(config);
+  rawNodes.forEach(n=>{if(!Array.isArray(n.inputs)&&!Array.isArray(n.outputs))return;
+    const lk=new Set(Object.keys(n.loop||{}));
+    // 设计视图：无绑定边的输入（hist 窗口读 / 最新一帧读）不列进端口列——它们不是前序边。
+    // 运行视图的端口列由 DAG 导出决定，不在此排除（保持原行为）。
+    if(isDesignView)(n.inputs||[]).forEach(p=>{const k=inputKind(n,p);if(k==='hist'||k==='latest')lk.add(p);});
+    n.inList=(n.inputs||[]).filter(p=>!lk.has(p));n.outList=n.outputs||[];n.anchorOk=n.inList.length<=MAX_PORTS&&n.outList.length<=MAX_PORTS;n.metaObj=S.meta[n.name]||null;});
   const group={},idx={};
   rawEdges.forEach(e=>{const k=(e.from??'∅')+'→'+e.to;group[k]=(group[k]||0)+1;});
   rawEdges.forEach(e=>{const k=(e.from??'∅')+'→'+e.to;e.offsetIndex=idx[k]=(idx[k]??0);e.offsetTotal=group[k];idx[k]++;});
@@ -277,20 +342,21 @@ const S={graph:null,view:{x:0,y:0,w:1100,h:700},showSignalNames:true,showHist:tr
 let dragState=null,edgeRefreshQueued=false;
 function toSvgPoint(cx,cy){const r=$('#svg').getBoundingClientRect();return{x:S.view.x+(cx-r.left)/r.width*S.view.w,y:S.view.y+(cy-r.top)/r.height*S.view.h};}
 function startNodeDrag(ev,n,group){ev.preventDefault();ev.stopPropagation();const p=toSvgPoint(ev.clientX,ev.clientY);dragState={kind:'node',node:n,group,startX:p.x,startY:p.y,baseX:n.x,baseY:n.y,moved:false};group.classList.add('dragging');}
-function redrawEdgesNow(){const g=S.graph;if(!g)return;document.querySelectorAll('#edges .edge').forEach(el=>{const e=g.edges[+el.dataset.idx];if(!e)return;const geo=edgeGeometry(g,e,S.edgeMode),p=el.querySelector('path');if(p)p.setAttribute('d',geo.d);const t=el.querySelector('text.elabel');if(t){t.setAttribute('x',geo.lx);t.setAttribute('y',geo.ly);}});if(g.histEdges)document.querySelectorAll('#hedges .hedge').forEach(el=>{const he=g.histEdges[+el.dataset.idx];if(!he||he.external)return;const geo=hedgePath(g,he),p=el.querySelector('path');if(p)p.setAttribute('d',geo.d);const t=el.querySelector('text.hlabel');if(t){t.setAttribute('x',geo.lx);t.setAttribute('y',geo.ly);}});}
+function redrawEdgesNow(){const g=S.graph;if(!g)return;document.querySelectorAll('#edges .edge').forEach(el=>{const e=g.edges[+el.dataset.idx];if(!e)return;const geo=edgeGeometry(g,e,S.edgeMode),p=el.querySelector('path');if(p)p.setAttribute('d',geo.d);const t=el.querySelector('text.elabel');if(t){t.setAttribute('x',geo.lx);t.setAttribute('y',geo.ly);}const b=el.querySelector('text.ebadge');if(b){b.setAttribute('x',geo.lx);b.setAttribute('y',geo.ly+12);}});if(g.histEdges)document.querySelectorAll('#hedges .hedge').forEach(el=>{const he=g.histEdges[+el.dataset.idx];if(!he||he.external)return;const geo=hedgePath(g,he),p=el.querySelector('path');if(p)p.setAttribute('d',geo.d);const t=el.querySelector('text.hlabel');if(t){t.setAttribute('x',geo.lx);t.setAttribute('y',geo.ly);}});}
 function applyNodePosition(n,grp){const nx=n.x,ny=n.y,r=grp.querySelector('rect');if(r){r.setAttribute('x',nx);r.setAttribute('y',ny);}grp.querySelectorAll('text').forEach(t=>{const c=t.getAttribute('class');if(c==='nid'){t.setAttribute('x',nx+NODE_W/2);t.setAttribute('y',ny+NODE_H/2-4);}else if(c==='nname'){t.setAttribute('x',nx+NODE_W/2);t.setAttribute('y',ny+NODE_H/2+14);}else if(c==='nmeta'){t.setAttribute('x',nx+NODE_W/2);t.setAttribute('y',ny+NODE_H/2+28);}});grp.querySelectorAll('.pin,.pout').forEach(el=>{const side=el.getAttribute('data-side'),i=+el.getAttribute('data-i'),list=side==='in'?(n.inList||[]):(n.outList||[]),py=portYAt(n,list.length,i),c=el.querySelector('circle');if(c)c.setAttribute('cx',side==='in'?nx:nx+NODE_W),c.setAttribute('cy',py);const t=el.querySelector('text');if(t)t.setAttribute('x',side==='in'?nx-4:nx+NODE_W+4),t.setAttribute('y',py+3);});}
 
 function drawGraph(){
-  const vp=$('#viewport'),g=S.graph;if(!g){vp.innerHTML='';$('#stNodes').textContent=0;$('#stEdges').textContent=0;$('#stSignals').textContent=0;$('#stHist').textContent=0;$('#stDepth').textContent=0;return;}
+  const vp=$('#viewport'),g=S.graph;if(!g){vp.innerHTML='';$('#stNodes').textContent=0;$('#stEdges').textContent=0;$('#stSignals').textContent=0;$('#stHist').textContent=0;$('#stEvt').textContent=0;$('#stDepth').textContent=0;return;}
   vp.innerHTML='';const bbox=layout(g);
   const visEdgeIdx=[];g.edges.forEach((e,i)=>{if(S.showTp||!isTpEdge(g,e))visEdgeIdx.push(i);});
   const many=visEdgeIdx.length>60;S.showSignalNames=!many;$('#toggleSignal').checked=!many;
   const eg=document.createElementNS(NS,'g');eg.id='edges';
   visEdgeIdx.forEach(i=>{
-    const e=g.edges[i],geo=edgeGeometry(g,e,S.edgeMode),w=document.createElementNS(NS,'g');w.className.baseVal='edge'+(e.self?' self':'')+(e.external?' external':'');w.dataset.idx=i;
+    const e=g.edges[i],geo=edgeGeometry(g,e,S.edgeMode),w=document.createElementNS(NS,'g');w.className.baseVal='edge'+(e.self?' self':'')+(e.external?' external':'')+(e.event?' evt':'')+(e.blocking===false?' nonblock':'');w.dataset.idx=i;
     const p=document.createElementNS(NS,'path');p.setAttribute('d',geo.d);p.setAttribute('marker-end','url(#arrow)');w.appendChild(p);
     if(e.timeLabel){const t=document.createElementNS(NS,'text');t.setAttribute('class','elabel');t.setAttribute('x',geo.lx);t.setAttribute('y',geo.ly);t.setAttribute('fill','#475569');t.textContent=e.timeLabel;w.appendChild(t);}else if(S.showSignalNames&&!e.self){const t=document.createElementNS(NS,'text');t.setAttribute('class','elabel');t.setAttribute('x',geo.lx);t.setAttribute('y',geo.ly);t.textContent=e.signal;w.appendChild(t);}
-    w.addEventListener('mouseenter',ev=>{const ed=g.edges[i],rel=new Set([ed.from,ed.to]);document.querySelectorAll('#nodes .node').forEach(el=>el.classList.toggle('dim',!rel.has(el.dataset.id)));document.querySelectorAll('#edges .edge').forEach(x=>x.classList.remove('hl','dim'));w.classList.add('hl');let tip=`${ed.signal} → ${ed.to}`;if(ed.self)tip+='（自反馈）';if(ed.external)tip+='（外部输入）';if(ed.message&&ed.message.type)tip+=`<br>类型: ${ed.message.type}${ed.message.has_frame?' · 带帧':''}`;showTip(ev,tip);});w.addEventListener('mouseleave',resetHighlight);eg.appendChild(w);
+    if(e.event){const t=document.createElementNS(NS,'text');t.setAttribute('class','ebadge');t.setAttribute('x',geo.lx);t.setAttribute('y',geo.ly+(e.timeLabel||S.showSignalNames?12:0));t.textContent='evt×'+e.thin+(e.blocking===false?' 非阻塞':'')+(e.blocking===true?' 阻塞':'');w.appendChild(t);}
+    w.addEventListener('mouseenter',ev=>{const ed=g.edges[i],rel=new Set([ed.from,ed.to]);document.querySelectorAll('#nodes .node').forEach(el=>el.classList.toggle('dim',!rel.has(el.dataset.id)));document.querySelectorAll('#edges .edge').forEach(x=>x.classList.remove('hl','dim'));w.classList.add('hl');let tip=`${ed.signal} → ${ed.to}`;if(ed.self)tip+='（自反馈）';if(ed.external)tip+='（外部输入）';if(ed.event){tip+=`<br>event 触发源 · 抽稀 N=${ed.thin}（支配前级每产出 ${ed.thin} 帧触发 1 次）`;tip+=ed.blocking===false?'<br>非阻塞边：只传帧，不计入就绪等待':(ed.blocking===true?'<br>阻塞边：计入就绪等待（支配端口）':'<br>阻塞性未知（前级周期为继承值）');}if(ed.message&&ed.message.type)tip+=`<br>类型: ${ed.message.type}${ed.message.has_frame?' · 带帧':''}`;showTip(ev,tip);});w.addEventListener('mouseleave',resetHighlight);eg.appendChild(w);
   });
   vp.appendChild(eg);
   if(g.histEdges&&S.showHist&&g.histEdges.length){const hg=document.createElementNS(NS,'g');hg.id='hedges';g.histEdges.forEach((he,i)=>{if(he.external)return;const w=document.createElementNS(NS,'g');w.className.baseVal='hedge';w.dataset.idx=i;const geo=hedgePath(g,he),p=document.createElementNS(NS,'path');p.setAttribute('d',geo.d);p.setAttribute('marker-end','url(#harrow)');w.appendChild(p);const t=document.createElementNS(NS,'text');t.setAttribute('class','hlabel');t.setAttribute('x',geo.lx);t.setAttribute('y',geo.ly);t.textContent=he.port+(he.mode==='win'?(' ·hist'+he.win):(he.mode==='latest'?'·最新':'·win'+he.win));w.appendChild(t);w.addEventListener('mouseenter',ev=>{const rel=new Set([he.from,he.to]);document.querySelectorAll('#nodes .node').forEach(el=>el.classList.toggle('dim',!rel.has(el.dataset.id)));document.querySelectorAll('#edges .edge').forEach(el=>el.classList.remove('hl','dim'));document.querySelectorAll('#hedges .hedge').forEach(el=>el.classList.toggle('dim',el!==w));w.classList.add('hl');showTip(ev,`${he.port} ${he.mode==='win'?'hist 窗口读前'+he.win+'帧（反馈/历史依赖）':(he.mode==='latest'?'读最新一帧':'依赖前'+he.win+'帧')}（${he.from} → ${he.to}）`);});w.addEventListener('mouseleave',resetHighlight);hg.appendChild(w);});vp.appendChild(hg);}
@@ -304,7 +370,15 @@ function drawGraph(){
     const t2=document.createElementNS(NS,'text');t2.setAttribute('class','nname');t2.setAttribute('x',n.x+NODE_W/2);t2.setAttribute('y',n.y+NODE_H/2+14);t2.setAttribute('fill',tcolor);t2.textContent=(n.kind==='timepoint')?('⏱ 时间锚点'+(n.anchorIdx!=null?' T'+n.anchorIdx:'')):(n.name+(n.kind&&n.kind!=='job'?' · '+n.kind:''));w.appendChild(t2);
     const meta=[];
     if(n.kind==='timepoint'){if(n.anchorOffsetMs!=null)meta.push('t='+n1(n.anchorOffsetMs)+'ms');if(n.anchorAbsMs!=null)meta.push('abs='+n1(n.anchorAbsMs)+'ms');}
-    else{const nrp=(S.viewMode==='run'&&n.kind==='job'&&n.task)?!n.task.period:false;if(nrp){meta.push('非周期');if(n.wcet!==undefined)meta.push('wcet='+n1(n.wcet)+'（虚拟）');}else{if(n.period)meta.push('period='+n1(n.period));if(n.wcet!==undefined)meta.push('wcet='+n1(n.wcet));}if(n.deadline!==undefined)meta.push('dl='+n1(n.deadline));if(n.parameters&&n.parameters.length)meta.push('p='+n.parameters[0].value);}
+    else{const src=withMaps(n.task||n),evp=Object.keys(src.evMap||{}),hsp=Object.keys(src.histMap||{});
+      const nrp=(S.viewMode==='run'&&n.kind==='job'&&n.task)?!n.task.period:false;
+      if(nrp){meta.push(evp.length?'event 触发':'⚠无触发声明（非法）');if(n.wcet!==undefined)meta.push('wcet='+n1(n.wcet)+'（虚拟）');}
+      else{if(n.period)meta.push('period='+n1(n.period));if(n.wcet!==undefined)meta.push('wcet='+n1(n.wcet));}
+      if(evp.length)meta.push('evt:'+evp.map(p=>p+'×'+(src.evMap[p])).join(','));
+      if(hsp.length)meta.push('hist:'+hsp.map(p=>p+'='+(src.histMap[p])).join(','));
+      if(n.deadline!==undefined)meta.push('dl='+n1(n.deadline));if(n.type)meta.push('type='+n.type);
+      const cfgs=(withMaps(n.task||n).configs||[]).map(c=>Object.values(c)[0]);
+      if(cfgs.length)meta.push('cfg='+cfgs.join(','));}
     if(meta.length){const t3=document.createElementNS(NS,'text');t3.setAttribute('class','nmeta');t3.setAttribute('x',n.x+NODE_W/2);t3.setAttribute('y',n.y+NODE_H/2+28);t3.setAttribute('fill',tcolor);t3.textContent=meta.join(' · ');w.appendChild(t3);}
     if(n.anchorOk&&!g.isDag){(n.inList||[]).forEach((name,ii)=>{const py=portYAt(n,n.inList.length,ii),pg=document.createElementNS(NS,'g');pg.setAttribute('class','pin');pg.setAttribute('data-side','in');pg.setAttribute('data-i',ii);const c=document.createElementNS(NS,'circle');c.setAttribute('cx',n.x);c.setAttribute('cy',py);c.setAttribute('r',3.5);pg.appendChild(c);const tt=document.createElementNS(NS,'text');tt.setAttribute('x',n.x-4);tt.setAttribute('y',py+3);tt.textContent=name;pg.appendChild(tt);const m=n.metaObj&&n.metaObj.params?n.metaObj.params.filter(p=>p.role==='in')[ii]:null;pg.addEventListener('mouseenter',ev=>showTip(ev,'IN '+name+(m?' · '+m.name+(m.desc?' · '+m.desc:''):'')));pg.addEventListener('mouseleave',resetHighlight);w.appendChild(pg);});(n.outList||[]).forEach((name,oo)=>{const py=portYAt(n,n.outList.length,oo),pg=document.createElementNS(NS,'g');pg.setAttribute('class','pout');pg.setAttribute('data-side','out');pg.setAttribute('data-i',oo);const c=document.createElementNS(NS,'circle');c.setAttribute('cx',n.x+NODE_W);c.setAttribute('cy',py);c.setAttribute('r',3.5);pg.appendChild(c);const tt=document.createElementNS(NS,'text');tt.setAttribute('x',n.x+NODE_W+4);tt.setAttribute('y',py+3);tt.textContent=name;pg.appendChild(tt);const m=n.metaObj&&n.metaObj.params?n.metaObj.params.filter(p=>p.role==='out')[oo]:null;pg.addEventListener('mouseenter',ev=>showTip(ev,'OUT '+name+(m?' · '+m.name+(m.desc?' · '+m.desc:''):'')));pg.addEventListener('mouseleave',resetHighlight);w.appendChild(pg);});}
     w.addEventListener('mouseenter',ev=>{const rel=new Set([n.id]);g.edges.forEach(ed=>{if(ed.from===n.id||ed.to===n.id){rel.add(ed.from);rel.add(ed.to);}});(g.histEdges||[]).forEach(h=>{if(h.from===n.id||h.to===n.id){rel.add(h.from);rel.add(h.to);}});document.querySelectorAll('#nodes .node').forEach(el=>el.classList.toggle('dim',!rel.has(el.dataset.id)));document.querySelectorAll('#edges .edge').forEach(el=>{const ed=g.edges[+el.dataset.idx],on=ed.from===n.id||ed.to===n.id;el.classList.toggle('dim',!on);el.classList.toggle('hl',on);});document.querySelectorAll('#hedges .hedge').forEach(el=>{const h=g.histEdges&&g.histEdges[+el.dataset.idx],on=!!h&&(h.from===n.id||h.to===n.id);el.classList.toggle('dim',!on);el.classList.toggle('hl',on);});let tip=`${n.id} · ${n.name}${n.kind?' · '+n.kind:''}`;if(n.kind==='timepoint'){tip+='<br>时间锚点'+(n.anchorIdx!=null?' #'+n.anchorIdx:'');if(n.anchorOffsetMs!=null)tip+=' · 偏移 '+n1(n.anchorOffsetMs)+'ms';if(n.anchorAbsMs!=null)tip+='<br>绝对时刻 '+n1(n.anchorAbsMs)+'ms';}showTip(ev,tip);});
@@ -312,7 +386,7 @@ function drawGraph(){
   });
   vp.appendChild(ng);
   const sig=new Set();visEdgeIdx.forEach(i=>sig.add(g.edges[i].signal));
-  $('#stNodes').textContent=g.nodes.length;$('#stEdges').textContent=visEdgeIdx.length;$('#stSignals').textContent=sig.size;$('#stHist').textContent=(g.histEdges||[]).length;$('#stDepth').textContent=Math.max(0,...g.nodes.map(n=>g.depth[n.id]));
+  $('#stNodes').textContent=g.nodes.length;$('#stEdges').textContent=visEdgeIdx.length;$('#stSignals').textContent=sig.size;$('#stHist').textContent=(g.histEdges||[]).length;$('#stEvt').textContent=g.edges.filter(e=>e.event||e.blocking===false).length;$('#stDepth').textContent=Math.max(0,...g.nodes.map(n=>g.depth[n.id]));
   fit(bbox);$('#detail').classList.remove('open');
 }
 function applyView(){$('#svg').setAttribute('viewBox',`${S.view.x} ${S.view.y} ${S.view.w} ${S.view.h}`);}
@@ -328,7 +402,13 @@ function renderAll(){setTabs();const data=S.viewMode==='run'?S.dag:S.pipeline;S.
 let pasteSeq=0;
 window.addEventListener('DOMContentLoaded',()=>{
   const svg=$('#svg');
-  function openDetail(n){const d=$('#detail');d.innerHTML='';const h=document.createElement('h3');h.innerHTML=`<span>节点详情 <span style="color:var(--muted);font-weight:400;font-size:12px">${n.name}</span></span>`;const cl=document.createElement('button');cl.className='close';cl.textContent='×';cl.onclick=()=>d.classList.remove('open');h.appendChild(cl);d.appendChild(h);const kv=document.createElement('dl');kv.className='kv';const rows=[['ID',n.id],['Name',n.name],['Kind',n.kind||'—'],['Period',n.period!=null?n1(n.period):'—'],['WCET',n.wcet!=null?n1(n.wcet):'—'],['Deadline',n.deadline!=null?n1(n.deadline):'—'],['k',n.k??'—'],['HyperPeriod',n.hyper_period_ms!=null?n1(n.hyper_period_ms):'—'],['AnchorOffset',n.anchorOffsetMs!=null?n1(n.anchorOffsetMs)+'ms':'—'],['AnchorAbs',n.anchorAbsMs!=null?n1(n.anchorAbsMs)+'ms':'—'],['Inputs',(n.inputs||[]).join(', ')||'—'],['Outputs',(n.outputs||[]).join(', ')||'—'],['Parameters',(n.parameters||[]).map(p=>JSON.stringify(p)).join(', ')||'—']];rows.forEach(([k,v])=>{if(v==='—')return;const dt=document.createElement('dt');dt.textContent=k;const dd=document.createElement('dd');dd.textContent=v;kv.append(dt,dd);});d.appendChild(kv);const pre=document.createElement('pre');pre.textContent=JSON.stringify(n,null,2);d.appendChild(pre);d.classList.add('open');}
+  function openDetail(n){const d=$('#detail');d.innerHTML='';const h=document.createElement('h3');h.innerHTML=`<span>节点详情 <span style="color:var(--muted);font-weight:400;font-size:12px">${n.name}</span></span>`;const cl=document.createElement('button');cl.className='close';cl.textContent='×';cl.onclick=()=>d.classList.remove('open');h.appendChild(cl);d.appendChild(h);const kv=document.createElement('dl');kv.className='kv';const rows=[['ID',n.id],['Name',n.name],['Kind',n.kind||'—'],['Period',n.period!=null?n1(n.period):'—'],['WCET',n.wcet!=null?n1(n.wcet):'—'],['Deadline',n.deadline!=null?n1(n.deadline):'—'],['k',n.k??'—'],['HyperPeriod',n.hyper_period_ms!=null?n1(n.hyper_period_ms):'—'],['AnchorOffset',n.anchorOffsetMs!=null?n1(n.anchorOffsetMs)+'ms':'—'],['AnchorAbs',n.anchorAbsMs!=null?n1(n.anchorAbsMs)+'ms':'—'],['Inputs',(n.inputs||[]).join(', ')||'—'],['Outputs',(n.outputs||[]).join(', ')||'—'],
+    // 触发方式与输入读法（与 core/g_state.hpp port_has_edge / pack_inputs 同规则）
+    ['触发',triggerDesc(n)],
+    ['hist 窗口读',Object.keys(withMaps(n.task||n).histMap).map(p=>p+'='+withMaps(n.task||n).histMap[p]).join(', ')||'—'],
+    ['event 触发源',Object.keys(withMaps(n.task||n).evMap).map(p=>p+'×'+withMaps(n.task||n).evMap[p]).join(', ')||'—'],
+    ['无绑定边输入',(n.inputs||[]).filter(p=>{const k=inputKind(withMaps(n.task||n),p);return k==='hist'||k==='latest';}).join(', ')||'—'],
+    ['configs',(n.configs||[]).map(c=>Object.entries(c).map(([k,v])=>k+'='+JSON.stringify(v)).join('')).join(', ')||'—']];rows.forEach(([k,v])=>{if(v==='—')return;const dt=document.createElement('dt');dt.textContent=k;const dd=document.createElement('dd');dd.textContent=v;kv.append(dt,dd);});d.appendChild(kv);const pre=document.createElement('pre');pre.textContent=JSON.stringify(n,null,2);d.appendChild(pre);d.classList.add('open');}
   const bindLoad=(btn,inputId,kind)=>{$(btn).addEventListener('click',()=>$(inputId).click());$(inputId).addEventListener('change',e=>{[...e.target.files].forEach(f=>{const r=new FileReader();r.onload=()=>{try{addTyped(kind,JSON.parse(r.result));}catch(err){alert('解析 "'+f.name+'" 失败：'+err.message);}};r.readAsText(f);});e.target.value='';});};
   bindLoad('#btnLoadMeta','#metaInput','meta');bindLoad('#btnLoadPipeline','#pipelineInput','pipeline');bindLoad('#btnLoadDag','#dagInput','dag');
   window.addEventListener('dragover',e=>e.preventDefault());window.addEventListener('drop',e=>{e.preventDefault();[...e.dataTransfer.files].forEach(f=>{if(!/\.json$/i.test(f.name)&&f.type!=='application/json')return;const r=new FileReader();r.onload=()=>{try{addFile(f.name,JSON.parse(r.result));}catch(err){alert(`解析失败：${err.message}`);}};r.readAsText(f);});});
