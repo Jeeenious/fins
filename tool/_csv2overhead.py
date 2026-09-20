@@ -116,13 +116,13 @@ def analyze_cpu_utilization(
     _require_columns(df_preempt, _PREEMPT_COLS, preempt_csv, "preempt")
     _require_columns(df_timeline, _TIMELINE_COLS, timeline_csv, "timeline")
 
-    # ---- 统一时间基准：两个 CSV 必须用**同一个** t0 ----
-    # 两份 CSV 的 t_us 是同一时钟的绝对值；若各取各自的最小值归一化，job 区间会整体平移
-    # （实测两文件 min 可差 ~2.6ms）→ job ∩ worker块 求交错位 → Active 低估、Overhead 虚高。
-    t0 = min(df_preempt["t_us"].min(), df_timeline["t_us"].min())
-
+    # ---- 时间基准：直接用 CSV 的 t_us（µs → ms）----
+    # 两份 CSV 由 _lttng2csv 用**同一个 t0** 导出（见其模块头注释），t_us 已是同一时钟的
+    # 绝对轴，故不再归零 —— 与 _csv2lantency 一致：ms 即"相对 trace 起点"，
+    # analysis_window_ms 在三个脚本间可直接对齐。归一化只会把坐标轴整体平移，
+    # 不改变任何时间差（对齐关系与偏移量无关）。
     def to_ms(ts_us):
-        return (ts_us - t0) / 1000.0
+        return ts_us / 1000.0
 
     window_start_ms, window_end_ms = (
         analysis_window_ms if analysis_window_ms else (-float("inf"), float("inf"))
@@ -263,6 +263,18 @@ def analyze_cpu_utilization(
             "Time_ms": idle_ms,
             "Total_ms": tot,
         })
+
+    # 窗口把所有数据都排除时会一路走到 px.bar 才炸出 KeyError: 'Category'（和成因毫无关系）。
+    # 与 _csv2lantency 同款守卫：此处显式报错并带上 trace 实际时间范围，便于直接改窗口。
+    if not cpu_summary:
+        lo_ms = min(df_preempt["t_us"].min(), df_timeline["t_us"].min()) / 1000.0
+        hi_ms = max(df_preempt["t_us"].max(), df_timeline["t_us"].max()) / 1000.0
+        raise ValueError(
+            f"分析窗口内没有任何数据（区间总长为 0）。\n"
+            f"  trace 时间范围 {lo_ms:.1f} ~ {hi_ms:.1f} ms（ms 相对 trace 起点，"
+            f"受 _lttng2csv 的 after_us 影响）\n"
+            f"  当前窗口 {analysis_window_ms} ms"
+        )
 
     # ============================================================
     # 5. AVG 行：全局加权（Σ时间 / Σ总时间）

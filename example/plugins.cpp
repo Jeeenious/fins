@@ -2,12 +2,14 @@
  * plugins.cpp — 用户算法插件（usr_* 函数族，编译成 plugins/plugin.so 供 loader 装载）
  *
  * 设计约定（configs-first，供负载/拓扑实验）：
- *   · 每个节点 cfg 只有一个参数 = 每拍忙等时长（µs，独占核心自旋），真实占用 CPU。
+ *   · 每个节点 cfg 只有一个参数 = **本拍给定的执行用时**（µs，独占核心自旋），真实占用 CPU。
+ *     执行用时是"给定值"：先做载荷产出（resize/赋值）并测出它已消耗的线程 CPU 时间，
+ *     再自旋补足差额 → 每拍总执行用时恒等于 cfg，与载荷大小无关（spin_cost_us 见下）。
  *   · 值路由已不需要：这些算法只提供「端口形状 + 烧算力」，o1/i1 只为形状与数据流存在。
  *   · 签名类别约定：配置 = 按值小标量（name 用 const 引用）；**输入一律 const T&**、
  *     输出一律 T&。输入按值会在每拍深拷整份载荷（mesg_size = 1MB 时每输入每拍 1MB）。
- *   · 反馈节点入参为 fins::rt::History<std::string>（loop 聚合的最近 N 帧只读视图，零 payload
- *     拷贝）；cfg 节点用 "loop":{端口:N} 声明各反馈窗口。
+ *   · 反馈节点入参为 fins::rt::History<std::string>（字段历史槽的最近 N 帧只读视图，零 payload
+ *     拷贝）；pipeline cfg 用 "hist":[{端口:N}] 声明各窗口。
  *
  * 形状族（每个 = 一个可导出的具体函数，供 pipeline cfg 的 [name:1.0.0] 定位）：
  *   基础    src(0→1) / sink(1→0) / relay(1→1)
@@ -31,7 +33,7 @@
 #include <ctime>
 #include <vector>
 
-static size_t mesg_size = 1024*1024;
+static size_t mesg_size = 7;
 
 namespace {
 
@@ -44,13 +46,31 @@ namespace {
     return static_cast<long long>(ts.tv_sec) * 1'000'000LL + static_cast<long long>(ts.tv_nsec) / 1'000LL;
   }
 
-  // 线程计时工具（不受核心分时复用影响）
-  void spin_cost_us(const std::string& name, long long us) {
+  // 忙等补时：把本 job 的线程 CPU 时间**补足到 budget_us**。
+  //
+  //   budget_us = 该节点给定的执行用时（cfg，来自 wcet 模型）——执行用时是**给定的**，
+  //               不随载荷大小漂移；
+  //   spent_us  = 调用前本 job 已消耗的线程 CPU 时间（载荷产出 resize/赋值等，由调用方测）。
+  //
+  // 自旋只补差额 budget_us − spent_us；working 上报 = spent_us + 自旋量 ≈ budget_us，
+  // 故时间线上"节点执行用时"恒等于给定值，与载荷成本无关（载荷只是把这段预算提前花掉）。
+  void spin_cost_us(const std::string& name, long long budget_us, long long spent_us) {
 
-    if (us <= 0)
+    const long long need = budget_us - spent_us; // 还需补足的自旋量
+
+    if (need <= 0) {
+      // 载荷已吃掉全部预算（甚至超出）：不补自旋，仍上报实际消耗，便于发现预算偏小
+      if (spent_us > 0)
+        tracepoint(
+              algo,
+              working,
+              name.c_str(),
+              sched_getcpu(),
+              spent_us);
       return;
+    }
 
-    // 任务开始时的线程 CPU 时间
+    // 补时起点（相对量：只关心这段自旋自身消耗的 CPU 时间）
     const long long start_cpu_us = thread_cpu_time_us();
 
     // 当前 execution segment 的起点
@@ -59,20 +79,24 @@ namespace {
     // 当前所在 CPU
     int segment_cpu = sched_getcpu();
 
+    // 首段要把载荷的 spent_us 一并计入上报值（各段合计 = budget_us）
+    bool first_segment = true;
+
     while (true) {
       const long long current_cpu_us = thread_cpu_time_us();
       const long long total_cpu_us = current_cpu_us - start_cpu_us;
 
       // 1. 检查任务是否已经获得足够的 CPU execution time
-      if (total_cpu_us >= us) {
-        const long long segment_cpu_us = us - (segment_start_cpu_us - start_cpu_us);
-        if (segment_cpu_us > 0) {
+      if (total_cpu_us >= need) {
+        const long long segment_cpu_us = need - (segment_start_cpu_us - start_cpu_us);
+        const long long reported_us = segment_cpu_us + (first_segment ? spent_us : 0);
+        if (reported_us > 0) {
           tracepoint(
                 algo,
                 working,
                 name.c_str(),
                 segment_cpu,
-                segment_cpu_us);
+                reported_us);
         }
         break;
       }
@@ -81,15 +105,16 @@ namespace {
       const int current_cpu = sched_getcpu();
       if (current_cpu != segment_cpu) {
         const long long segment_cpu_us = current_cpu_us - segment_start_cpu_us;
-        if (segment_cpu_us > 0) {
+        const long long reported_us = segment_cpu_us + (first_segment ? spent_us : 0);
+        if (reported_us > 0) {
           tracepoint(
                 algo,
                 working,
                 name.c_str(),
                 segment_cpu,
-                segment_cpu_us);
-
+                reported_us);
         }
+        first_segment = false;
         segment_cpu = current_cpu;
         segment_start_cpu_us = current_cpu_us;
       }
@@ -101,9 +126,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   } // 0 输入 / 1 输出
@@ -111,7 +138,7 @@ namespace {
     const std::string &i1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    spin_cost_us(name, cfg, 0);
 
     tracepoint(algo, complete, name.c_str());
   } // 1 输入 / 0 输出
@@ -120,9 +147,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   } // 1 输入 / 1 输出
@@ -134,10 +163,12 @@ namespace {
     std::string &o2) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
     o2.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -148,11 +179,13 @@ namespace {
     std::string &o3) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
     o2.resize(mesg_size);
     o3.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -164,12 +197,14 @@ namespace {
     std::string &o4) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
     o2.resize(mesg_size);
     o3.resize(mesg_size);
     o4.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -182,13 +217,15 @@ namespace {
     std::string &o5) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
     o2.resize(mesg_size);
     o3.resize(mesg_size);
     o4.resize(mesg_size);
     o5.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -202,7 +239,7 @@ namespace {
     std::string &o6) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
     o2.resize(mesg_size);
@@ -210,6 +247,8 @@ namespace {
     o4.resize(mesg_size);
     o5.resize(mesg_size);
     o6.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -224,7 +263,7 @@ namespace {
     std::string &o7) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
     o2.resize(mesg_size);
@@ -233,6 +272,8 @@ namespace {
     o5.resize(mesg_size);
     o6.resize(mesg_size);
     o7.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -248,7 +289,7 @@ namespace {
     std::string &o8) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
     o2.resize(mesg_size);
@@ -258,6 +299,8 @@ namespace {
     o6.resize(mesg_size);
     o7.resize(mesg_size);
     o8.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -274,7 +317,7 @@ namespace {
     std::string &o9) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
     o2.resize(mesg_size);
@@ -285,6 +328,8 @@ namespace {
     o7.resize(mesg_size);
     o8.resize(mesg_size);
     o9.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -302,7 +347,7 @@ namespace {
     std::string &o10) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
     o2.resize(mesg_size);
@@ -315,6 +360,8 @@ namespace {
     o9.resize(mesg_size);
     o10.resize(mesg_size);
 
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+
     tracepoint(algo, complete, name.c_str());
   }
 
@@ -325,9 +372,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -338,9 +387,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -352,9 +403,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -367,9 +420,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -383,9 +438,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -400,9 +457,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -418,9 +477,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -437,9 +498,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -457,9 +520,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -472,9 +537,11 @@ namespace {
     &hist, std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -485,9 +552,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -499,9 +568,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -514,9 +585,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -530,9 +603,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -547,9 +622,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -565,9 +642,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -584,9 +663,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -604,9 +685,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
@@ -625,9 +708,11 @@ namespace {
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg);
+    const long long t0_cpu_us = thread_cpu_time_us();
 
     o1.resize(mesg_size);
+
+    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }

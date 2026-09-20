@@ -134,19 +134,17 @@ function inputKind(n,port){
   withMaps(n);
   if(Object.prototype.hasOwnProperty.call(n.histMap,port))return 'hist';
   if(Object.prototype.hasOwnProperty.call(n.evMap,port))return 'event';
-  if(n.type==='timer'||n.type==='event')return 'latest';  // 两种模式下非 event 端口都读历史槽
-  return 'edge';                                          // 缺 type（非法配置）→ 兜底按边画
+  if(n.period>0||Object.keys(n.evMap).length)return 'latest';  // 两种触发模式下非 event 端口都读历史槽
+  return 'edge';                                               // 无触发声明（非法配置）→ 兜底按边画
 }
 // 触发方式概述（设计视图按 JSON 声明；运行视图的 period 已是解析后的最终周期）
 function triggerDesc(n){
   const src=withMaps(n.task||n),ev=Object.keys(src.evMap),hs=Object.keys(src.histMap);
-  if(src.type==='timer')
-    return (src.period>0?'时间触发(timer) · period='+n1(src.period)+'ms':'⚠ type=timer 但缺 period（check_topology ⑦ 拒绝）');
-  if(src.type==='event'){
-    if(!ev.length)return '⚠ type=event 但未声明 event 端口（check_topology ⑦ 拒绝）';
-    return '事件触发(event) · 触发源 '+ev.join(', ')+'（抽稀 N='+ev.map(p=>src.evMap[p]).join('/')+'）'+(n.period>0?' → 最终周期 '+n1(n.period)+'ms':'');
-  }
-  return '⚠ 缺 type 字段（非法：须 timer 或 event；check_topology ⑦）'+(hs.length?' · 另声明了 hist':'');
+  if(src.period>0)
+    return (ev.length?'⚠ period 与 event 互斥（check_topology ⑦ 拒绝）':'时间触发 · period='+n1(src.period)+'ms');
+  if(ev.length)
+    return '事件触发 · 触发源 '+ev.join(', ')+'（抽稀 N='+ev.map(p=>src.evMap[p]).join('/')+'）'+(n.period>0?' → 最终周期 '+n1(n.period)+'ms':'');
+  return '⚠ 缺触发声明（非法：须 period 或 event 二选一；check_topology ⑦）'+(hs.length?' · 另声明了 hist':'');
 }
 
 function buildGraph(config){
@@ -376,8 +374,7 @@ function drawGraph(){
       else{if(n.period)meta.push('period='+n1(n.period));if(n.wcet!==undefined)meta.push('wcet='+n1(n.wcet));}
       if(evp.length)meta.push('evt:'+evp.map(p=>p+'×'+(src.evMap[p])).join(','));
       if(hsp.length)meta.push('hist:'+hsp.map(p=>p+'='+(src.histMap[p])).join(','));
-      if(n.deadline!==undefined)meta.push('dl='+n1(n.deadline));if(n.type)meta.push('type='+n.type);
-      const cfgs=(withMaps(n.task||n).configs||[]).map(c=>Object.values(c)[0]);
+      if(n.deadline!==undefined)meta.push('dl='+n1(n.deadline));const cfgs=(withMaps(n.task||n).configs||[]).map(c=>Object.values(c)[0]);
       if(cfgs.length)meta.push('cfg='+cfgs.join(','));}
     if(meta.length){const t3=document.createElementNS(NS,'text');t3.setAttribute('class','nmeta');t3.setAttribute('x',n.x+NODE_W/2);t3.setAttribute('y',n.y+NODE_H/2+28);t3.setAttribute('fill',tcolor);t3.textContent=meta.join(' · ');w.appendChild(t3);}
     if(n.anchorOk&&!g.isDag){(n.inList||[]).forEach((name,ii)=>{const py=portYAt(n,n.inList.length,ii),pg=document.createElementNS(NS,'g');pg.setAttribute('class','pin');pg.setAttribute('data-side','in');pg.setAttribute('data-i',ii);const c=document.createElementNS(NS,'circle');c.setAttribute('cx',n.x);c.setAttribute('cy',py);c.setAttribute('r',3.5);pg.appendChild(c);const tt=document.createElementNS(NS,'text');tt.setAttribute('x',n.x-4);tt.setAttribute('y',py+3);tt.textContent=name;pg.appendChild(tt);const m=n.metaObj&&n.metaObj.params?n.metaObj.params.filter(p=>p.role==='in')[ii]:null;pg.addEventListener('mouseenter',ev=>showTip(ev,'IN '+name+(m?' · '+m.name+(m.desc?' · '+m.desc:''):'')));pg.addEventListener('mouseleave',resetHighlight);w.appendChild(pg);});(n.outList||[]).forEach((name,oo)=>{const py=portYAt(n,n.outList.length,oo),pg=document.createElementNS(NS,'g');pg.setAttribute('class','pout');pg.setAttribute('data-side','out');pg.setAttribute('data-i',oo);const c=document.createElementNS(NS,'circle');c.setAttribute('cx',n.x+NODE_W);c.setAttribute('cy',py);c.setAttribute('r',3.5);pg.appendChild(c);const tt=document.createElementNS(NS,'text');tt.setAttribute('x',n.x+NODE_W+4);tt.setAttribute('y',py+3);tt.textContent=name;pg.appendChild(tt);const m=n.metaObj&&n.metaObj.params?n.metaObj.params.filter(p=>p.role==='out')[oo]:null;pg.addEventListener('mouseenter',ev=>showTip(ev,'OUT '+name+(m?' · '+m.name+(m.desc?' · '+m.desc:''):'')));pg.addEventListener('mouseleave',resetHighlight);w.appendChild(pg);});}

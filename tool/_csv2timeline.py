@@ -103,7 +103,7 @@ def _require_columns(df, cols, path: str, which: str):
 def generate_execution_gantt(
         preempt_csv: str,
         timeline_csv: str,
-        zoom_window_ms=None,
+        analysis_window_ms=None,
         output_html: str = "cpu_activate_timeline.html",
         show_overhead: bool = True,
         overhead_color: str = "#FFB347",
@@ -120,14 +120,13 @@ def generate_execution_gantt(
     _require_columns(df_preempt, _PREEMPT_COLS, preempt_csv, "preempt")
     _require_columns(df_timeline, _TIMELINE_COLS, timeline_csv, "timeline")
 
-    # ---- 统一时间基准：两个 CSV 必须用**同一个** t0 ----
-    # 两份 CSV 的 t_us 是同一时钟的绝对值；若各取各自的最小值归一化，则 job 区间会整体平移
-    # （实测两文件 min 可差 ~2.6ms）。下面的 job ∩ CPU块 求交会因此错位 → Active 低估、
-    # Overhead 虚高（实测最多 7 倍）。
-    t0 = min(df_preempt["t_us"].min(), df_timeline["t_us"].min())
-
+    # ---- 时间基准：直接用 CSV 的 t_us（µs → ms）----
+    # 两份 CSV 由 _lttng2csv 用**同一个 t0** 导出（见其模块头注释），t_us 已是同一时钟的
+    # 绝对轴，故不再归零 —— 与 _csv2lantency 一致：ms 即"相对 trace 起点"，
+    # analysis_window_ms 在三个脚本间可直接对齐。归一化只会把坐标轴整体平移，
+    # 不改变任何时间差（job ∩ CPU块 的求交结果与偏移无关）。
     def to_ms(ts_us):
-        return (ts_us - t0) / 1000.0
+        return ts_us / 1000.0
 
     # ============================================================
     # 1. 从 preempt.csv 构造每个 CPU 上"目标 worker"的运行片段
@@ -342,9 +341,16 @@ def generate_execution_gantt(
         ),
     )
 
-    if zoom_window_ms is not None:
+    if analysis_window_ms is not None:
+        # 本窗口只设 x 轴范围（缩放），不筛数据 —— 窗口完全落在数据外会得到一张空图，
+        # 故这里提示一下实际时间范围（与 _csv2lantency 的报错文案同源）。
+        d_lo = min(df_preempt["t_us"].min(), df_timeline["t_us"].min()) / 1000.0
+        d_hi = max(df_preempt["t_us"].max(), df_timeline["t_us"].max()) / 1000.0
+        if analysis_window_ms[1] < d_lo or analysis_window_ms[0] > d_hi:
+            print(f"⚠️ 分析窗口 {analysis_window_ms} ms 与数据范围 {d_lo:.1f}~{d_hi:.1f} ms "
+                  f"无交集，图会是空的（本窗口只缩放 x 轴，不筛数据）")
         layout_kwargs["xaxis"] = dict(
-            range=[zoom_window_ms[0], zoom_window_ms[1]],
+            range=[analysis_window_ms[0], analysis_window_ms[1]],
             title="<b>Time (ms from Trace Start)</b>",
         )
 
@@ -368,7 +374,7 @@ if __name__ == "__main__":
     generate_execution_gantt(
         preempt_csv="feedback_u70_m3_ms05_s20632672_135004_preempt.csv",
         timeline_csv="feedback_u70_m3_ms05_s20632672_135004_timeline.csv",
-        zoom_window_ms=None,
+        analysis_window_ms=None,
         output_html="cpu_activate_timeline.html",
         show_overhead=True,
     )

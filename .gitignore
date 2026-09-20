@@ -62,17 +62,10 @@ server
 *.exe
 *.out
 *.app
+*.launch.py
 
 # log
 *.log
-
-# tool
-*/kernel*
-*/pipeline*
-*/result*
-*/temp*
-*/typical*
-*
 
 # ros
 install/
@@ -84,4 +77,15 @@ test/
 /memory/FACT.md
 /memory/JOURNAL.jsonl
 /plugins/
+
+# tool
 *.json
+*.py
+/tool/CIE_1MB/*
+/tool/CIE_serial_1MB/*
+/tool/CIE_serial_7B/*
+/tool/FINS_1MB/*
+/tool/FINS_serial_1MB/*
+/tool/FINS_serial_7B/*
+/tool/pipeline_serial/*
+/tool/temp/*

@@ -13,11 +13,13 @@
 # - `feedback`：反馈（由 hist 窗口构成的闭环）
 # - `mixed`：混合拓扑
 # 
-# **五类都可以混入 `usr_acc`（hist 窗口读）节点：**
-# 
-# - 普通链/分支位置按概率 `ACC_PROB` 被替换为 `usr_acc`：第一个输入 = 前级 feed
-#   （标量读最新一帧），第二个输入 = `hist` 随机读一个**与 feed 不同名**的历史已产出
-#   字段（最近 N>2 帧窗口）。
+# **链/分支位置都可能混入 `usr_acc`（hist 窗口读）节点**（参数 `phist` / `hist`）：
+# multihop / fork / join / feedback 四种在配置里各自单列这两项；mixed 的片段节点走默认值。
+#
+# - 每个已产出字段里**与 feed 不同名者**独立以概率 `phist` 被选作 hist 端口
+#   → 命中 k 个即 `usr_acc{k}`（k=0 则退回 `usr_relay`；k 上限 10 = 插件侧 usr_acc..usr_acc10）。
+#   故 `phist` 同时决定"有没有 hist"与"有几个"，`hist` 只管每个窗口的**长度 N**（须 >2）。
+# - 第一个输入恒为前级 feed（标量读最新一帧）；hist 端口读该字段最近 N 帧窗口。
 # - 数据驱动(event)链仍走绑定边精确消费单帧；显式周期(timed)任务由 period 定时释放，
 #   输入从字段历史缓存取样。
 
@@ -25,7 +27,7 @@ import os
 import json
 import math
 import random
-from collections import deque
+from collections import Counter, deque
 
 # ============================================================
 # 1. Algorithm maps
@@ -74,37 +76,68 @@ ACCUMULATOR = {
 # 2. Configuration
 # ============================================================
 
+# 拓扑生成的默认参数：CONFIG 与各 _sk_* 的默认值共用同一份（故须定义在 CONFIG 之前）
+ACC_PROB = 0.25  # 链上节点成为 hist 窗口节点（usr_acc）的概率
+HIST_N_RANGE = (3, 8)  # hist 窗口长度 N 的默认范围（须 > 2）
+
 CONFIG = {
 
     "topology": {
 
+        # phist / hist 对以下四种拓扑同名同义（都经 _chain_step / _acc_or_relay）：
+        #   phist = 每个与 feed 不同名的已产出字段，独立以此概率被选作 hist 端口
+        #           → 命中 k 个即 usr_acc{k}（k=0 退回 usr_relay，k 上限 10）
+        #   hist  = 每个窗口的长度 N（帧数），int 或 (lo, hi)，须 > 2
+        # 省略则取默认（ACC_PROB / HIST_N_RANGE）。mixed 不列这两项，片段内部走默认值。
+        #
+        # 形状参数：paths = 独立链条数；fan = 扇出/扇入路数；
+        # depth = 链深度（multihop 每条链 / fork 每条支路 / join lane 与尾链共用 /
+        #         feedback 主链）
+
         "multihop": {
             "paths": (1, 4),
             "depth": (2, 8),
+            "phist": ACC_PROB,
+            "hist": HIST_N_RANGE,
         },
 
         "fork": {
             "fan": (2, 8),
-            "bdepth": (1, 3),
+            "depth": (1, 3),
+            "phist": ACC_PROB,
+            "hist": HIST_N_RANGE,
         },
 
         "join": {
             "fan": (2, 8),
-            "bdepth": (1, 3),
-            "tail": (1, 3),
+
+            # 合并前（fan 条 lane）与合并后（尾链）共用同一个深度值
+            "depth": (1, 3),
+            "phist": ACC_PROB,
+            "hist": HIST_N_RANGE,
         },
 
         "feedback": {
             "depth": (3, 8),
-            "histN": (3, 8),
+
+            # 环头 acc 恒建（闭环必需），phist 只作用于环头之前的普通节点；
+            # hist 对两者都生效
+            "phist": ACC_PROB,
+            "hist": HIST_N_RANGE,
         },
 
         "mixed": {
             "nseg": (3, 8),
 
-            "chain_prob": 0.45,
-            "fork_join_prob": 0.30,
-            "feedback_prob": 0.25,
+            # 每段四选一（顺序 = multihop / fork / join / feedback），
+            # 四者之和必须为 1 —— 判据是 rng.random() 的落点区间，
+            # 和不为 1 时 else 分支会吃掉残差，pfeedback 实际占比 ≠ 这里写的值
+            "pmultihop": 0.25,
+            "pfork": 0.25,
+            "pjoin": 0.25,
+            "pfeedback": 0.25,
+
+            # 无 phist / hist：片段内节点走默认值，不再单列（同一语义不出现两处）
         },
     },
 
@@ -289,8 +322,6 @@ def _add(sk, algo, fo, ins=None, hist=None):
 # 4. Topology generation
 # ============================================================
 
-ACC_PROB = 0.25  # 普通链节点被替换为 acc（hist 窗口）的概率
-HIST_N_RANGE = (3, 8)  # 额外 acc 的 hist 窗口长度（>2）
 THIN_MAX = 4  # event 抽稀倍数 N 的上限（候选 = H/T_min 在 [2, THIN_MAX] 内的因子）
 
 
@@ -307,29 +338,47 @@ def _record(sk, produced, idx, fo):
         produced.append((idx, p))
 
 
-def _chain_step(sk, rng, produced, feed):
-    """沿链推进一步：普通 relay，或按概率替换成 usr_acc（读一个与 feed
-    不同名的历史已产出字段作 hist 窗口；无候选时退回 relay）。
-    返回新节点 index（其输出字段 = p{index}_0）。"""
+def _acc_or_relay(sk, rng, produced, feed, phist=ACC_PROB, hist=HIST_N_RANGE):
+    """按 phist **逐个候选字段独立**判定，生成 usr_acc{k} 或 usr_relay，返回节点 index。
+
+    候选 = 已产出字段里与 feed 不同名者。每个候选独立以 phist 概率被选中作 hist 端口
+    → 命中数 k 随机，节点形态 = ACCUMULATOR[k]（usr_acc / usr_acc2 / …）；k=0 退回 relay。
+    故 phist 同时决定"有没有 hist"与"有几个"，hist 只管每个窗口的**长度 N**。
+
+    k 上限 = len(ACCUMULATOR)（= 插件侧 usr_acc..usr_acc10），超出部分截断。
+    注意：候选数随图规模增长，故越靠后的节点越容易命中（P(命中≥1) = 1-(1-phist)^|cand|）。
+
+    @param feed 本节点的主输入字段 (idx, port)
+    @retval int 新节点 index（未登记 produced，由调用方 _record）
+    """
     cand = [o for o in produced if _field_of(o) != _field_of(feed)]
-    if cand and rng.random() < ACC_PROB:
-        hist_src = rng.choice(cand)
-        n = _add(
+    srcs = [o for o in cand if rng.random() < phist][:max(ACCUMULATOR)]
+
+    if srcs:
+        return _add(
             sk,
-            ACCUMULATOR[1],
+            ACCUMULATOR[len(srcs)],
             1,
-            [feed, hist_src],
+            [feed] + srcs,
             hist={
-                _field_of(hist_src): rng.randint(*HIST_N_RANGE),
+                _field_of(o): _randint(rng, hist) for o in srcs
             },
         )
-    else:
-        n = _add(sk, "usr_relay", 1, [feed])
+    return _add(sk, "usr_relay", 1, [feed])
+
+
+def _chain_step(sk, rng, produced, feed, phist=ACC_PROB, hist=HIST_N_RANGE):
+    """沿链推进一步：普通 relay 或 hist 节点（见 _acc_or_relay），并登记其输出字段。
+
+    phist=0 → 纯 relay 链（单入单出、唯一前序，传参时延分析的前提）。
+    返回新节点 index（其输出字段 = p{index}_0）。
+    """
+    n = _acc_or_relay(sk, rng, produced, feed, phist, hist)
     _record(sk, produced, n, 1)
     return n
 
 
-def _sk_multihop(rng, paths, depth):
+def _sk_multihop(rng, paths, depth, phist=ACC_PROB, hist=HIST_N_RANGE):
     sk = []
     produced = []
 
@@ -340,14 +389,18 @@ def _sk_multihop(rng, paths, depth):
 
         feed = (r, 0)
         for _ in range(depth):
-            feed = (_chain_step(sk, rng, produced, feed), 0)
+            feed = (_chain_step(sk, rng, produced, feed, phist, hist), 0)
 
         _add(sk, "usr_sink", 1, [feed])
 
     return sk, set()
 
 
-def _sk_fork(rng, fan, bdepth):
+def _sk_fork(rng, fan, depth, phist=ACC_PROB, hist=HIST_N_RANGE):
+    """扇出：src → fork{fan}，每条支路接 depth 跳后各自 sink（死端）。
+
+    depth 是**已抽好的整数**（由 generate_topology 现抽），fan 条支路共用同一个值。
+    """
     sk = []
     produced = []
 
@@ -363,15 +416,21 @@ def _sk_fork(rng, fan, bdepth):
         port = rng.randrange(fan)
         feed = (f, port)
 
-        for _ in range(bdepth):
-            feed = (_chain_step(sk, rng, produced, feed), 0)
+        for _ in range(depth):
+            feed = (_chain_step(sk, rng, produced, feed, phist, hist), 0)
 
         _add(sk, "usr_sink", 1, [feed])
 
     return sk, set()
 
 
-def _sk_join(rng, fan, bdepth, tail):
+def _sk_join(rng, fan, depth, phist=ACC_PROB, hist=HIST_N_RANGE):
+    """扇入：fan 条独立 lane（各带自己的 src）各接 depth 跳 → join{fan} → 再接 depth 跳 → sink。
+
+    depth 是**已抽好的整数**，合并前与合并后共用同一个值——同一块里不能有两个 depth 键，
+    且这两段的性质本就不同（合并前 fan 路可并行，合并后单路串行），用同一个深度只是
+    统一了命名，不是把它们并成一件事。
+    """
     sk = []
     produced = []
     lanes = []
@@ -382,8 +441,8 @@ def _sk_join(rng, fan, bdepth, tail):
         _record(sk, produced, r, 1)
 
         feed = (r, 0)
-        for _ in range(bdepth):
-            feed = (_chain_step(sk, rng, produced, feed), 0)
+        for _ in range(depth):
+            feed = (_chain_step(sk, rng, produced, feed, phist, hist), 0)
 
         lanes.append(feed)
 
@@ -391,19 +450,22 @@ def _sk_join(rng, fan, bdepth, tail):
     _record(sk, produced, j, 1)
 
     feed = (j, 0)
-    for _ in range(tail):
-        feed = (_chain_step(sk, rng, produced, feed), 0)
+    for _ in range(depth):
+        feed = (_chain_step(sk, rng, produced, feed, phist, hist), 0)
 
     _add(sk, "usr_sink", 1, [feed])
 
     return sk, set()
 
 
-def _sk_feedback(rng, depth, histN_range=HIST_N_RANGE):
+def _sk_feedback(rng, depth, phist=ACC_PROB, hist=HIST_N_RANGE):
     """feedback：链首(环头) acc hist 读链尾输出 → 由 hist 窗口构成的闭环。
 
     环头之前可混入任意 relay/acc；环头(acc, timed) 之后到链尾强制 event，
     让链头→…→链尾有真实绑定边(前序)路径；链头 hist 读链尾字段，跨周期回环。
+    phist 只作用于**环头之前**的普通节点；环头自身的 acc 是闭环必需，恒建、
+    恒 1 个窗口（输入 = feed + 链尾回环字段），不受 phist 影响。
+    hist（窗口长度 N）对两者都生效——环头读链尾字段的窗口长度也由它定。
     """
     if depth < 2:
         raise RuntimeError(f"feedback depth 需 ≥2 以构成闭环，depth={depth}")
@@ -424,7 +486,7 @@ def _sk_feedback(rng, depth, histN_range=HIST_N_RANGE):
         if i == head:
 
             # usr_acc：feed(前级字段, 标量) + hist(链尾 p{depth}_0, N>2)
-            histN = rng.randint(*histN_range)
+            histN = _randint(rng, hist)
             n = _add(
                 sk,
                 ACCUMULATOR[1],
@@ -447,7 +509,7 @@ def _sk_feedback(rng, depth, histN_range=HIST_N_RANGE):
             else:
 
                 # 环头之前：普通节点（可混入 acc，acyclic）
-                n = _chain_step(sk, rng, produced, feed)
+                n = _chain_step(sk, rng, produced, feed, phist, hist)
 
             _record(sk, produced, n, 1)
 
@@ -459,7 +521,28 @@ def _sk_feedback(rng, depth, histN_range=HIST_N_RANGE):
     return sk, must_event
 
 
-def _sk_mixed(rng, nseg):
+def _sk_mixed(rng, nseg, pmultihop=0.25, pfork=0.25, pjoin=0.25, pfeedback=0.25):
+    """混合骨架：从单个 src 起接 nseg 个片段，每段按四个概率之一选一种片段类型
+    （顺序 = multihop / fork / join / feedback）。
+
+    四个片段与四种 kind 同形，区别只在"挂在当前的 r 上"：
+      multihop：从 r 接 depth 跳链，r 前移到链尾
+      fork    ：从 r 扇出 fan 条分支，各接若干跳后各自 usr_sink（死端），**r 不变**
+      join    ：从 r 扇出 fan 条分支 → 各接若干跳 → join 回一路，r 前移到 join 节点
+      feedback：从 r 接一个 hist 节点（窗口读更早的字段，acyclic），r 前移
+
+    判据是 rng.random() 的落点区间，故四者之和须为 1——否则 else 分支会吃掉残差，
+    feedback 实际占比 ≠ 传入值。
+
+    片段内部的节点一律走 _chain_step / _acc_or_relay 的**默认** phist / hist
+    （ACC_PROB / HIST_N_RANGE）——mixed 不单列这两个键，避免同一语义在配置里出现两处。
+    """
+    total = pmultihop + pfork + pjoin + pfeedback
+    if abs(total - 1.0) > 1e-9:
+        raise ValueError(
+            f"mixed 四个片段概率之和须为 1（pmultihop + pfork + pjoin + pfeedback），收到 {total}"
+        )
+
     sk = []
     produced = []
 
@@ -470,35 +553,45 @@ def _sk_mixed(rng, nseg):
 
         x = rng.random()
 
-        if x < 0.45:
+        if x < pmultihop:
 
-            # Chain
+            # multihop 片段：从 r 接一条短链
             depth = rng.randint(1, 3)
             feed = (r, 0)
             for _ in range(depth):
                 feed = (_chain_step(sk, rng, produced, feed), 0)
             r = feed[0]
 
-        elif x < 0.75:
+        elif x < pmultihop + pfork:
 
-            # Fork -> branches -> join
+            # fork 片段：扇出后各自收尾为 sink，r 不动（后续片段仍从 r 续接）
+            fan = rng.randint(2, 5)
+            f = _add(sk, FAN_OUT[fan], fan, [(r, 0)])
+            _record(sk, produced, f, fan)
+
+            for bi in range(fan):
+                feed = (f, rng.randrange(fan))
+                for _ in range(rng.randint(1, 3)):
+                    feed = (_chain_step(sk, rng, produced, feed), 0)
+                _add(sk, "usr_sink", 1, [feed])
+
+        elif x < pmultihop + pfork + pjoin:
+
+            # join 片段：扇出 → 各支路 → 汇回一路，r 前移到 join 节点
             fan = rng.randint(2, 5)
             f = _add(sk, FAN_OUT[fan], fan, [(r, 0)])
             _record(sk, produced, f, fan)
 
             tails = []
             # 分支端口**无放回**取（随机置换）：fork 的 fan 个输出端口恰好各接一条分支。
-            # 原为 rng.randrange(fan) 有放回 —— 两条分支可能连同一个端口，join 的输入里
-            # 就出现同一字段两次（算法签名要求 N 个输入，重复字段使 join 名不副实；
-            # 且该字段会在 event 声明里重复，被 C++ 解析器判非法）。
+            # 有放回时两条分支可能连同一个端口，join 的输入里就会出现同一字段两次
+            # （算法签名要求 N 个输入，重复字段使 join 名不副实；且该字段会在 event
+            # 声明里重复，被 C++ 解析器判非法）。
             ports = rng.sample(range(fan), fan)
             for bi in range(fan):
-                port = ports[bi]
-                feed = (f, port)
-
+                feed = (f, ports[bi])
                 if rng.random() < 0.5:
                     feed = (_chain_step(sk, rng, produced, feed), 0)
-
                 tails.append(feed)
 
             r = _add(sk, FAN_IN[fan], 1, tails)
@@ -506,25 +599,9 @@ def _sk_mixed(rng, nseg):
 
         else:
 
-            # Feedback 片段（acyclic 字段窗口；真正的环只在 feedback kind 构造）
-            feed = (r, 0)
-            cand = [o for o in produced if _field_of(o) != _field_of(feed)]
-
-            if cand:
-                hist_src = rng.choice(cand)
-                histN = rng.randint(*HIST_N_RANGE)
-                r = _add(
-                    sk,
-                    ACCUMULATOR[1],
-                    1,
-                    [feed, hist_src],
-                    hist={
-                        _field_of(hist_src): histN,
-                    },
-                )
-            else:
-                r = _add(sk, "usr_relay", 1, [feed])
-
+            # feedback 片段：hist 节点读更早的字段（acyclic 字段窗口；
+            # 真正的环只在 feedback kind 构造）
+            r = _acc_or_relay(sk, rng, produced, (r, 0))
             _record(sk, produced, r, 1)
 
     _add(sk, "usr_sink", 1, [(r, 0)])
@@ -532,44 +609,120 @@ def _sk_mixed(rng, nseg):
     return sk, set()
 
 
+# 各拓扑块允许的键（白名单，generate_topology 逐块校验；旧键一律硬报错）
+_TOPO_KEYS = {
+    "multihop": ("paths", "depth", "phist", "hist"),
+    "fork": ("fan", "depth", "phist", "hist"),
+    "join": ("fan", "depth", "phist", "hist"),
+    "feedback": ("depth", "phist", "hist"),
+    # mixed 不列 phist / hist：片段内节点走默认值
+    "mixed": ("nseg", "pmultihop", "pfork", "pjoin", "pfeedback"),
+}
+
+# 已作废的旧键 → 现键（仅用于报错时给改名指引；这些键不再被读取）
+_TOPO_RENAMED = {
+    "acc_prob": "phist",
+    "bdepth": "depth",
+    "tail": "depth",
+    "histN": "hist",
+    "chain_prob": "pmultihop",
+    "fork_join_prob": "pfork / pjoin",
+    "feedback_prob": "pfeedback",
+    "hist_k": "（窗口个数已不可配，phist 逐候选判定）",
+}
+
+
 def generate_topology(kind, rng, config=None):
     cfg = CONFIG if config is None else config
 
     tc = cfg["topology"]
 
+    def _check_keys(block, kind):
+        """该拓扑块的键必须落在白名单内。
+
+        旧键一律**硬报错**而不是静默忽略——静默忽略正是"配置改了不生效"的成因
+        （mixed 的三个概率键、feedback.histN、bdepth/tail 都曾如此）。
+        """
+        unknown = sorted(set(block) - set(_TOPO_KEYS[kind]))
+        if not unknown:
+            return
+        hints = [f"{k} → {_TOPO_RENAMED[k]}" for k in unknown if k in _TOPO_RENAMED]
+        raise ValueError(
+            f"[{kind}] 未知参数 {unknown}；该块可用键 = {list(_TOPO_KEYS[kind])}"
+            + (f"（旧键改名：{'；'.join(hints)}）" if hints else "")
+        )
+
+    def _depth_spec(block):
+        """该块的链深度规格（int 或 (lo, hi)）。"""
+        if "depth" not in block:
+            raise ValueError('[拓扑块] 缺少 depth（链深度，int 或 (lo, hi)）')
+        return block["depth"]
+
+    def _hist_args(block):
+        """该拓扑块的 (phist, hist)，带范围校验。
+
+        phist = 每个与 feed 不同名的已产出字段，独立以此概率被选作 hist 端口
+                （命中 k 个即 usr_acc{k}，k=0 退回 usr_relay）
+        hist  = 每个窗口的**长度 N**（帧数），int 或 (lo, hi)，每步现抽，须 > 2
+                （C++ check_topology ④ 拒 N≤2；配小了原本要到灌配置时才报错）
+        不写这两项时取默认（ACC_PROB / HIST_N_RANGE）。
+        """
+        phist = block.get("phist", ACC_PROB)
+        hist = block.get("hist", HIST_N_RANGE)
+        lo, _ = (hist, hist) if isinstance(hist, int) else hist
+        if lo <= 2:
+            raise ValueError(
+                f"hist 窗口长度须 > 2（g_state.hpp check_topology ④），收到 {hist}"
+            )
+        return phist, hist
+
+    if kind not in _TOPO_KEYS:
+        raise ValueError(f"Unknown topology kind: {kind}")
+
+    block = tc[kind]
+    _check_keys(block, kind)
+
     if kind == "multihop":
         return _sk_multihop(
             rng,
-            _randint(rng, tc["multihop"]["paths"]),
-            _randint(rng, tc["multihop"]["depth"]),
+            _randint(rng, block["paths"]),
+            _randint(rng, block["depth"]),
+            *_hist_args(block),
         )
 
     if kind == "fork":
         return _sk_fork(
             rng,
-            _randint(rng, tc["fork"]["fan"]),
-            _randint(rng, tc["fork"]["bdepth"]),
+            _randint(rng, block["fan"]),
+            _randint(rng, _depth_spec(block)),
+            *_hist_args(block),
         )
 
     if kind == "join":
         return _sk_join(
             rng,
-            _randint(rng, tc["join"]["fan"]),
-            _randint(rng, tc["join"]["bdepth"]),
-            _randint(rng, tc["join"]["tail"]),
+            _randint(rng, block["fan"]),
+            # 合并前/合并后共用同一个抽出来的深度（同块不能有两个 depth 键）
+            _randint(rng, _depth_spec(block)),
+            *_hist_args(block),
         )
 
     if kind == "feedback":
-        depth = _randint(rng, tc["feedback"]["depth"])
-        return _sk_feedback(rng, depth, tuple(tc["feedback"]["histN"]))
-
-    if kind == "mixed":
-        return _sk_mixed(
+        return _sk_feedback(
             rng,
-            _randint(rng, tc["mixed"]["nseg"]),
+            _randint(rng, block["depth"]),
+            *_hist_args(block),
         )
 
-    raise ValueError(f"Unknown topology kind: {kind}")
+    # mixed：无 phist / hist（片段内节点走默认值）
+    return _sk_mixed(
+        rng,
+        _randint(rng, block["nseg"]),
+        block.get("pmultihop", 0.25),
+        block.get("pfork", 0.25),
+        block.get("pjoin", 0.25),
+        block.get("pfeedback", 0.25),
+    )
 
 
 # ============================================================
@@ -1605,18 +1758,17 @@ def _make_pipeline(sk, trig, T, C_ms):
         node_id = f"n{i}"
 
         # 字段顺序（2026-09-19 定，与 g_state.hpp NodeInfo 头注释同源）：
-        #   id / name / version / type / configs / wcet / inputs / outputs / hist / event|period
-        # 触发细节（period 或 event）一律**置末**：type 已标明模式，细节跟在最后便于扫读。
+        #   id / name / version                        — 标识
+        #   configs / inputs / outputs                 — 配置 + 端口（三者连着）
+        #   hist                                       — 窗口读声明
+        #   event | period                             — 触发模式（二选一，判据就是这两个字段本身）
+        #   wcet / deadline / cap                      — 可有可无的属性（本生成器只写 wcet；deadline/cap 留空）
         node = {
             "id": node_id,
 
             "name": nd["algo"],
 
             "version": "1.0.0",
-
-            # 触发模式显式声明（timer/event 二选一）；承载周期的字段与之匹配：
-            # timer → period，event → event（见 check_topology ⑦）
-            "type": "timer" if trig[i] == "timed" else "event",
 
             # configs 为**位置式取值表**（NodeInfo 只取 value，顺序 = AlgoFunc 配置段序号）。
             # 每项单键对象，键 = c{节点序号}_{配置序号}，与数据端口 p{i}_{j} 同一编号体系；
@@ -1636,10 +1788,6 @@ def _make_pipeline(sk, trig, T, C_ms):
                     )
                 },
             ],
-
-            "wcet": float(
-                C_ms[i]
-            ),
         }
 
         # ----------------------------------------------------
@@ -1718,10 +1866,10 @@ def _make_pipeline(sk, trig, T, C_ms):
             node["hist"] = hist_out
 
         # ----------------------------------------------------
-        # 触发细节（置末，与 type 对应）
+        # 触发细节（置末）：period / event 二选一，本身就是触发模式的声明
         #
-        # timer → period；event → event 声明。两者二选一且必须与 type 一致，
-        # 由 g_state.hpp check_topology ⑦ 校验（不一致直接拒配置）。
+        # timer → period；event → event 声明。两者二选一、恰好其一，
+        # 由 g_state.hpp check_topology ⑦ 校验（都写或都不写都拒配置）。
         #
         # event 的触发源 = 非 hist 输入端口（hist 是窗口读，不能同端口兼任触发源；对
         # 非 hist 节点即全部输入）。各端口写同一个抽稀倍数 N = T[i] / min(触发源周期)，
@@ -1748,6 +1896,17 @@ def _make_pipeline(sk, trig, T, C_ms):
                 {port_name: thin}
                 for port_name in event_ports
             ]
+
+        # ----------------------------------------------------
+        # 可有可无的属性（置最末）
+        #
+        # wcet（ms）——调度/优先级用；生成器的求解器已定值，故总是写出。
+        # deadline / cap 本生成器不写（deadline 缺省 0 = 未声明；cap 为预留字段）。
+        # ----------------------------------------------------
+
+        node["wcet"] = float(
+            C_ms[i]
+        )
 
         nodes.append(node)
 
@@ -1937,6 +2096,11 @@ def _bucket_key(kind, u, m, bucket_id):
 
 def _generate_candidates(kind, u, m, config, attempts, seed_start, buckets, candidates, ):
     successes = 0
+    # 失败原因 → 次数。逐个尝试失败是采样常态（桶不匹配 / 该 (u,m) 无解），
+    # 但**全部**失败且原因只有一种时，几乎必然是配置写错——那种情况必须报出来，
+    # 否则只显示 generated=0，看不出是配置问题还是运气差（曾把 hist 语义改动的
+    # 配置遗留藏了整整一轮）。
+    reasons = Counter()
 
     for offset in range(attempts):
 
@@ -1960,8 +2124,9 @@ def _generate_candidates(kind, u, m, config, attempts, seed_start, buckets, cand
         except (
                 ValueError,
                 RuntimeError,
-        ):
+        ) as exc:
 
+            reasons[str(exc).splitlines()[0][:140]] += 1
             continue
 
         bucket_id = result[
@@ -1996,6 +2161,13 @@ def _generate_candidates(kind, u, m, config, attempts, seed_start, buckets, cand
         )
 
         successes += 1
+
+    if successes == 0 and reasons:
+        print(f"    [全部失败] {attempts} 次尝试均未产出候选，原因分布：")
+        for msg, c in reasons.most_common(3):
+            print(f"      ×{c:<5} {msg}")
+        if len(reasons) == 1:
+            print("      ⚠ 只有一种原因 → 大概率是配置写错，而不是采样运气差")
 
     return successes
 
@@ -2325,7 +2497,9 @@ def generate_all(out_dir=None, config=None):
 
     all_selected = []
 
-    kinds = [
+    # kinds 可从 config 覆盖（只生成指定拓扑；缺省 = 全部）——CONFIG 里只留一个拓扑块时，
+    # 其余 kind 会在 generate_topology 里 KeyError，故必须能收窄
+    kinds = cfg.get("kinds") or [
         "multihop",
         "fork",
         "join",

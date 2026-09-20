@@ -21,23 +21,28 @@
 ## 2. 节点字段
 
 字段顺序约定（生成器按此写出，**解析不依赖顺序**）：
-`id / name / version / type / configs / wcet / inputs / outputs / hist / event|period`，
-触发细节（`event` 或 `period`）一律置末。
+
+```
+id / name / version          标识
+configs / inputs / outputs   配置 + 端口（三者连着）
+hist                         窗口读声明
+event | period               触发模式（二选一）
+wcet / deadline / cap        可有可无的属性（置最末）
+```
 
 | 字段 | 类型 | 必填 | 默认 | 语义 |
 |---|---|---|---|---|
 | `id` | string | ✅ | — | 节点唯一标识；顶点名 = `{id}:{k}`。生成器用 `n{i}`（i = 节点下标，`configs` 的键依赖它） |
 | `name` | string | ✅ | — | 算法名；与 `version` 组成定位键 `name:version`，在插件库 `library_g.so_ctx` 里查 |
 | `version` | string | ✅ | — | 算法版本（定位键的另一半） |
-| `type` | string | ✅ | — | 触发模式：`"timer"`（时间触发）/ `"event"`（事件触发）。**唯一触发模式声明** |
 | `configs` | array | — | `[]` | 位置式配置值表：`[{c{i}_0: 值}, {c{i}_1: 值}, ...]`。注入顺序 = 数组顺序 = 算法配置段序号 |
 | `wcet` | number | — | `1` | 最坏执行时间（ms）；调度/优先级用 |
 | `deadline` | number | — | `0` | 相对截止期（ms）；**0 = 未声明**，排序中视为最紧急（见 §5） |
 | `inputs` | string[] | — | `[]` | 输入端口名（= 上游输出端口名，同名直连）；顺序 = 算法输入参数顺序 |
 | `outputs` | string[] | — | `[]` | 输出端口名（生产者自己命名，全局唯一）；顺序 = 算法输出参数顺序 |
 | `hist` | array | — | `[]` | 窗口读声明：`[{端口名: 窗口长度 N}, ...]`，N > 2 |
-| `event` | array | — | `[]` | 事件触发声明：`[{端口名: 抽稀倍数 N}, ...]`，N ≥ 1（仅 `type="event"`） |
-| `period` | number | — | `0` | 执行周期（ms，> 0）（仅 `type="timer"`） |
+| `event` | array | — | `[]` | 事件触发声明：`[{端口名: 抽稀倍数 N}, ...]`，N ≥ 1（声明即事件触发） |
+| `period` | number | — | `0` | 执行周期（ms，> 0）（声明即时间触发） |
 | `cap` | number | — | — | **预留字段**（见 §7）：execute 耗时样本保留条数，正整数 |
 
 ### 2.1 `configs` 的键：`c{i}_{j}`
@@ -52,18 +57,18 @@
 - 只取**值**（顺序即语义，名字仅用于自校验），键写错直接拒配置（§6 ⑧）
 - 例：`usr_relay(const std::string& name, int cfg, ...)` → `c{i}_0` = 节点 id、`c{i}_1` = 忙等时长 µs
 
-## 3. 触发模式：`type` 与 `period`/`event` 必须一致
+## 3. 触发模式：`period` / `event` 二选一
 
-`type` 是唯一声明，承载周期的字段必须与之匹配（`check_topology` ⑦）：
+**没有独立的 `type` 字段**——触发模式的判据就是 `period` / `event` 本身（`check_topology` ⑦）：
 
-| `type` | 必须 | 必须没有 | 释放方式 | 输入读法 |
-|---|---|---|---|---|
-| `"timer"` | `period` > 0 | `event` | tp 时间点顶点（超周期内 `k·period` 各一个） | `hist` 端口窗口读；其余读历史槽**最新一帧** |
-| `"event"` | `event` 非空 | `period` | 由 `event` 端口的 producer 完成事件释放 | `event` 端口读绑定边帧；`hist` 端口窗口读；其余读**最新一帧** |
+| 模式 | 判据 | 释放方式 | 输入读法 |
+|---|---|---|---|
+| 时间触发 | `period` > 0 | tp 时间点顶点（超周期内 `k·period` 各一个） | `hist` 端口窗口读；其余读历史槽**最新一帧** |
+| 事件触发 | `event` 非空 | 由 `event` 端口的 producer 完成事件释放 | `event` 端口读绑定边帧；`hist` 端口窗口读；其余读**最新一帧** |
 
-**不支持隐式事件节点**：既不写 `period` 也不写 `event` 的节点一律拒（`type` 与实际字段
-不一致时，运行时按哪种模式走全凭猜，例如 `type="timer"` 却没 `period` 会既无 tp 释放点
-也无绑定边 → 节点静默不跑）。
+**二选一且必须恰好其一，不支持隐式事件节点**：
+- 两者都写 → 拒（`period` 会静默压过 `event`：`port_has_edge` 对 `period>0` 恒返回 false）
+- 都不写 → 拒（既无 tp 释放点也无绑定边，节点会静默不跑）
 
 ### 3.1 event 的虚拟周期与支配端口
 
@@ -96,7 +101,7 @@
 
 | # | 规则 |
 |---|---|
-| 1 | `id` / `name` / `version` / `type` 必填 string；`type ∈ {timer, event}` |
+| 1 | `id` / `name` / `version` 必填 string |
 | 2 | `configs` 每项须为单键对象，键 = `c{i}_{j}`（后缀必须等于下标） |
 | 3 | `inputs` / `outputs` 为 string 数组 |
 | 4 | `wcet` / `deadline` / `period` / `cap` 为 number；`cap` 为正整数 |
@@ -108,12 +113,12 @@
 | # | 规则 |
 |---|---|
 | ① | 单写者：同名输出端口至多一个生产者 |
-| ② | 源节点（无输入）须 `type="timer"` 且 `period > 0` |
+| ② | 源节点（无输入）须时间触发：`period > 0` |
 | ③ | 孤立输入：每个输入端口须有生产者 |
-| ④ | `hist`：键 ∈ `inputs`、N > 2、节点须为 timer 或 event、不得与 `event` 键重叠 |
+| ④ | `hist`：键 ∈ `inputs`、N > 2、节点须声明 `period` 或 `event`、不得与 `event` 键重叠 |
 | ⑤ | 事件前序边无环（`event` 端口构成的 producer→consumer 子图） |
 | ⑥ | `event`：键 ∈ `inputs`、N ≥ 1 |
-| ⑦ | `type` 与触发字段一致（timer ⟺ `period>0`；event ⟺ `event` 非空；不得都有/都无） |
+| ⑦ | 触发模式二选一：`period>0` ⟺ 时间触发、`event` 非空 ⟺ 事件触发，不得都有/都无 |
 | ⑧ | `configs[j]` 键须为 `c{本节点下标}_{j}` |
 
 ## 7. 预留字段：`cap`
@@ -134,17 +139,18 @@
 |---|---|
 | `parameters` | 已更名 `configs` 且改形为 `[{c{i}_j: 值}]`；出现即拒并提示 |
 | `hist` 的旧 map 形态 `{"p0_0": 5}` | 只接受数组形态 `[{"p0_0": 5}]`，map 形态报"须为数组" |
+| `type` | 曾短暂引入（timer/event 字符串），已删——触发模式由 `period`/`event` 字段本身判定 |
 | `trig` / `T_ms` | 从不属于本 schema；运行时由 `build_dominance` 现算（`_load.inspect_file` 曾有坏引用，已修） |
 
 ## 8. 完整示例
 
 ```json
 [
-  {"id": "n0", "name": "usr_src", "version": "1.0.0", "type": "timer",
+  {"id": "n0", "name": "usr_src", "version": "1.0.0",
    "configs": [{"c0_0": "n0"}, {"c0_1": 1005}], "wcet": 1.005,
    "outputs": ["p0_0"], "period": 100.0},
 
-  {"id": "n1", "name": "usr_acc", "version": "1.0.0", "type": "event",
+  {"id": "n1", "name": "usr_acc", "version": "1.0.0",
    "configs": [{"c1_0": "n1"}, {"c1_1": 3979}], "wcet": 3.979,
    "inputs": ["p0_0", "p3_0"], "outputs": ["p1_0"],
    "hist": [{"p3_0": 3}], "event": [{"p0_0": 1}]}
@@ -158,5 +164,5 @@
 
 - 解析/校验实现：`core/g_state.hpp`（`NodeInfo` 构造器、`check_topology`）
 - 生成器：`tool/_load.py`（`_make_pipeline` 产出、`inspect_file` 打印、`generate_all` 批量）
-- 可视化：`tool/viewer.html`（`inputKind` / `triggerDesc` 按 `type` 分派）
+- 可视化：`tool/viewer.html`（`inputKind` / `triggerDesc` 按 `period`/`event` 分派）
 - 调度语义：`docs/precedence_graph_design.md`；WCET 自整定：`docs/wcet_estimation.md`

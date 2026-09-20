@@ -155,16 +155,14 @@ namespace fins::rt {
   inline Library library_g;
 
   /** @brief 节点解析态（Pipeline 内嵌，parse_pipeline 产物）：纯数据，字段含 id/name/version、
-   *  端口名数组、config_keys/config_cache、hist/event、type/period/wcet/deadline。 */
+   *  端口名数组、config_keys/config_cache、hist/event、period/wcet/deadline。 */
   struct NodeInfo {
     std::string id; // 节点在图中的唯一标识（顶点名 id:{k} 前缀）
     std::string name; // 算法名（[name:version] = so 表定位键）
     std::string version; // 算法版本（定位键）
 
-    std::string type; // 触发模式（"timer" / "event"，必填）：timer ⟺ period>0，event ⟺ event 非空，
-                      // 由 check_topology ⑦ 校验两者一致（二选一且只允许其一）
-
-    double period{0}; // 执行周期（ms；仅 timer 节点，类型为 timer 时必填 >0）
+    double period{0}; // 执行周期（ms；>0 = 时间触发。0 = 未声明 period → 必须声明 event，
+                      // 见 check_topology ⑦ 二选一）
     double deadline{0}; // 相对截止期（ms；缺省 0 = 未声明，排序中视为最紧急）
     double wcet{1}; // 最坏执行时间（ms；缺省 1）
 
@@ -203,9 +201,13 @@ namespace fins::rt {
     /** @brief 逐节点自解析：全部结构校验 + 字段抽取（Pipeline::parse 只拆封顶层后逐个调用
      *  本构造器）。configs 为**位置式取值表** config_cache——每项 {c<下标>: 值}，只取值、名字丢弃
      *  （顺序 = configs 数组元素顺序 = AlgoFunc 配置段相对序号，见 algo_func.hpp 头注释顺序保证链）。
-     *  字段顺序约定（生成器按此写出，解析不依赖顺序）：id / name / version / type / configs /
-     *  inputs / outputs / hist / event|period（触发细节置末）。
-     * @param n 节点 JSON 对象（必填 id/name/version/type；可选 configs/inputs/outputs/wcet/deadline/hist/cap，
+     *  字段顺序约定（生成器按此写出，解析不依赖顺序）：
+     *    id / name / version                      标识
+     *    configs / inputs / outputs               配置 + 端口（三者连着）
+     *    hist                                     窗口读声明
+     *    event | period                           触发模式（二选一，见 check_topology ⑦）
+     *    wcet / deadline / cap                    可有可无的属性
+     * @param n 节点 JSON 对象（必填 id/name/version；可选 configs/inputs/outputs/wcet/deadline/hist/cap，
      *          以及 timer 的 period、event 的 event）。字段全表与语义见 docs/pipeline_json_schema.md
      * @param at 错误定位上下文串（如 "nodes[i]."，错误消息前缀用）
      * @retval 无（格式违反抛 std::invalid_argument）
@@ -219,12 +221,6 @@ namespace fins::rt {
         throw std::invalid_argument("[parse_dataflow] " + at + "version 必填 string");
       if (!n.contains("id") || !n["id"].is_string())
         throw std::invalid_argument("[parse_dataflow] " + at + "id 必填 string");
-      if (!n.contains("type") || !n["type"].is_string())
-        throw std::invalid_argument("[parse_dataflow] " + at + "type 必填 string（\"timer\" 或 \"event\"）");
-      type = n["type"].get<std::string>();
-      if (type != "timer" && type != "event")
-        throw std::invalid_argument("[parse_dataflow] " + at + "type 须为 \"timer\" 或 \"event\"，收到 \"" + type + "\"");
-
       // 旧字段名 parameters → configs（2026-09-19 更名+改形），命中即拒并指明改法
       if (n.contains("parameters"))
         throw std::invalid_argument("[parse_dataflow] " + at +
@@ -323,7 +319,7 @@ namespace fins::rt {
   };
   /** @brief Pipeline — dataflow 配置（解析态；全局单份 pipeline_g）：cache = 原始配置 JSON 双缓冲
    *  （RPC 写缓冲份不解析 → pending → 主线程调度循环图静止时 commit + parse_pipeline 填 nodes），
-   *  标准形式 = 节点对象数组（id/name/version/type 必填 + configs/inputs/outputs/wcet/deadline/hist，
+   *  标准形式 = 节点对象数组（id/name/version 必填 + configs/inputs/outputs/wcet/deadline/hist，
    *  hist 可选），违反抛 std::invalid_argument；显式周期节点输入经 message_hist_ 字段缓存取样（hist 窗口/最新标量）。
    */
   struct Pipeline {
@@ -379,8 +375,8 @@ namespace fins::rt {
      *  ⑥ event 语义合法性（唯一审查点）：event 键须在本节点 inputs 中、抽稀倍数 N ≥ 1、不得与 hist
      *     键重叠。虚拟周期 = min over event 端口 (N × 支配节点周期)；不整除标称 HP 时由
      *     build_dominance **拓宽超周期**容纳（不再拒绝），此处只查逐节点内的静态合法性。
-     *  ⑦ type 与触发字段一致（**不支持隐式事件节点**）：唯一触发模式声明是 type（timer/event），
-     *     承载周期的字段必须与之匹配——timer ⟺ period>0、event ⟺ event 非空，不得两者都有/都无。
+     *  ⑦ 触发模式二选一（**不支持隐式事件节点**）：period>0 ⟺ 时间触发、event 非空 ⟺ 事件触发，
+     *     两者必须恰好声明其一（period 会静默压过 event；都无则节点静默不跑）。
      *  ⑧ configs 键形：每项 {c{节点序号}_{配置序号}: 值}，与数据端口 p{i}_{j} 同构；节点序号须等于
      *     本节点下标（配置被搬错节点/节点顺序被改时直接暴露）。
      * @retval 无（违反抛 std::invalid_argument）
@@ -396,7 +392,7 @@ namespace fins::rt {
       for (size_t i = 0; i < nodes.size(); ++i)
         if (nodes[i].input_ports.empty() && nodes[i].period <= 0)
           throw std::invalid_argument("[check_topology] nodes[" + std::to_string(i) +
-                                      "] 无输入节点无上游驱动，须 type=\"timer\" 且 period>0");
+                                      "] 无输入节点无上游驱动，须时间触发（period>0）");
       // ③ 孤立输入拒绝：每个输入端口（含显式周期节点的窗口输入/自反馈字段）须有生产者（数据流边
       //    只来自节点输出；无生产者 → 该节点退化为“伪根”——无 tp 释放点、虚拟周期定不出来、expand 后只跑一次且
       //    永不重放，还会让周期兄弟因它永不完成而无法翻页）。周期节点自反馈（hist 字段 = 自身输出）
@@ -418,7 +414,7 @@ namespace fins::rt {
           return std::find(ni.input_ports.begin(), ni.input_ports.end(), pn) != ni.input_ports.end();
         };
         if (!ni.hist.empty() && ni.period <= 0 && ni.event.empty())
-          throw std::invalid_argument(at + " 声明 hist 的节点须为 timer（period>0）或 event（声明 event 端口）");
+          throw std::invalid_argument(at + " 声明 hist 的节点须为时间触发（period>0）或事件触发（声明 event 端口）");
         for (const auto &[pn, N]: ni.hist) {
           if (!in_inputs(pn))
             throw std::invalid_argument(at + " hist 端口 '" + pn + "' 须在本节点 inputs 中声明");
@@ -433,22 +429,16 @@ namespace fins::rt {
           if (N < 1)
             throw std::invalid_argument(at + " event 端口 '" + pn + "' 抽稀倍数 N 须 ≥ 1");
         }
-        // ⑦ type 与触发字段一致（唯一触发模式声明 = type，不支持隐式事件节点）：timer ⟺ period>0、
-        //    event ⟺ event 非空，且不得两者都有/都无。不一致时运行时按哪种模式走全凭猜——如
-        //    type=timer 却没 period：既无 tp 释放点也无绑定边，节点会静默不跑。
+        // ⑦ 触发模式二选一（**判据就是字段本身，无独立 type 字段**；不支持隐式事件节点）：
+        //    period>0 ⟺ 时间触发、event 非空 ⟺ 事件触发。两者都写时 period 会静默压过 event
+        //    （port_has_edge 对 period>0 恒返回 false）；都不写则触发方式只能靠运行时猜
+        //    （既无 tp 释放点也无绑定边 → 节点静默不跑）。故必须恰好其一。
         const bool has_period = ni.period > 0;
         const bool has_event = !ni.event.empty();
-        if (ni.type == "timer") {
-          if (!has_period)
-            throw std::invalid_argument(at + " type=\"timer\" 须声明 period（>0）");
-          if (has_event)
-            throw std::invalid_argument(at + " type=\"timer\" 不得声明 event（二选一触发模式）");
-        } else { // type == "event"
-          if (!has_event)
-            throw std::invalid_argument(at + " type=\"event\" 须声明 event 端口（见 ⑥）");
-          if (has_period)
-            throw std::invalid_argument(at + " type=\"event\" 不得声明 period（二选一触发模式）");
-        }
+        if (has_period && has_event)
+          throw std::invalid_argument(at + " period 与 event 互斥（二选一触发模式），不得同时声明");
+        if (!has_period && !has_event)
+          throw std::invalid_argument(at + " 须声明触发模式之一：period（时间触发）或 event（事件触发）");
         // ⑧ configs 键的"节点序号"须 = 本节点下标（c{i}_{j} 与 p{i}_{j} 同一编号体系；
         //    节点顺序被改动 / 配置被搬错节点时直接暴露，而不是静默按位置注入错值）
         for (size_t j = 0; j < ni.config_keys.size(); ++j) {
@@ -1019,7 +1009,7 @@ namespace fins::rt {
     /** @brief ⑦.5 时间链：解析同步时间点（显式周期节点释放时刻并集）→ 建时间点顶点（job = 延迟
      *  （sleep_until 绝对释放时刻，timer 拿到 w 直接 job() 即实现延迟）、period=相对 hyper_start_ms
      *  的释放偏移）+ 挂靠边 tp:s → {id}:{k}（释放约束：时间点 Finished 任务才就绪）。仅显式周期
-     *  节点（type=timer）产生同步点并挂靠；事件触发（type=event）节点仍纯数据流驱动。时间点按绝对释放时刻聚合
+     *  时间触发节点（period>0）产生同步点并挂靠；事件触发节点（event 非空）仍纯数据流驱动。时间点按绝对释放时刻聚合
      *  ——多任务共享同一时间点（如两个 50ms 任务与一个 100ms 任务同时刻释放共用该点），锚定真实
      *  时钟消除旧 delay 的漂移。注意顺序：须在 build_edge 之后调用（其挂靠边引用的任务顶点已由
      *  build_vertex 建好、时间点顶点自建）。
