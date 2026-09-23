@@ -2,16 +2,21 @@
  * plugins.cpp — 用户算法插件（usr_* 函数族，编译成 plugins/plugin.so 供 loader 装载）
  *
  * 设计约定（configs-first，供负载/拓扑实验）：
- *   · 每个节点 cfg 只有一个参数 = **本拍给定的执行用时**（µs，独占核心自旋），真实占用 CPU。
+ *   配置段三个参数（JSON configs 的 c{i}_0 / c{i}_1 / c{i}_2，位置式）：
+ *     name = 节点 id（tracepoint 用）
+ *     load  = **本拍给定的执行用时**（µs，独占核心自旋），真实占用 CPU
+ *     mesg = **载荷字节数**：输出 resize 到该大小（逐节点可配，取代原编译期常量）
  *     执行用时是"给定值"：先做载荷产出（resize/赋值）并测出它已消耗的线程 CPU 时间，
- *     再自旋补足差额 → 每拍总执行用时恒等于 cfg，与载荷大小无关（spin_cost_us 见下）。
+ *     再自旋补足差额 → 每拍总执行用时恒等于 load，与载荷大小无关（spin_cost_us 见下）。
+ *     ⚠ mesg 越大，载荷产出本身越贵；若它吃掉全部预算，spin_cost_us 会如实上报实际消耗
+ *     （不再补自旋），该拍实际用时将**超过** load —— 生成侧须保证 load 大于载荷成本。
  *   · 值路由已不需要：这些算法只提供「端口形状 + 烧算力」，o1/i1 只为形状与数据流存在。
  *   · 签名类别约定：配置 = 按值小标量（name 用 const 引用）；**输入一律 const T&**、
- *     输出一律 T&。输入按值会在每拍深拷整份载荷（mesg_size = 1MB 时每输入每拍 1MB）。
+ *     输出一律 T&。输入按值会在每拍深拷整份载荷（mesg 大时每输入每拍都拷一份）。
  *   · 反馈节点入参为 fins::rt::History<std::string>（字段历史槽的最近 N 帧只读视图，零 payload
- *     拷贝）；pipeline cfg 用 "hist":[{端口:N}] 声明各窗口。
+ *     拷贝）；pipeline load 用 "hist":[{端口:N}] 声明各窗口。
  *
- * 形状族（每个 = 一个可导出的具体函数，供 pipeline cfg 的 [name:1.0.0] 定位）：
+ * 形状族（每个 = 一个可导出的具体函数，供 pipeline load 的 [name:1.0.0] 定位）：
  *   基础    src(0→1) / sink(1→0) / relay(1→1)
  *   扇出    1→k        usr_fork(=2)、usr_fork3..9、usr_fork10(=10)  —— 多速率 fork 类按 fan 选用
  *   扇入    k→1        usr_join(=2)、usr_join3..9、usr_join10(=10)  —— 多速率 join 类按 fan 选用
@@ -20,7 +25,7 @@
  *
  *   负载/拓扑入口见 tool/uload.ipynb（gen_class 五类：多速率 multihop / fork / join、
  *   feedback、mixed；每图内部混合周期 timed 与事件 event 任务）。周期/事件(激活次数 n_j) 与
- *   目标利用率 u 的分配都在生成侧完成——本族算法只作为“按 cfg 烧掉对应 µs”的端口形状载体。
+ *   目标利用率 u 的分配都在生成侧完成——本族算法只作为“按 load 烧掉对应 µs”的端口形状载体。
  *
  * 对外接口（FINS_ALGO_EXPORT 由 X-macro 生成 5 个 C 工厂符号）：
  *   get_plugin_count / get_algo_name / get_algo_version(恒 "1.0.0") / create_algo /
@@ -32,8 +37,6 @@
 #include <chrono>
 #include <ctime>
 #include <vector>
-
-static size_t mesg_size = 7;
 
 namespace {
 
@@ -48,7 +51,7 @@ namespace {
 
   // 忙等补时：把本 job 的线程 CPU 时间**补足到 budget_us**。
   //
-  //   budget_us = 该节点给定的执行用时（cfg，来自 wcet 模型）——执行用时是**给定的**，
+  //   budget_us = 该节点给定的执行用时 load，来自 wcet 模型）——执行用时是**给定的**，
   //               不随载荷大小漂移；
   //   spent_us  = 调用前本 job 已消耗的线程 CPU 时间（载荷产出 resize/赋值等，由调用方测）。
   //
@@ -122,42 +125,42 @@ namespace {
   }
 
   // ── 基础：源 / 汇 / 链 ──
-  void usr_src(const std::string& name, int cfg,
+  void usr_src(const std::string& name, int load, int mesg,
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   } // 0 输入 / 1 输出
-  void usr_sink(const std::string& name, int cfg,
+  void usr_sink(const std::string& name, int load, [[maybe_unused]] int mesg,
     const std::string &i1) {
     tracepoint(algo, execute, name.c_str());
 
-    spin_cost_us(name, cfg, 0);
+    spin_cost_us(name, load, 0);
 
     tracepoint(algo, complete, name.c_str());
   } // 1 输入 / 0 输出
-  void usr_relay(const std::string& name, int cfg,
+  void usr_relay(const std::string& name, int load, int mesg,
     const std::string &i1,
     std::string &o1) {
     tracepoint(algo, execute, name.c_str());
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   } // 1 输入 / 1 输出
 
   // ── 扇出 1→k（k=2..10）──
-  void usr_fork(const std::string& name, int cfg,
+  void usr_fork(const std::string& name, int load, int mesg,
     const std::string &i1,
     std::string &o1,
     std::string &o2) {
@@ -165,14 +168,14 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
-    o2.resize(mesg_size);
+    o1.resize(mesg);
+    o2.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_fork3(const std::string& name, int cfg,
+  void usr_fork3(const std::string& name, int load, int mesg,
     const std::string &i1,
     std::string &o1,
     std::string &o2,
@@ -181,15 +184,15 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
-    o2.resize(mesg_size);
-    o3.resize(mesg_size);
+    o1.resize(mesg);
+    o2.resize(mesg);
+    o3.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_fork4(const std::string& name, int cfg,
+  void usr_fork4(const std::string& name, int load, int mesg,
     const std::string &i1,
     std::string &o1,
     std::string &o2,
@@ -199,16 +202,16 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
-    o2.resize(mesg_size);
-    o3.resize(mesg_size);
-    o4.resize(mesg_size);
+    o1.resize(mesg);
+    o2.resize(mesg);
+    o3.resize(mesg);
+    o4.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_fork5(const std::string& name, int cfg,
+  void usr_fork5(const std::string& name, int load, int mesg,
     const std::string &i1,
     std::string &o1,
     std::string &o2,
@@ -219,17 +222,17 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
-    o2.resize(mesg_size);
-    o3.resize(mesg_size);
-    o4.resize(mesg_size);
-    o5.resize(mesg_size);
+    o1.resize(mesg);
+    o2.resize(mesg);
+    o3.resize(mesg);
+    o4.resize(mesg);
+    o5.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_fork6(const std::string& name, int cfg,
+  void usr_fork6(const std::string& name, int load, int mesg,
     const std::string &i1,
     std::string &o1,
     std::string &o2,
@@ -241,18 +244,18 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
-    o2.resize(mesg_size);
-    o3.resize(mesg_size);
-    o4.resize(mesg_size);
-    o5.resize(mesg_size);
-    o6.resize(mesg_size);
+    o1.resize(mesg);
+    o2.resize(mesg);
+    o3.resize(mesg);
+    o4.resize(mesg);
+    o5.resize(mesg);
+    o6.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_fork7(const std::string& name, int cfg,
+  void usr_fork7(const std::string& name, int load, int mesg,
     const std::string &i1,
     std::string &o1,
     std::string &o2,
@@ -265,19 +268,19 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
-    o2.resize(mesg_size);
-    o3.resize(mesg_size);
-    o4.resize(mesg_size);
-    o5.resize(mesg_size);
-    o6.resize(mesg_size);
-    o7.resize(mesg_size);
+    o1.resize(mesg);
+    o2.resize(mesg);
+    o3.resize(mesg);
+    o4.resize(mesg);
+    o5.resize(mesg);
+    o6.resize(mesg);
+    o7.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_fork8(const std::string& name, int cfg,
+  void usr_fork8(const std::string& name, int load, int mesg,
     const std::string &i1,
     std::string &o1,
     std::string &o2,
@@ -291,20 +294,20 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
-    o2.resize(mesg_size);
-    o3.resize(mesg_size);
-    o4.resize(mesg_size);
-    o5.resize(mesg_size);
-    o6.resize(mesg_size);
-    o7.resize(mesg_size);
-    o8.resize(mesg_size);
+    o1.resize(mesg);
+    o2.resize(mesg);
+    o3.resize(mesg);
+    o4.resize(mesg);
+    o5.resize(mesg);
+    o6.resize(mesg);
+    o7.resize(mesg);
+    o8.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_fork9(const std::string& name, int cfg,
+  void usr_fork9(const std::string& name, int load, int mesg,
     const std::string &i1,
     std::string &o1,
     std::string &o2,
@@ -319,21 +322,21 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
-    o2.resize(mesg_size);
-    o3.resize(mesg_size);
-    o4.resize(mesg_size);
-    o5.resize(mesg_size);
-    o6.resize(mesg_size);
-    o7.resize(mesg_size);
-    o8.resize(mesg_size);
-    o9.resize(mesg_size);
+    o1.resize(mesg);
+    o2.resize(mesg);
+    o3.resize(mesg);
+    o4.resize(mesg);
+    o5.resize(mesg);
+    o6.resize(mesg);
+    o7.resize(mesg);
+    o8.resize(mesg);
+    o9.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_fork10(const std::string& name, int cfg,
+  void usr_fork10(const std::string& name, int load, int mesg,
     const std::string &i1,
     std::string &o1,
     std::string &o2,
@@ -349,24 +352,24 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
-    o2.resize(mesg_size);
-    o3.resize(mesg_size);
-    o4.resize(mesg_size);
-    o5.resize(mesg_size);
-    o6.resize(mesg_size);
-    o7.resize(mesg_size);
-    o8.resize(mesg_size);
-    o9.resize(mesg_size);
-    o10.resize(mesg_size);
+    o1.resize(mesg);
+    o2.resize(mesg);
+    o3.resize(mesg);
+    o4.resize(mesg);
+    o5.resize(mesg);
+    o6.resize(mesg);
+    o7.resize(mesg);
+    o8.resize(mesg);
+    o9.resize(mesg);
+    o10.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
 
   // ── 扇入 k→1（k=2..10）──
-  void usr_join(const std::string& name, int cfg,
+  void usr_join(const std::string& name, int load, int mesg,
     const std::string &i1,
     const std::string &i2,
     std::string &o1) {
@@ -374,13 +377,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_join3(const std::string& name, int cfg,
+  void usr_join3(const std::string& name, int load, int mesg,
     const std::string &i1,
     const std::string &i2,
     const std::string &i3,
@@ -389,13 +392,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_join4(const std::string& name, int cfg,
+  void usr_join4(const std::string& name, int load, int mesg,
     const std::string &i1,
     const std::string &i2,
     const std::string &i3,
@@ -405,13 +408,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_join5(const std::string& name, int cfg,
+  void usr_join5(const std::string& name, int load, int mesg,
     const std::string &i1,
     const std::string &i2,
     const std::string &i3,
@@ -422,13 +425,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_join6(const std::string& name, int cfg,
+  void usr_join6(const std::string& name, int load, int mesg,
     const std::string &i1,
     const std::string &i2,
     const std::string &i3,
@@ -440,13 +443,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_join7(const std::string& name, int cfg,
+  void usr_join7(const std::string& name, int load, int mesg,
     const std::string &i1,
     const std::string &i2,
     const std::string &i3,
@@ -459,13 +462,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_join8(const std::string& name, int cfg,
+  void usr_join8(const std::string& name, int load, int mesg,
     const std::string &i1,
     const std::string &i2,
     const std::string &i3,
@@ -479,13 +482,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_join9(const std::string& name, int cfg,
+  void usr_join9(const std::string& name, int load, int mesg,
     const std::string &i1,
     const std::string &i2,
     const std::string &i3,
@@ -500,13 +503,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_join10(const std::string& name, int cfg,
+  void usr_join10(const std::string& name, int load, int mesg,
     const std::string &i1,
     const std::string &i2,
     const std::string &i3,
@@ -522,16 +525,16 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
 
   // ── 反馈：1 外部输入 feed + k 路 loop 反馈（k=1..10），单输出 ──
-  //   每路 loop 入参 = 本节点输出最近 N 帧的只读视图，cfg 以 "loop":{h1:N1,...} 声明。
-  void usr_acc(const std::string& name, int cfg,
+  //   每路 loop 入参 = 本节点输出最近 N 帧的只读视图 load 以 "loop":{h1:N1,...} 声明。
+  void usr_acc(const std::string& name, int load, int mesg,
     const std::string &i1,
     const fins::rt::History<std::string>
     &hist, std::string &o1) {
@@ -539,13 +542,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_acc2(const std::string& name, int cfg,
+  void usr_acc2(const std::string& name, int load, int mesg,
     const std::string &i1,
     const fins::rt::History<std::string> &h1,
     const fins::rt::History<std::string> &h2,
@@ -554,13 +557,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_acc3(const std::string& name, int cfg,
+  void usr_acc3(const std::string& name, int load, int mesg,
     const std::string &i1,
     const fins::rt::History<std::string> &h1,
     const fins::rt::History<std::string> &h2,
@@ -570,13 +573,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_acc4(const std::string& name, int cfg,
+  void usr_acc4(const std::string& name, int load, int mesg,
     const std::string &i1,
     const fins::rt::History<std::string> &h1,
     const fins::rt::History<std::string> &h2,
@@ -587,13 +590,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_acc5(const std::string& name, int cfg,
+  void usr_acc5(const std::string& name, int load, int mesg,
     const std::string &i1,
     const fins::rt::History<std::string> &h1,
     const fins::rt::History<std::string> &h2,
@@ -605,13 +608,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_acc6(const std::string& name, int cfg,
+  void usr_acc6(const std::string& name, int load, int mesg,
     const std::string &i1,
     const fins::rt::History<std::string> &h1,
     const fins::rt::History<std::string> &h2,
@@ -624,13 +627,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_acc7(const std::string& name, int cfg,
+  void usr_acc7(const std::string& name, int load, int mesg,
     const std::string &i1,
     const fins::rt::History<std::string> &h1,
     const fins::rt::History<std::string> &h2,
@@ -644,13 +647,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_acc8(const std::string& name, int cfg,
+  void usr_acc8(const std::string& name, int load, int mesg,
     const std::string &i1,
     const fins::rt::History<std::string> &h1,
     const fins::rt::History<std::string> &h2,
@@ -665,13 +668,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_acc9(const std::string& name, int cfg,
+  void usr_acc9(const std::string& name, int load, int mesg,
     const std::string &i1,
     const fins::rt::History<std::string> &h1,
     const fins::rt::History<std::string> &h2,
@@ -687,13 +690,13 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
-  void usr_acc10(const std::string& name, int cfg,
+  void usr_acc10(const std::string& name, int load, int mesg,
     const std::string &i1,
     const fins::rt::History<std::string> &h1,
     const fins::rt::History<std::string> &h2,
@@ -710,9 +713,9 @@ namespace {
 
     const long long t0_cpu_us = thread_cpu_time_us();
 
-    o1.resize(mesg_size);
+    o1.resize(mesg);
 
-    spin_cost_us(name, cfg, thread_cpu_time_us() - t0_cpu_us);
+    spin_cost_us(name, load, thread_cpu_time_us() - t0_cpu_us);
 
     tracepoint(algo, complete, name.c_str());
   }
