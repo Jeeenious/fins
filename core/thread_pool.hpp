@@ -24,6 +24,31 @@
 #include "utils/logger.hpp"
 
 namespace fins::rt {
+  /// 设置当前线程名（comm）。仅影响可观测性（sched_switch prev_comm/next_comm、top -H、
+  /// ps -T、perf、gdb），失败（如名字超长 / 权限）只告警，不影响调度正确性。
+  static void set_thread_name(const std::string &name) {
+    if (pthread_setname_np(pthread_self(), name.c_str()) != 0)
+      FINS_LOG_WARN("[ThreadPool] set thread name '{}' failed: {}", name, strerror(errno));
+  }
+
+  static void bind_core(int core) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0)
+      FINS_LOG_WARN("[ThreadPool] bind core {} failed: {}", core, strerror(errno));
+  }
+
+  /// 实时调度类（SCHED_FIFO）：同核 CFS 线程（主线程/计时线程未绑核，可能被 wake-affine
+  /// 放进 worker 核）无法抢占 RT worker → 忙等待自旋不被进程内线程打断。需 CAP_SYS_NICE
+  /// （WSL 默认 root 可成功）；失败 warn 降级为普通 CFS 调度（不影响运行）。
+  static void set_realtime(int priority) {
+    struct sched_param sp{};
+    sp.sched_priority = priority;
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
+      FINS_LOG_WARN("[ThreadPool] set SCHED_FIFO prio {} failed: {}", priority, strerror(errno));
+  }
+
   /// 绑核自调度线程池（单例）：worker 经装配点注册的取任务回调取任务并执行，
   /// 不依赖 g_state（不引用任务队列 / 停止位，见停止约定）。
   class ThreadPool {
@@ -120,31 +145,6 @@ namespace fins::rt {
           FINS_LOG_ERROR("[ThreadPool] worker {} callback threw unknown exception", idx);
         }
       }
-    }
-
-    /// 设置当前线程名（comm）。仅影响可观测性（sched_switch prev_comm/next_comm、top -H、
-    /// ps -T、perf、gdb），失败（如名字超长 / 权限）只告警，不影响调度正确性。
-    static void set_thread_name(const std::string &name) {
-      if (pthread_setname_np(pthread_self(), name.c_str()) != 0)
-        FINS_LOG_WARN("[ThreadPool] set thread name '{}' failed: {}", name, strerror(errno));
-    }
-
-    static void bind_core(int core) {
-      cpu_set_t set;
-      CPU_ZERO(&set);
-      CPU_SET(core, &set);
-      if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0)
-        FINS_LOG_WARN("[ThreadPool] bind core {} failed: {}", core, strerror(errno));
-    }
-
-    /// 实时调度类（SCHED_FIFO）：同核 CFS 线程（主线程/计时线程未绑核，可能被 wake-affine
-    /// 放进 worker 核）无法抢占 RT worker → 忙等待自旋不被进程内线程打断。需 CAP_SYS_NICE
-    /// （WSL 默认 root 可成功）；失败 warn 降级为普通 CFS 调度（不影响运行）。
-    static void set_realtime(int priority) {
-      struct sched_param sp{};
-      sp.sched_priority = priority;
-      if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
-        FINS_LOG_WARN("[ThreadPool] set SCHED_FIFO prio {} failed: {}", priority, strerror(errno));
     }
   };
 
