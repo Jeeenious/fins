@@ -193,6 +193,9 @@ int main(int argc, char **argv) {
   //    + notify（与 worker 完成事件共同唤醒主线程调度循环）。tp 顶点在 pin_sync 建图时已写入
   //    job = sleep_until（绝对释放时刻，job 内实时读 hyper_start_ms → rollover 平移自动对齐）──
   std::thread timer_th([&] {
+    fins::rt::set_thread_name("fins_timer");
+    fins::rt::bind_core(0);
+    fins::rt::set_realtime(50);
 
     std::unique_lock tl(graph_g.mtx);
     for (;;) {
@@ -221,6 +224,10 @@ int main(int argc, char **argv) {
   });
 
   {
+    fins::rt::set_thread_name("fins_main");
+    fins::rt::bind_core(0);
+    fins::rt::set_realtime(50);
+
     std::unique_lock lk(graph_g.mtx);
     for (;;) {
 
