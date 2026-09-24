@@ -13,6 +13,10 @@
 #define FINS_WCET_METHOD fins::sched::WcetMethod::PQUANTILE     // 估计方法（HWM/PQUANTILE）
 
 #define FINS_ALGO_LIB_PATH "./build/lib"   // 插件目录（可通过命令行参数覆盖）
+#define FINS_CONTROL_CORE 0          // 非 worker 线程（主循环/计时/组件）绑定的核：须在 worker 核
+                                     // （= ThreadPool 显式绑的 1..num_workers）之外，且须落在进程 cpuset
+                                     // 内（否则 bind 静默失败）。cgroup 模式由 tool/client.sh 多留一核并
+                                     // 经 argv[4] 传入；裸跑默认 0。命令行参数可覆盖
 #define FINS_CLIENT_IP "0.0.0.0"     // orchestrator 上报端口（可通过命令行参数覆盖）
 #define FINS_CLIENT_PORT 18080
 #define FINS_SERVER_IP "0.0.0.0"    // orchestrator 监听端口（可通过命令行参数覆盖）
@@ -48,6 +52,19 @@ int main(int argc, char **argv) {
   const std::string plugin_dir = argc > 2 ? argv[2] : FINS_ALGO_LIB_PATH;
   int num_workers = argc > 3 ? std::atoi(argv[3]) : 2;   // 线程池 worker 数；非法/≤0 回落默认 2
   if (num_workers < 1) num_workers = 2;
+  int control_core = argc > 4 ? std::atoi(argv[4]) : FINS_CONTROL_CORE;
+
+  // worker 占 1..num_workers（ThreadPool::working 显式绑），控制核落进这个区间就又跟 worker 抢核了
+  if (control_core < 0 || (control_core >= 1 && control_core <= num_workers)) {
+    FINS_LOG_WARN("[agent] control_core={} 与 worker 核 1..{} 冲突，回落 0", control_core, num_workers);
+    control_core = 0;
+  }
+
+  // ★ 控制核先行绑定：本线程（main）**此后**创建的全部线程——组件（RPC/插件 watchdog/硬件监控）、
+  //   计时线程、httplib 的连接线程——都继承该 affinity（pthread_create 继承创建者的 CPU 掩码），
+  //   故只需绑这一次；worker 由 ThreadPool::working 显式绑到 1..num_workers，不继承、不受影响。
+  //   ⚠ 必须在这里（任何组件 start 之前）绑，否则组件线程已经建出来、继承不到。
+  fins::rt::bind_core(control_core);
 
   // ── 装配 wcet_updater：FINS_WCET_METHOD 方法（PQUANTILE = 99% 分位 + 20% 裕度）。
   wcet_updater = fins::sched::make_wcet_updater(FINS_WCET_METHOD);
@@ -190,7 +207,7 @@ int main(int argc, char **argv) {
   //    job = sleep_until（绝对释放时刻，job 内实时读 hyper_start_ms → rollover 平移自动对齐）──
   std::thread timer_th([&] {
     fins::rt::set_thread_name("fins_timer");
-    fins::rt::bind_core(0);
+    fins::rt::bind_core(control_core);   // 与 worker 核分离（已由 main 继承，显式再绑一次便于阅读）
     fins::rt::set_realtime(50);
 
     std::unique_lock tl(graph_g.mtx);
@@ -221,7 +238,7 @@ int main(int argc, char **argv) {
 
   {
     fins::rt::set_thread_name("fins_main");
-    fins::rt::bind_core(0);
+    // 核已在 main 开头绑定（control_core），此处不再重复
     fins::rt::set_realtime(50);
 
     std::unique_lock lk(graph_g.mtx);

@@ -53,7 +53,7 @@ include/          核心运行时(SDK,头文件即库)
 schedule/           三件套:wcet / makespan / priority 自包含策略头
 example/            client(主程序 agent) · server(发 cfg) · plugins.cpp(usr_* 插件)
 tool/               uload.ipynb(生成) · test.ipynb(采集) · plot.ipynb(分析)
-                    viewer.html(设计/运行图可视化) · agent.sh(独占核脚本)
+                    viewer.html(设计/运行图可视化) · client.sh(独占核脚本)
 docs/               6 篇调度/DAG 语义设计 + pipeline JSON schema
 third_party/        单头依赖 nlohmann/json.hpp · cpp-httplib.h
 build/bin/ build/lib/     构建产物(client/server · plugin.so),gitignore 不入库
@@ -176,9 +176,8 @@ cmake -S . -B cmake-build-debug && cmake --build cmake-build-debug -j
 ./build/bin/client 18080 ./build/lib
 ./build/bin/server tool/uload/cfg_fork_u20_m6_s10011.json 18080   # 发一份 → client 重建运行图
 
-# 正式实验(独占核 + RT,需 root):见 tool/agent.sh
-sudo tool/agent.sh -g        # 一次性授 RT(写 limits.d,重登生效)
-sudo tool/agent.sh 1-6 6     # 独占核 1-6 + 6 worker 起 build/bin/client
+# 正式实验(独占核 + RT,需 root):见 tool/client.sh
+sudo tool/client.sh 1-7 6    # 独占核 1-7 = worker 核 1-6 + 控制核 7(非 worker 线程绑这里)
 ```
 
 产物约定(均 gitignore):client(agent) 退出写 `tool/temp/tracing.csv`(表头 `tid,seq,kind,t_us,cpu,tag`,

@@ -39,9 +39,10 @@ namespace fins::rt {
       FINS_LOG_WARN("[ThreadPool] bind core {} failed: {}", core, strerror(errno));
   }
 
-  /// 实时调度类（SCHED_FIFO）：同核 CFS 线程（主线程/计时线程未绑核，可能被 wake-affine
-  /// 放进 worker 核）无法抢占 RT worker → 忙等待自旋不被进程内线程打断。需 CAP_SYS_NICE
-  /// （WSL 默认 root 可成功）；失败 warn 降级为普通 CFS 调度（不影响运行）。
+  /// 实时调度类（SCHED_FIFO）：worker 绑 1..num_workers、非 worker 线程（主循环/计时/组件）绑
+  /// 控制核（见 example/client.cpp 开头的 bind_core，新线程继承创建者掩码）→ 同核竞争只剩外部
+  /// 进程，RT 保证 worker 的忙等自旋不被同核 CFS 线程打断。需 CAP_SYS_NICE；失败 warn 降级为
+  /// 普通 CFS 调度（不影响运行）。
   static void set_realtime(int priority) {
     struct sched_param sp{};
     sp.sched_priority = priority;
