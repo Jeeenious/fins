@@ -2,7 +2,7 @@
 
 > 状态：已落地。对应 `core/g_state.hpp` 的 `Pipeline::parse_pipeline`（第一级：逐节点格式校验）
 > 与 `Pipeline::check_topology`（第二级：跨节点图结构校验）。本文是**唯一字段清单**，
-> 生成器 `tool/_load.py`、可视化 `tool/viewer.html` 均按此产出/读取。
+> 生成器 `tool/_load2json.py`、可视化 `tool/viewer.html` 均按此产出/读取。
 
 ## 1. 顶层形态
 
@@ -27,7 +27,7 @@ id / name / version          标识
 configs / inputs / outputs   配置 + 端口（三者连着）
 hist                         窗口读声明
 event | period               触发模式（二选一）
-wcet / deadline / cap        可有可无的属性（置最末）
+cap                          预留属性（可有可无，置最末）
 ```
 
 | 字段 | 类型 | 必填 | 默认 | 语义 |
@@ -36,14 +36,16 @@ wcet / deadline / cap        可有可无的属性（置最末）
 | `name` | string | ✅ | — | 算法名；与 `version` 组成定位键 `name:version`，在插件库 `library_g.so_ctx` 里查 |
 | `version` | string | ✅ | — | 算法版本（定位键的另一半） |
 | `configs` | array | — | `[]` | 位置式配置值表：`[{c{i}_0: 值}, {c{i}_1: 值}, ...]`。注入顺序 = 数组顺序 = 算法配置段序号 |
-| `wcet` | number | — | `1` | 最坏执行时间（ms）；调度/优先级用 |
-| `deadline` | number | — | `0` | 相对截止期（ms）；**0 = 未声明**，排序中视为最紧急（见 §5） |
 | `inputs` | string[] | — | `[]` | 输入端口名（= 上游输出端口名，同名直连）；顺序 = 算法输入参数顺序 |
 | `outputs` | string[] | — | `[]` | 输出端口名（生产者自己命名，全局唯一）；顺序 = 算法输出参数顺序 |
 | `hist` | array | — | `[]` | 窗口读声明：`[{端口名: 窗口长度 N}, ...]`，N > 2 |
 | `event` | array | — | `[]` | 事件触发声明：`[{端口名: 抽稀倍数 N}, ...]`，N ≥ 1（声明即事件触发） |
 | `period` | number | — | `0` | 执行周期（ms，> 0）（声明即时间触发） |
 | `cap` | number | — | — | **预留字段**（见 §7）：execute 耗时样本保留条数，正整数 |
+
+> `wcet` / `deadline` **不在本 schema**：`wcet` 由框架内维护（`wcet_updater` 按执行历史自整定，
+> 缺省 1ms）；**截止期不由框架维护**（框架没有足够信息——它取决于调度的人怎么排，见 §5）。
+> 写进 JSON 会被静默忽略（解析器按名取键，不认识的键不报错），生成器也不再写出。
 
 ### 2.1 `configs` 的键：`c{i}_{j}`
 
@@ -76,7 +78,9 @@ wcet / deadline / cap        可有可无的属性（置最末）
 - 取到最小值的端口 = **支配端口**，其绑定边是**阻塞边**（唯一释放条件）；同节点其余
   `event` 端口建**非阻塞边**（帧照样送到下游共享槽，但不参与"等齐"）
 - 抽稀倍数 `N=2` 表示：支配节点每产出 2 帧，本节点触发 1 次
-- `T` 不整除超周期 HP 时**不拒绝**，而是把 HP 拓宽到能整除全部周期的倍数（倍数 > 100 才拒）
+- 超周期 `HP = lcm(全部最终周期)`（`calculate_hp`）——取公倍数，**没有拓宽/拒绝路径**；
+  整除判定用 `HP_DIV_EPS`（1e-5），不整除只 WARN（`count_instance` 点名），`HP > HP_MAX_WARN_MS`
+  （1000ms）同样只 WARN 不拒绝
 
 ## 4. 端口与连线
 
@@ -86,14 +90,22 @@ wcet / deadline / cap        可有可无的属性（置最末）
 - 顶点实例绑定式：`pk = ((k+1)·Np − 1) / Nc`（快→慢绑末帧、慢→快共享帧）
 - `hist` 端口是**窗口读**（无绑定边），不能同时声明 `event`（同一端口语义互斥）
 
-## 5. `deadline` 与排序
+## 5. 截止期：不由框架维护
 
-- 缺省 `0` = **未声明**（框架不替用户预设）
-- `update_abs_deadline` 滚动计算 `ddl = 滚动起点 + (k+1)·deadline` → `deadline=0` 时 ddl 最小
-- EDF（`prio_edf`）按 `ddl − now` 升序 → **0 即"最紧急"**
-- ⚠ 不写 `deadline` 的节点 ddl 全等于滚动起点 → 彼此同权（EDF 退化为就绪序）。要靠 EDF 区分
-  先后就得在 JSON 里显式写 `deadline`
-- ⚠ `DENSITY` 策略用 `wcet / max(1e-9, deadline)`，`deadline=0` 时分母退到 `1e-9` → 优先级爆表
+**框架不持有、不算、也不校验截止期**（`Workload` 只有 `k`/`name`/`period`/`wcet`/`job`）：
+截止期是**调度决策**的一部分，信息不在图里——同一张图换个调度算法/换份目标就完全不同，
+框架替用户臆断一个（如"相对截止期 = 周期"）只会把错误假设固化进顶点属性。
+
+需要截止期的策略/算法自己决定来源，两种常见做法：
+
+- **算法侧注入**：把截止期当配置值传进算法（`configs` 的 `c{i}_j` 槽位），或由算法自己维护
+  一张 `{顶点 id → 截止期}` 表；调度侧要读时从算法/外部表取。
+- **另一份配置 JSON 读入**：单独一份 `deadline` 脚本产出（按节点 id / 实例 k 索引），
+  由装配点或调度算法在 `expand_hp` 后读入并自行保存、自行刷新——**不落进 `Workload`**。
+
+框架侧现存的与时间有关的量只有：`period`（框架算的最终执行周期）、`hp_start_ms`/`hp_origin_ms`
+（释放网格，严格整拍推进）、`wcet`（自整定）。原先的 `prio_dm`/`prio_density`/`prio_edf`/`prio_llf`
+（以及 `Workload::ddl` + `update_abs_deadline`）已随之删除，`Policy` = FIFO/RM/SJF/LJF/DEPTH/HEIGHT。
 
 ## 6. 校验规则清单
 
@@ -104,7 +116,7 @@ wcet / deadline / cap        可有可无的属性（置最末）
 | 1 | `id` / `name` / `version` 必填 string |
 | 2 | `configs` 每项须为单键对象，键 = `c{i}_{j}`（后缀必须等于下标） |
 | 3 | `inputs` / `outputs` 为 string 数组 |
-| 4 | `wcet` / `deadline` / `period` / `cap` 为 number；`cap` 为正整数 |
+| 4 | `period` / `cap` 为 number；`cap` 为正整数 |
 | 5 | `hist` / `event` 为 `[{端口名: 正整数}, ...]`，同端口不得重复声明 |
 | 6 | `parameters` → **拒绝**并提示更名为 `configs` |
 
@@ -140,18 +152,19 @@ wcet / deadline / cap        可有可无的属性（置最末）
 | `parameters` | 已更名 `configs` 且改形为 `[{c{i}_j: 值}]`；出现即拒并提示 |
 | `hist` 的旧 map 形态 `{"p0_0": 5}` | 只接受数组形态 `[{"p0_0": 5}]`，map 形态报"须为数组" |
 | `type` | 曾短暂引入（timer/event 字符串），已删——触发模式由 `period`/`event` 字段本身判定 |
-| `trig` / `T_ms` | 从不属于本 schema；运行时由 `build_dominance` 现算（`_load.inspect_file` 曾有坏引用，已修） |
+| `wcet` / `deadline` | 不进 JSON：`wcet` 由框架内维护（`wcet_updater` 自整定）；**截止期不由框架维护**（调度算法自己注入/另读一份配置，见 §5）。写了也静默忽略，生成器已不写出 |
+| `trig` / `T_ms` | 从不属于本 schema；运行时由 `build_dominance` 现算（`_load2json.inspect_file` 曾有坏引用，已修） |
 
 ## 8. 完整示例
 
 ```json
 [
   {"id": "n0", "name": "usr_src", "version": "1.0.0",
-   "configs": [{"c0_0": "n0"}, {"c0_1": 1005}], "wcet": 1.005,
+   "configs": [{"c0_0": "n0"}, {"c0_1": 1005}, {"c0_2": 1024}],
    "outputs": ["p0_0"], "period": 100.0},
 
   {"id": "n1", "name": "usr_acc", "version": "1.0.0",
-   "configs": [{"c1_0": "n1"}, {"c1_1": 3979}], "wcet": 3.979,
+   "configs": [{"c1_0": "n1"}, {"c1_1": 3979}, {"c1_2": 1024}],
    "inputs": ["p0_0", "p3_0"], "outputs": ["p1_0"],
    "hist": [{"p3_0": 3}], "event": [{"p0_0": 1}]}
 ]
@@ -163,6 +176,6 @@ wcet / deadline / cap        可有可无的属性（置最末）
 ## 9. 相关
 
 - 解析/校验实现：`core/g_state.hpp`（`NodeInfo` 构造器、`check_topology`）
-- 生成器：`tool/_load.py`（`_make_pipeline` 产出、`inspect_file` 打印、`generate_all` 批量）
+- 生成器：`tool/_load2json.py`（`_make_pipeline` 产出、`inspect_file` 打印、`generate_all` 批量）
 - 可视化：`tool/viewer.html`（`inputKind` / `triggerDesc` 按 `period`/`event` 分派）
 - 调度语义：`docs/precedence_graph_design.md`；WCET 自整定：`docs/wcet_estimation.md`

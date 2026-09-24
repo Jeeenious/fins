@@ -6,9 +6,9 @@
 
 ## 1. 背景与目标
 
-在 precedence graph 中,`wcet` 是顶点权,直接决定 makespan 估计、调度优先级与截止期检查。
-配置给的 `wcet` 是**静态估计**(缺省 1ms),实际执行可能有偏差:估紧 → makespan 低估、
-过载漏报;估松 → 容量浪费。
+在 precedence graph 中,`wcet` 是顶点权,直接决定 makespan 估计与调度优先级(SJF/LJF)。
+`wcet` **只由框架维护**(JSON 的同名字段已不再读入,生成器也不再写出),未自整定时保持
+顶点默认 **1ms**:估紧 → makespan 低估、过载漏报;估松 → 容量浪费。
 
 目标:用运行时观测到的 execute 历史动态估计 wcet,让下一周期的调度依据贴合实际。
 
@@ -76,11 +76,11 @@ wcet_updater = fins::sched::make_wcet_updater(FINS_WCET_METHOD);   // PQUANTILE�
 
 ## 5. 说明与注意事项
 
-- 只对有执行历史的普通 job 节点生效:`tp:` 时间点顶点无 job → 跳过;无历史顶点 → 保留建图
-  期配置默认。
-- 首周期无历史 → 保持配置默认,第二周期起才有估计值。
+- 只对**有执行历史**的顶点生效;`tp:` 时间点顶点的 `wcet` 是相邻同步点间隔(非执行负载),
+  不作为被覆盖的对象(结构量,见 `docs/makespan_multipath_bound.md`)。
+- 首周期无历史 → 保持顶点默认 1ms,第二周期起才有估计值。
 - **联动**:`FINS_CAL_WCET=1` 时 `v.wcet` 会被历史覆盖,直接影响 `FINS_CAL_MAKESPAN` 的
-  makespan 估计(两者同图同权,开一个要考虑另一个)。默认保持 `0`,配置 wcet 为基准。
+  makespan 估计(两者同图同权,开一个要考虑另一个)。默认保持 `0`(此时 `wcet` 恒为默认 1ms)。
 - `wcet_updater` 函数槽在 `FINS_CAL_WCET=0` 时不会被调用(编译期裁剪),注入无副作用。
 
 ## 6. 相关代码
