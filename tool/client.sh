@@ -5,6 +5,11 @@ CGBASE=/sys/fs/cgroup
 CG=$CGBASE/fins_exclusive
 RT_CONF=/etc/security/limits.d/50-fins-rt.conf
 RT_PRIO=95
+# 非 worker 线程（主循环/计时/组件）的核。空 = 取 CPUS 的最后一核（约定：调用方多给一个核当控制核，
+# 如 CPUS=1-3 + WORKERS=2 → worker 1,2、控制核 3）。控制核必须留在同一个 cpuset 里（否则
+# bind_core 会 EINVAL 静默失败），但**不能**去借 core 0——把 core 0 并进 cpuset.cpus 会让
+# cpuset.cpus.partition=isolated 失败，worker 核的隔离跟着一起丢。
+CONTROL_CPU="${CONTROL_CPU:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
 CLIENT_BIN="${CLIENT_BIN:-$ROOT/build/bin/client}"
@@ -52,6 +57,15 @@ case "${1:-}" in
     WORKERS="$1"; shift
     PORT="${1:-18080}"
     PDIR="${2:-$ROOT/build/lib}"
-    run_in_partition "$CPUS" "$CLIENT_BIN" "$PORT" "$PDIR" "$WORKERS"
+    if [ -z "$CONTROL_CPU" ]; then          # 取范围里的最后一个核（"1-3" → 3；"0,1-2" → 2）
+      IFS=',' read -ra _parts <<< "$CPUS"
+      for _p in "${_parts[@]}"; do
+        case "$_p" in *-*) CONTROL_CPU="${_p#*-}" ;; *) CONTROL_CPU="$_p" ;; esac
+      done
+    fi
+    # cpuset = 整个范围（worker 核 + 控制核）：worker 由 client 显式绑到 1..WORKERS，控制线程绑
+    # $CONTROL_CPU。若调用方没多给核（范围里核数 == WORKERS），client 会告警并回落 core 0，
+    # 而 0 不在本 cpuset 里 → bind 失败 → 控制线程落回 worker 核（即旧行为）。
+    run_in_partition "$CPUS" "$CLIENT_BIN" "$PORT" "$PDIR" "$WORKERS" "$CONTROL_CPU"
     ;;
 esac

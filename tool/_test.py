@@ -59,6 +59,69 @@ def parse_m_from_filename(filename):
     return 2  # 默认兜底值
 
 
+# ===== 跑前守卫：残留 client 检查 + 清理 =====
+# 客户端主线程被 set_thread_name 改名 → 进程 comm 就是 CLIENT_COMM（不是 "client"）；
+# 且 httplib 在 Linux 给监听 socket 设了 SO_REUSEPORT：第二个 client 照样 bind 成功、不报错，
+# 推送被内核分流到其中一个 → 两个进程各跑一份图，trace 里 worker tid 数变成 2×m（实测整批中招）。
+CLIENT_COMM = "fins_main"
+
+
+def _client_pids():
+    """残留 client 进程 pid：按 comm == CLIENT_COMM 找。"""
+    out = subprocess.run(["ps", "-eo", "pid,comm"], capture_output=True, text=True).stdout
+    pids = []
+    for line in out.splitlines()[1:]:
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[1].strip() == CLIENT_COMM:
+            pids.append(int(parts[0]))
+    return pids
+
+
+def _port_pids(port):
+    """监听 port 的 pid（解析 ss -ltnp 的 pid=…）；有人占着但拿不到 pid → -1。"""
+    res = subprocess.run(["ss", "-ltnp", f"sport = :{port}"], capture_output=True, text=True)
+    pids = [int(m) for m in re.findall(r"pid=(\d+)", res.stdout)]
+    if not pids and re.search(rf":{port}\b", res.stdout):
+        pids = [-1]
+    return pids
+
+
+def ensure_port_free(port, sudo_password=None, grace=3.0):
+    """跑前守卫：清掉残留 client 并确认端口空出来；清不掉就抛错中止，别把脏数据跑出来。
+
+    先借 client.sh -r 清 cgroup 成员（cgroup 里的残留连 killpg 都不一定够），再按 pid 兜底
+    SIGTERM → SIGKILL，最后复查 ss。返回被清掉的 pid 列表。
+    """
+    root = repo_root()
+    found = sorted(set(_client_pids()) | set(_port_pids(port)))
+    if not found:
+        return []
+
+    print(f"  🧹 [守卫] 端口 {port} 上发现残留 client（pid={found}）→ 清理")
+    if sudo_password is not None:
+        subprocess.run(["sudo", "-S", os.path.join(root, "tool", "client.sh"), "-r"],
+                       input=(sudo_password + "\n").encode(),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=root)
+
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 0.5)):
+        alive = sorted({p for p in _client_pids() + _port_pids(port) if p > 0})
+        if not alive:
+            break
+        for pid in alive:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        time.sleep(wait)
+
+    left = sorted(set(_client_pids()) | set(_port_pids(port)))
+    if left:
+        raise RuntimeError(f"❌ [守卫] 清不掉残留 client（pid={left}），端口 {port} 仍被占用。"
+                           f"继续跑会把两个进程的数据混进同一份 trace，已中止。")
+    print("  ✅ [守卫] 端口已空出、无残留 client")
+    return found
+
+
 def run_once(cfg_rel_path, cfg_dir, result_base_dir, sudo_password, lttng_warm_up = 1.0, fins_warmup_time=2.0, run_time=10.0,
              port=18080, use_cgroup=True, cpu_offset=1):
     """单次测试执行函数：自动根据文件名中的 m 确定 worker 数与独占核范围"""
@@ -72,7 +135,9 @@ def run_once(cfg_rel_path, cfg_dir, result_base_dir, sudo_password, lttng_warm_u
     # 动态解析 m 值
     m_val = parse_m_from_filename(cfg_name)
     workers = m_val
-    cores_range = f"{cpu_offset}-{cpu_offset + m_val - 1}" if m_val > 1 else str(cpu_offset)
+    # 核范围多留一核给非 worker 线程（主循环/计时/组件）：worker 绑 1..m，控制线程绑 m+1。
+    # 控制核必须与 worker 同 cpuset（否则 bind 失败），又不能借 core 0（会把 isolated 分区搞掉）。
+    cores_range = f"{cpu_offset}-{cpu_offset + m_val}" if m_val >= 1 else str(cpu_offset)
 
     timestamp = datetime.now().strftime("%H%M%S")
     session_name = "fins_eval_" + test_name + "_" + timestamp
@@ -83,6 +148,10 @@ def run_once(cfg_rel_path, cfg_dir, result_base_dir, sudo_password, lttng_warm_u
     raw_trace_output = os.path.join(root, "tool", "temp", "trace_raw_" + timestamp)
 
     print(f"\n>>> [开始测试] {test_name} (自动解析: m={m_val} -> workers={workers}, cores={cores_range})")
+
+    # 0. 🧹 跑前守卫：残留 client 检查 + 清理（必须在建 LTTng 会话之前——否则旧进程的 tracepoint
+    #    也会被追进本次会话，两个进程的图混在同一份 CSV 里，事后无法分离）
+    ensure_port_free(port, sudo_password)
 
     # 1. 🛑 【新增/强化】彻底清理可能残留的所有 LTTng 会话，防止多会话并发导致事件双写
     subprocess.run(["lttng", "stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -198,6 +267,12 @@ def run_once(cfg_rel_path, cfg_dir, result_base_dir, sudo_password, lttng_warm_u
             cwd=root
         )
 
+    # 6.5 收尾复查：本次 client 必须真退出了。没退出也不致命（下个 run 的跑前守卫会清），
+    #     但必须留痕——残留进程会让下一个 run 的 trace 混进两个进程的数据。
+    left = sorted(set(_client_pids()) | set(_port_pids(port)))
+    if left:
+        print(f"  ⚠️ [收尾] client 未退出（pid={left}）——已交给下个 run 的跑前守卫处理")
+
     # 7. 搬运 Trace
     final_trace_path = os.path.join(test_result_dir, "trace")
     success = False
@@ -254,6 +329,10 @@ def run_all(target_cfg_dir, target_result_dir, run_time=10.0, cpu_offset=1):
     print("🔒 该评测脚本需要 root 权限来配置 Cgroup 与绑定核心")
     print("=" * 60)
     sudo_password = getpass.getpass("请输入您的 sudo 密码: ")
+
+    print("=" * 60)
+    print("🧹 跑前守卫：检查残留 client / 端口占用...")
+    ensure_port_free(PORT, sudo_password)
 
     print("=" * 60)
     print(f"🚀 开始智能批量评测（自动从文件名匹配 m）")
