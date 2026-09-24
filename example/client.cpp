@@ -4,7 +4,7 @@
 
 #define FINS_STATIC_PRIORITY 0                                  // 1 = 静态优先级
 #define FINS_DYNAMIC_PRIORITY 0                                 // 1 = 动态优先级
-#define FINS_PRIORITY_POLICY fins::sched::Policy::EDF           // 换策略改这一行（RM/DM/SJF/LJF/DENSITY/DEPTH/HEIGHT/LLF...）
+#define FINS_PRIORITY_POLICY fins::sched::Policy::FIFO          // 换策略改这一行（RM/SJF/LJF/DEPTH/HEIGHT）
 
 #define FINS_CAL_MAKESPAN 0                                     // 1 = rollover 算 makespan 上界并告警过载
 #define FINS_MAKESPAN_METHOD fins::sched::MakespanMethod::MPB   // 估计方法（GRAHAM/MPB）

@@ -5,13 +5,12 @@
  *   —— 顶点 → 调度优先级（int，**值越大越优先**，对齐就绪最大堆）。grab 决策点现算。
  *
  * 本头文件提供两类策略 + 一行装配选择器（对外无复杂数据结构）：
- *   · 静态（字段）：prio_fifo / prio_rm / prio_dm / prio_sjf / prio_ljf / prio_density
+ *   · 静态（字段）：prio_fifo / prio_rm（周期）/ prio_sjf / prio_ljf（框架内维护的 wcet）
  *   · 静态（图结构）：prio_depth / prio_height —— 结构缓存按 version 失效（同 makespan）
- *   · 动态（grab 现算）：prio_edf / prio_llf —— 内部读 now_ms，用 ddl−now 归一化防 int32 溢出
+ *   （原先的 DM/DENSITY/EDF/LLF 依赖 JSON 外源的 deadline/ddl——两者已移除，故一并删除）
  *   · make_priority(Policy, version_of) → 与槽签名一致的 std::function，装配点一行选策略
  *
- * 数值约定：返回 int，越大越优先；时间量统一 µs 精度（ms×1000 取整）；相对量（ddl−now）
- * 避免绝对时间戳（steady_clock 巨量级）溢出 int32。
+ * 数值约定：返回 int，越大越优先；时间量统一 µs 精度（ms×1000 取整）。
  *
  * 依赖：include/g_state.hpp（Workload/Message）、include/utils/form.hpp（DAG）、
  *       include/utils/time.hpp（now_ms）。
@@ -45,20 +44,11 @@ inline int prio_fifo(const fins::rt::Workload &w) { (void)w; return 0; }
 /// RM（Rate Monotonic，Liu & Layland 1973）：周期越短优先级越高。
 inline int prio_rm(const fins::rt::Workload &w) { return -(int)std::llround(w.period * 1000.0); }
 
-/// DM（Deadline Monotonic，Leung & Whitehead 1982）：相对截止期越短优先级越高
-/// （RM 对截止期≠周期情形的推广；任意相对截止期下静态最优）。
-inline int prio_dm(const fins::rt::Workload &w) { return -(int)std::llround(w.deadline * 1000.0); }
-
 /// SJF（Shortest Job First）：wcet 越小优先级越高（最小化平均响应/周转）。
 inline int prio_sjf(const fins::rt::Workload &w) { return -(int)std::llround(w.wcet * 1000.0); }
 
 /// LJF（Longest Job First）：wcet 越大优先级越高（先做重活、尾部并行收尾）。
 inline int prio_ljf(const fins::rt::Workload &w) { return (int)std::llround(w.wcet * 1000.0); }
-
-/// HDF（Highest Density First）：密度 = wcet/截止期 越大越优先（负载/截止期比例最紧者先做）。
-inline int prio_density(const fins::rt::Workload &w) {
-  return (int)std::llround(w.wcet / std::max(1e-9, w.deadline) * 1e6);
-}
 
 // ============================================================================
 // 静态策略 · 图结构（DAG 感知；结构缓存按 version 失效，同 makespan_updater）
@@ -149,23 +139,10 @@ inline int prio_height(Dag &dag, uint64_t version, const fins::rt::Workload &w) 
 // 动态策略 · grab 决策点现算（内部读 now_ms；用 ddl−now 归一化防 int32 溢出）
 // ============================================================================
 
-/// EDF（Earliest Deadline First，Liu & Layland 1973）：绝对截止期最早者优先。
-/// ddl−now = 剩余截止期（ms → µs）；同一 grab 内所有就绪顶点共享同一时间轴 → 单调变换保序。
-inline int prio_edf(const fins::rt::Workload &w) {
-  return -(int)std::llround((w.ddl - fins::util::now_ms()) * 1000.0);
-}
-
-/// LLF（Least Laxity First，Dertouzos 1974；同 LST/MLF）：松弛度 = 剩余截止期 − 剩余执行，
-/// 松弛越小越紧急。剩余执行未知 → 用 wcet 保守近似（视为尚未执行）。
-inline int prio_llf(const fins::rt::Workload &w) {
-  const double laxity = w.ddl - fins::util::now_ms() - w.wcet;
-  return -(int)std::llround(laxity * 1000.0);
-}
-
 // ============================================================================
 // 策略选择器（装配点一行选策略）
 // ============================================================================
-enum class Policy { FIFO, RM, DM, SJF, LJF, DENSITY, DEPTH, HEIGHT, EDF, LLF };
+enum class Policy { FIFO, RM, SJF, LJF, DEPTH, HEIGHT };
 
 /** @brief 策略 → 装配函数槽（client 一行装配；version_of 供图结构策略现读结构版本号）。
  *  @param p          策略（Policy 枚举）
@@ -182,14 +159,10 @@ inline std::function<int(Dag &, const fins::rt::Workload &)> make_priority(
   switch (p) {
     case Policy::FIFO:    return [](Dag &, const fins::rt::Workload &w) { return prio_fifo(w); };
     case Policy::RM:      return [](Dag &, const fins::rt::Workload &w) { return prio_rm(w); };
-    case Policy::DM:      return [](Dag &, const fins::rt::Workload &w) { return prio_dm(w); };
     case Policy::SJF:     return [](Dag &, const fins::rt::Workload &w) { return prio_sjf(w); };
     case Policy::LJF:     return [](Dag &, const fins::rt::Workload &w) { return prio_ljf(w); };
-    case Policy::DENSITY: return [](Dag &, const fins::rt::Workload &w) { return prio_density(w); };
     case Policy::DEPTH:   return [version_of](Dag &d, const fins::rt::Workload &w) { return prio_depth(d, version_of(), w); };
     case Policy::HEIGHT:  return [version_of](Dag &d, const fins::rt::Workload &w) { return prio_height(d, version_of(), w); };
-    case Policy::EDF:     return [](Dag &, const fins::rt::Workload &w) { return prio_edf(w); };
-    case Policy::LLF:     return [](Dag &, const fins::rt::Workload &w) { return prio_llf(w); };
   }
   return [](Dag &, const fins::rt::Workload &) { return 0; };   // 防御：未知策略 → FIFO
 }

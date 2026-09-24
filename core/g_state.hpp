@@ -155,7 +155,7 @@ namespace fins::rt {
   inline Library library_g;
 
   /** @brief 节点解析态（Pipeline 内嵌，parse_pipeline 产物）：纯数据，字段含 id/name/version、
-   *  端口名数组、config_keys/config_cache、hist/event、period/wcet/deadline。 */
+   *  端口名数组、config_keys/config_cache、hist/event/period（wcet/deadline 已不再从 JSON 读入）。 */
   struct NodeInfo {
     std::string id; // 节点在图中的唯一标识（顶点名 id:{k} 前缀）
     std::string name; // 算法名（[name:version] = so 表定位键）
@@ -163,8 +163,6 @@ namespace fins::rt {
 
     double period{0}; // 执行周期（ms；>0 = 时间触发。0 = 未声明 period → 必须声明 event，
                       // 见 check_topology ⑦ 二选一）
-    double deadline{0}; // 相对截止期（ms；缺省 0 = 未声明，排序中视为最紧急）
-    double wcet{1}; // 最坏执行时间（ms；缺省 1）
 
     size_t exec_cap{0}; // **预留字段**（JSON `cap`）：本节点算法保留多少次 execute 耗时样本
                         // （0 = 未声明 → 图侧缺省 100）。对应图侧 exec_hist_cap（键 = **算法名**，
@@ -206,8 +204,8 @@ namespace fins::rt {
      *    configs / inputs / outputs               配置 + 端口（三者连着）
      *    hist                                     窗口读声明
      *    event | period                           触发模式（二选一，见 check_topology ⑦）
-     *    wcet / deadline / cap                    可有可无的属性
-     * @param n 节点 JSON 对象（必填 id/name/version；可选 configs/inputs/outputs/wcet/deadline/hist/cap，
+     *    cap                                      可有可无的属性（wcet/deadline 不再读入）
+     * @param n 节点 JSON 对象（必填 id/name/version；可选 configs/inputs/outputs/hist/cap，
      *          以及 timer 的 period、event 的 event）。字段全表与语义见 docs/pipeline_json_schema.md
      * @param at 错误定位上下文串（如 "nodes[i]."，错误消息前缀用）
      * @retval 无（格式违反抛 std::invalid_argument）
@@ -257,7 +255,7 @@ namespace fins::rt {
             throw std::invalid_argument("[parse_dataflow] " + at + std::string(f) + "[" + std::to_string(j) +
                                         "] 元素须为 string（端口名）");
       }
-      for (const char *f: {"wcet", "deadline", "period", "cap"}) {
+      for (const char *f: {"period", "cap"}) {
         if (n.contains(f) && !n[f].is_number())
           throw std::invalid_argument("[parse_dataflow] " + at + f + " 须为 number");
       }
@@ -275,12 +273,6 @@ namespace fins::rt {
       name = n["name"].get<std::string>();
       version = n["version"].get<std::string>();
       period = n.contains("period") ? n["period"].get<double>() : 0.0;
-      wcet = n.contains("wcet") ? n["wcet"].get<double>() : 1.0;
-      // 缺省 0 = 未声明（框架不替用户预设）：0 参与排序即"最紧急"——EDF 用 (ddl − now) 升序，
-      // ddl = 本拍起点 + (k+1)·deadline（update_abs_deadline），deadline=0 → ddl 最小 → 最先到期。
-      // 注意：不显式写 deadline 的节点 ddl 全等于本拍起点，彼此同权（EDF 退化为就绪序）；
-      // 要靠 EDF 区分先后就得在 JSON 里显式写 deadline。
-      deadline = n.contains("deadline") ? n["deadline"].get<double>() : 0.0;
 
       if (n.contains("inputs") && n["inputs"].is_array())
         input_ports = n["inputs"].get<std::vector<std::string>>();
@@ -319,8 +311,7 @@ namespace fins::rt {
   };
   /** @brief Pipeline — dataflow 配置（解析态；全局单份 pipeline_g）：cache = 原始配置 JSON 双缓冲
    *  （RPC 写缓冲份不解析 → pending → 主线程调度循环图静止时 commit + parse_pipeline 填 nodes），
-   *  标准形式 = 节点对象数组（id/name/version 必填 + configs/inputs/outputs/wcet/deadline/hist，
-   *  hist 可选），违反抛 std::invalid_argument；显式周期节点输入经 message_hist_ 字段缓存取样（hist 窗口/最新标量）。
+   *  标准形式 = 节点对象数组（id/name/version 必填 + configs/inputs/outputs/hist，hist 可选），违反抛 std::invalid_argument；显式周期节点输入经 message_hist_ 字段缓存取样（hist 窗口/最新标量）。
    */
   struct Pipeline {
     /// 原始数据
@@ -532,13 +523,14 @@ namespace fins::rt {
     std::string id{}; // 顶点名（格式 {节点id}:{k}，如 cam:0/cam:1）——expand_hp ⑥ 建顶点时填 vtx（同 dag 的 map 键）；
     std::string
         name{}; // 节点名（来自 Pipeline::NodeInfo.name；区别于 id 顶点名 = {name}:{k}）——装配点/测试按节点名识别
-    size_t k{0}; // 超周期内实例序号（expand_hp ⑥ 建顶点填；update_abs_deadline 算 ddl 用）
+    size_t k{0}; // 超周期内实例序号（expand_hp 建顶点填；就绪序/诊断用）
 
-    double period{0};
-    double deadline{0}; // 相对截止期（ms；缺省 0 = 未声明，排序中视为最紧急）
-
-    double wcet{1}; // 最坏执行时间（ms；缺省 1）
-    double ddl{0}; // 绝对截止期（ms）= 本拍起点 + (k+1)·deadline；由 expand_hp/rollover_hp 每拍写一次
+    double period{0}; // 最终执行周期（ms）= build_dominance 的 period_final（timer 取 JSON period、
+                      // event 取 N × 前级周期），供 prio_rm/导出读——非 JSON 直传
+    double wcet{1}; // 最坏执行时间（ms）：**框架内维护**——wcet_updater 按执行历史自整定
+                    // （FINS_CAL_WCET=1 时），未自整定则保持默认 1；tp 顶点复用为"相邻同步点间隔"。
+                    // 不从 JSON 的 wcet 字段读入（那个只是生成器的求解器输出，运行时不用）
+                    // （截止期 ddl 不在框架内——由调度算法自己决定/注入，见 docs/pipeline_json_schema.md §5）
 
     std::function<void()> job; // 执行体（闭包捕获实例 + 预解析绑定边引用，运行时零查找取帧/发布）
   };
@@ -938,9 +930,8 @@ namespace fins::rt {
     }
 
     /** @brief ⑥ 建顶点：每节点展开 node_count 个 job 实例顶点 {id}:{k}（k=0..N-1），载荷 =
-     *  attrs 基础（period/deadline/wcet/ddl；priority 不预设，排序键由运行时 priority_updater 键函数现算）。
-     *  abs_deadline(ddl) 在此一次算好 = 本拍起点 hp_start + (k+1)·相对截止期（实例序号 k 即 ddl 的拍内刻度）；
-     *  之后每拍由 rollover_hp 用新起点重写（无独立 release/相位）。
+     *  attrs 基础（id/name/k/period；priority 不预设，排序键由运行时 priority_updater 键函数现算；
+     *  wcet 由框架自整定写入，见 Workload::wcet）。
      * @param dag 目标图（就地加顶点）
      * @param nodes 解析态节点表（只读）
      * @param period_final 节点 id → 最终周期（只读；⑤ 的结果）
@@ -956,11 +947,9 @@ namespace fins::rt {
         const size_t N = node_count.at(info.id);
         for (size_t k = 0; k < N; ++k) {
           Workload v;
-          v.k = k; // 实例序号（ddl 的拍内刻度）
+          v.k = k; // 实例序号
           v.name = info.name; // 节点名（NodeInfo.name；id 顶点名 = {name}:{k}）
           v.period = period_final.at(info.id);
-          v.deadline = info.deadline; // parse 缺省 0（未声明）
-          v.wcet = info.wcet;
           dag.add_node(info.id + ":" + std::to_string(k), std::move(v));
         }
       }
@@ -1353,7 +1342,7 @@ namespace fins::rt {
       // ⑤ 实例数
       count_instance(hyper_period_ms, job_period, job_count);
 
-      // ⑥ 建顶点 {id}:{k}（内含 ddl = 本拍起点 + (k+1)·deadline）
+      // ⑥ 建顶点 {id}:{k}
       build_vertex(dag, nodes, job_period, job_count);
 
       // ⑦ 绑定边（跨节点·阻塞/非阻塞）
@@ -1377,13 +1366,12 @@ namespace fins::rt {
       std::ofstream(FINS_EXPORT_DGRAPH_PATH) << export_dag().dump(2);
 #endif
 
-      update_abs_deadline(); // 建图后写一次 ddl
     }
 
     /**
      * @brief 超周期回绕（**无锁原语，前提调用方持 mtx**；主线程调度循环图静止时调用）：
      *        ① 超周期起点**严格推进到绝对释放网格上的下一拍**（网格锚定 hp_grid_origin_ms，见 rollover 内注释）
-     *        → ② 刷新全图绝对截止期（update_abs_deadline）→ ③ 调度增量状态重置（done_/ready_ 清空、
+     *        → ② 调度增量状态重置（done_/ready_ 清空、
      *        tp_released_ 游标归零、pred_left_ 重置回 in_degree_ 基准，不 clear dag——顶点对象存活）。
      *        回绕后全部顶点未完成：job 顶点由前序完成事件逐级释放，源节点由其 tp 门被计时线程重新拉取释放。
      * @retval 无
@@ -1399,8 +1387,6 @@ namespace fins::rt {
                         skipped, hp_origin_ms + j * hp_);
         hp_start_ms = hp_origin_ms + j * hp_;
       }
-
-      update_abs_deadline(); // 本拍 ddl = 新起点 + (k+1)·deadline（每拍刷新一次即可——排序只消费 ddl 的差）
 
 #if FINS_CAL_WCET
       update_wcet_estimation();
@@ -1452,8 +1438,8 @@ namespace fins::rt {
      *        运行中）。优先级唯一来源 = 装配点注入的 priority_updater 键函数（顶点 → 调度优先级，
      *        可读 *this 全图状态如 hp_start_ms/核心负载）：grab 前对每个就绪顶点现算覆盖占位 0；
      *        未注入回调 → prio 恒 0 → 就绪堆退化为纯 FIFO。再 rebuild() 按最新 prio 重建堆、
-     *        pop_max() O(log n) 取顶；prio 相等时按入队序号 seq 小者先出 = 精确 FIFO。ddl 由
-     *        expand_hp/rollover_hp 每拍刷新一次（update_abs_deadline），本函数纯读不写图状态。
+     *        pop_max() O(log n) 取顶；prio 相等时按入队序号 seq 小者先出 = 精确 FIFO。
+     *        本函数纯读，不写图状态。
      * @retval Workload* 图内顶点指针（含 id/job；图静止期间 expand/rollover 不重建 → 稳定不悬垂）；
      *                   nullptr = 无就绪顶点
      */
@@ -1540,24 +1526,6 @@ namespace fins::rt {
 
   private:
     /**
-     * @brief 用**当前** hp_start_ms 重写全部顶点的绝对截止期 ddl = hp_start_ms + (k+1)·deadline
-     *        （**无锁原语，前提调用方持 mtx**）：只在 rollover_hp 回绕后刷一次（建图期那次由
-     *        build_vertex 直接算，无需重复），不在轮次内（grab 热路径）调用——一拍内起点恒定 →
-     *        ddl 一拍内是常量，且 EDF/LLF 同一决策共享同一 now、只消费 ddl 的**相对差**，ddl 里作为
-     *        公共加数的起点对排序零贡献 → 每拍刷一次与每次 grab 刷 N 次结果完全一致，省掉 O(n)/grab。
-     *        tp 顶点虽有 job（sleep 闭包）但 deadline 恒 0，故其 ddl == 起点、且不入就绪堆（不参与排序）；
-     *        deadline 缺省 0 → 同拍全部顶点 ddl 相等（EDF 退化为就绪序）。
-     * @retval 无
-     */
-    void update_abs_deadline() {
-      dag.for_each_vertex([&](const std::string &, Workload &v) {
-        if (!v.job)
-          return;
-        v.ddl = hp_start_ms + (double) (v.k + 1) * v.deadline;
-      });
-    }
-
-    /**
      * @brief 集中回写 wcet（无锁原语，前提调用方持 mtx；rollover_hp 内 #if FINS_CAL_WCET）：
      *         遍历图顶点，对有执行历史的普通节点调 wcet_updater(该顶点历史 deque) 现算覆盖 v.wcet。
      *         tp 顶点无 job → 跳过（wcet 建图期理论写死 = 相邻同步点间隔）；无历史顶点 → 跳过（保留建图期默认）。
@@ -1583,7 +1551,7 @@ namespace fins::rt {
     }
 
     /** @brief 导出 dag 为 JSON（调试/可视化：顶点集合 + 边集合 + 超周期参数）。
-     *  私有，供内部调试/导出调用（调用方持 mtx）。顶点含 id/name/k/period/deadline/wcet/ddl/
+     *  私有，供内部调试/导出调用（调用方持 mtx）。顶点含 id/name/k/period/wcet/
      *  has_job/kind（"job" | "timepoint"）；边含 from/to/tag + message 槽状态（是否有帧/类型）。
      * @retval nlohmann::json 图 JSON（调用方决定落盘 dump(2) 或消费）
      */
@@ -1599,9 +1567,7 @@ namespace fins::rt {
             {"name", v.name},
             {"k", v.k},
             {"period", v.period},
-            {"deadline", v.deadline},
             {"wcet", v.wcet},
-            {"ddl", v.ddl},
             {"has_job", static_cast<bool>(v.job)},
             {"kind", id.rfind("tp:", 0) == 0 ? "timepoint" : "job"},
         });
