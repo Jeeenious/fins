@@ -221,19 +221,24 @@ CONFIG = {
 
         "makespan_bin_width_ms": 10.0,
 
-        # Anything above this goes into overflow.
-        #
-        # None:
-        #     use H_ms.
-        #
-        "makespan_max_ms": 80,
+        # 接受域（四种写法，与 workload.utilization 同一套思路）：
+        #   80          → [0, 80]（旧行为）
+        #   None        → [0, H_ms]
+        #   "any"       → [0, ∞)：上不封顶，makespan > H 的过载配置也收
+        #   (lo, hi)    → 只收 [lo, hi]（hi 给 None 表示上不封顶）
+        # 落在接受域外的候选由 _bucket_for_makespan 返回 None → 丢弃（桶号是标签，夹了就是假标签）。
+        # 注意单链上 makespan ≡ ΣC ≡ u·m·H，与 utilization 是同一约束的两种说法，别无谓地卡两遍。
+        "makespan": 80,
+
+        # Output directory（默认回退路径，可被显式传入参数覆盖）。
+        "out_dir": "pipeline",
+    },
+
+    # 生成期的采样/搜索预算（与「实验自变量」无关，故不放在 workload 下）。
+    "search": {
 
         # Number of final samples per bucket.
         "n_per": 5,
-
-        # ----------------------------------------------------
-        # Generation policy.
-        # ----------------------------------------------------
 
         # Initial candidate generation.
         "initial_attempts": 500,
@@ -254,9 +259,6 @@ CONFIG = {
 
         # Random seed.
         "seed_base": 20260910,
-
-        # Output directory（默认回退路径，可被显式传入参数覆盖）。
-        "out_dir": "pipeline",
     },
 
     "solver": {
@@ -1479,6 +1481,92 @@ def _random_positive_vector(rng, n):
 
 
 # ============================================================
+# 11.5 Utilization spec → concrete u
+# ============================================================
+
+def _u_window(T, m, min_c_ms, max_c_ratio):
+    """可行利用率区间 [u_min, u_max]（与 utilization 同量纲：Σ(C_i/T_i)/m）。
+
+    u_min = Σ(min_c_ms/T_i)/m
+        —— 每个节点的 wcet 有地板（min_wcet_us），故 u 不可能比这更低；
+    u_max = min(n·max_c_ratio/m, 1/m)
+        —— 前者 = 单节点 C_i ≤ max_c_ratio·T_i；后者 = 单链串行 ΣC = u·m·H 必须 < H（不积压）。
+
+    @retval (u_min, u_max) 闭区间；u_min ≥ u_max 表示该 (拓扑, m, min_wcet) 根本无解
+    """
+    u_min = sum(min_c_ms / t for t in T) / float(m)
+    u_max = min(len(T) * max_c_ratio / float(m), 1.0 / float(m))
+    return u_min, u_max
+
+
+# 已提示过的 (spec, m, 可行域) 组合 —— _resolve_utilization 每候选调一次，同样的提示只打第一遍
+_SEEN_U_SPEC = set()
+
+
+def _resolve_utilization(spec, T, m, solver_cfg, seed):
+    """把 `workload.utilization` 的一个元素解析成**具体 u**（必定落在可行域内）。
+
+    三种写法（可混用在同一列表里）：
+      · 数字（0.5）            → 精确目标（旧行为）；
+      · 二元组（(0.7, 0.85)）  → 在该区间内均匀取样；
+      · None / "any" / "free"  → **任意 u**：取满整个可行域后均匀取样。
+    请求区间与可行域相交时取交集；不相交时**夹到最近边界并警告**，不抛 ——
+    "不可行的是那一段，不是整个配置"。取样用 `Random(seed)` 固定，故同一
+    (kind, spec, m) 反复生成得到同一个 u（各载荷档共用同一份求解结果，拓扑仍逐节点一致）。
+
+    @retval float 具体目标 u（≥ u_min 且 ≤ u_max，可直接喂给求解器）
+    """
+    u_min, u_max = _u_window(
+        T, m,
+        solver_cfg["min_wcet_us"] / 1000.0,
+        solver_cfg["max_c_ratio"],
+    )
+    if u_min >= u_max:
+        raise RuntimeError(
+            f"可行利用率区间为空：u_min={u_min:.4f} ≥ u_max={u_max:.4f}"
+            f"（节点数={len(T)}, m={m}, min_wcet_us={solver_cfg['min_wcet_us']}, "
+            f"max_c_ratio={solver_cfg['max_c_ratio']}）—— 请减小 min_wcet_us 或增大 m"
+        )
+
+    if isinstance(spec, (tuple, list)):
+        if len(spec) != 2:
+            raise ValueError(f"utilization 区间须为 (lo, hi)，收到 {spec!r}")
+        lo, hi = float(spec[0]), float(spec[1])
+        if lo > hi:
+            raise ValueError(f"utilization 区间 lo > hi：{spec!r}")
+    elif spec is None or (isinstance(spec, str) and spec.lower() in ("any", "free")):
+        lo, hi = u_min, u_max
+    elif isinstance(spec, str):
+        raise ValueError(f"utilization 元素只能是数字、(lo, hi) 二元组或 'any'，收到 {spec!r}")
+    else:
+        lo = hi = float(spec)
+
+    a, b = max(lo, u_min), min(hi, u_max)
+    # 本函数每个候选尝试都会被调一次（同一 (spec, m) 最多上千次）→ 同样的提示只打第一遍，别刷屏
+    tag = (repr(spec), m, round(u_min, 6), round(u_max, 6))
+
+    if a > b:                                   # 请求区间与可行域不相交 → 夹到最近边界
+        clamped = u_min if hi < u_min else u_max
+        if tag not in _SEEN_U_SPEC:
+            print(f"⚠️ utilization={spec!r} 与可行域 [{u_min:.4f}, {u_max:.4f}] 不相交（节点 {len(T)} 个, m={m}）"
+                  f" → 夹到 {clamped:.4f}")
+        _SEEN_U_SPEC.add(tag)
+        return clamped
+
+    if (a, b) != (lo, hi) and tag not in _SEEN_U_SPEC:
+        print(f"⚠️ utilization={spec!r} 与可行域 [{u_min:.4f}, {u_max:.4f}] 相交后被夹为 [{a:.4f}, {b:.4f}]"
+              f"（节点 {len(T)} 个, m={m}）")
+
+    if not isinstance(spec, (int, float)) and tag not in _SEEN_U_SPEC:
+        print(f"[RESOLVE] utilization={spec!r} → "
+              + (f"u={a:.4f}" if b - a < 1e-12 else f"取样于 [{a:.4f}, {b:.4f}]"))
+
+    _SEEN_U_SPEC.add(tag)
+
+    return a if b - a < 1e-12 else random.Random(seed).uniform(a, b)
+
+
+# ============================================================
 # 12. Generate utilization-exact C
 # ============================================================
 
@@ -1506,29 +1594,40 @@ def _initial_C_from_utilization(T, utilization, m, rng, min_c_ms, max_c_ratio):
         n,
     )
 
-    C = []
+    C = [
+        target_total_u * shares[i] * T[i]
+        for i in range(n)
+    ]
 
-    for i in range(n):
+    # 目标 u 贴近 wcet 地板时（Σmin_c/T_i ≈ u·m —— min_wcet 被载荷成本抬高、或 u 取到
+    # `_u_window` 的 u_min），"均匀随机占比"要让**每个**节点都 ≥ 地板几乎不可能命中 →
+    # 改用带下限的占比：share_i ≥ min_c/(u·m·T_i)，剩余份额再随机分。
+    # 只在随机占比已经踩地板时才走这条分支 → 中高 u 的既有路径逐位不变（既有语料不受影响）。
+    if any(c < min_c_ms for c in C):
+        floors = [
+            min_c_ms / (target_total_u * T[i])
+            for i in range(n)
+        ]
 
-        task_u = (
-                target_total_u
-                *
-                shares[i]
-        )
+        rest = 1.0 - sum(floors)
 
-        c = (
-                task_u
-                *
-                T[i]
-        )
+        if rest < 0:
+            return None
+
+        w = _random_positive_vector(rng, n)
+
+        C = [
+            target_total_u * (floors[i] + rest * w[i]) * T[i]
+            for i in range(n)
+        ]
+
+    for i, c in enumerate(C):
 
         if c < min_c_ms:
             return None
 
         if c > T[i] * max_c_ratio:
             return None
-
-        C.append(c)
 
     realized = _calc_utilization(
         C,
@@ -1641,51 +1740,123 @@ def _solve_C_for_candidate(sk, trig, T, utilization, m, H_ms, seed, solver_cfg, 
 # 14. Makespan buckets
 # ============================================================
 
-def _build_buckets(H_ms, width, max_ms):
+def _ms_json(v):
+    """makespan 边界写进 metadata 时把上不封顶（inf）写成 JSON null —— json 的 Infinity
+    不是合法 JSON，会让严格解析器报错。"""
+    return v if isinstance(v, (int, float)) and math.isfinite(v) else None
+
+
+def _build_buckets(H_ms, width, spec):
+    """把 makespan 接受域切成 width 宽的桶。`spec`（= 配置里的 `makespan`）四种写法：
+
+      · 数字 N     → 接受 [0, N]（旧行为）
+      · None       → 接受 [0, H_ms]（旧行为）
+      · "any"      → 接受 [0, ∞)：**上不封顶**，makespan > H 的过载候选也收
+      · (lo, hi)   → 只接受 [lo, hi]（hi 给 None 表示上不封顶）
+
+    桶 id 一律是**全局编号**（id = lo/width 取整），所以区间写法下文件名里的 `msNN` 仍是
+    全局桶号，历史文件名语义不变。落在接受域外的候选由 `_bucket_for_makespan` 返回 None →
+    调用方丢弃（makespan 无法"夹"，桶号是标签，夹了就是假标签）。
+    """
+    # 容错：makespan 只吃**一个** spec，(lo, hi) 写成 [(lo, hi)] 也认（单元素列表 → 拆开）
+    while isinstance(spec, (list, tuple)) and len(spec) == 1 and isinstance(spec[0], (list, tuple)):
+        spec = spec[0]
+
+    lo, hi_spec = 0.0, spec
+
+    if isinstance(hi_spec, (tuple, list)):
+        if len(hi_spec) != 2:
+            raise ValueError(
+                f"makespan 区间须为 (lo, hi)，收到 {spec!r}"
+            )
+
+        lo, hi_spec = hi_spec
+
+    if isinstance(hi_spec, str):
+        if hi_spec.lower() not in ("any", "inf", "unbounded"):
+            raise ValueError(
+                f"makespan 的字符串写法只认 'any'，收到 {spec!r}"
+            )
+
+        hi_spec = math.inf
+
+    if hi_spec is None:
+        hi_spec = H_ms
+
+    if lo is None:
+        lo = 0.0
+
+    if hi_spec <= 0:
+        raise ValueError(
+            "makespan "
+            "must be > 0"
+        )
+
+    if lo < 0:
+        raise ValueError(
+            f"makespan 接受域下界须 ≥ 0，收到 {spec!r}"
+        )
+
+    if lo >= hi_spec:
+        raise ValueError(
+            f"makespan 接受域为空：{spec!r}（下界 {lo} ≥ 上界 {hi_spec}）"
+        )
+
+    # width 缺省（配置里没写 makespan_bin_width_ms）→ 整个接受域**一个桶**（不多分桶）
+    if width is None:
+        width = (hi_spec - lo) if math.isfinite(hi_spec) else max(H_ms - lo, 1.0)
+
     if width <= 0:
         raise ValueError(
             "makespan_bin_width_ms "
             "must be > 0"
         )
 
-    if max_ms is None:
-        max_ms = H_ms
+    i0 = int(math.floor(lo / width))
 
-    if max_ms <= 0:
-        raise ValueError(
-            "makespan_max_ms "
-            "must be > 0"
-        )
+    # 上不封顶：先用 [lo, H_ms] 做有限分桶（桶号仍是全局编号），再把最后一桶的上界放开到 ∞
+    unbounded = math.isinf(hi_spec)
 
-    n_regular = int(
-        math.ceil(
-            max_ms /
-            width
-        )
+    stop = (
+        max(H_ms, lo + width)
+        if unbounded
+        else hi_spec
     )
 
     buckets = []
+    i = i0
 
-    for i in range(n_regular):
-        lo = (
-                i *
-                width
-        )
+    while True:
 
-        hi = min(
+        lo_i = lo if i == i0 else i * width
+
+        hi_i = min(
             (i + 1) * width,
-            max_ms,
+            stop,
         )
+
+        last = hi_i >= stop
 
         buckets.append({
             "id": i,
-            "lo": lo,
-            "hi": hi,
-            "last": (
-                    i ==
-                    n_regular - 1
-            ),
+            "lo": lo_i,
+            "hi": hi_i,
+            "last": last,
         })
+
+        if last:
+
+            if unbounded:
+                buckets[-1]["hi"] = math.inf   # 上不封顶：>= H 的过载候选也收进这一桶
+
+            break
+
+        i += 1
+
+        if i - i0 > 100000:
+            raise ValueError(
+                f"makespan 桶数过多（width={width} 太小？），spec={spec!r}"
+            )
 
     return buckets
 
@@ -1738,6 +1909,23 @@ def _check_workload_keys(cfg):
     if "u" in workload and "utilization" not in workload:
         raise KeyError(
             "workload 的键 'u' 已改名为 'utilization'（配置需同步更新）"
+        )
+
+    moved = [
+        k for k in ("n_per", "initial_attempts", "refill_attempts",
+                    "max_refill_rounds", "candidate_factor", "seed_base")
+        if k in workload
+    ]
+    if moved:
+        raise KeyError(
+            f"workload 的键 {moved} 已移到顶层 cfg['search']（生成期采样/搜索预算，与实验自变量无关）"
+            " —— 配置需同步更新"
+        )
+
+    if "makespan_max_ms" in workload and "makespan" not in workload:
+        raise KeyError(
+            "workload 的键 'makespan_max_ms' 已改名为 'makespan'（现支持 数字 / None / 'any' / (lo, hi)，"
+            "配置需同步更新）"
         )
 
 
@@ -1892,7 +2080,7 @@ def _make_pipeline(sk, trig, T, C_ms, mesg_size):
         #   configs / inputs / outputs                 — 配置 + 端口（三者连着）
         #   hist                                       — 窗口读声明
         #   event | period                             — 触发模式（二选一，判据就是这两个字段本身）
-        #   wcet / deadline / cap                      — 可有可无的属性（本生成器只写 wcet；deadline/cap 留空）
+        #   cap                                        — 预留属性（本生成器不写；wcet/deadline 已不进 JSON）
         node = {
             "id": node_id,
 
@@ -2034,13 +2222,9 @@ def _make_pipeline(sk, trig, T, C_ms, mesg_size):
         # ----------------------------------------------------
         # 可有可无的属性（置最末）
         #
-        # wcet（ms）——调度/优先级用；生成器的求解器已定值，故总是写出。
-        # deadline / cap 本生成器不写（deadline 缺省 0 = 未声明；cap 为预留字段）。
+        # wcet 不写：执行时长由运行时维护（插件按 c{i}_1 忙等实测 + wcet_updater 自整定），
+        # 求解器算出的 C_ms 只进 c{i}_1（µs）。deadline / cap 同样不写（预留字段）。
         # ----------------------------------------------------
-
-        node["wcet"] = float(
-            C_ms[i]
-        )
 
         nodes.append(node)
 
@@ -2063,8 +2247,8 @@ def _make_metadata(kind, utilization, m, H_ms, makespan, bucket, seed):
 
         "makespan_bucket": {
             "id": bucket["id"],
-            "lo_ms": bucket["lo"],
-            "hi_ms": bucket["hi"],
+            "lo_ms": _ms_json(bucket["lo"]),
+            "hi_ms": _ms_json(bucket["hi"]),
         },
 
         "seed": seed,
@@ -2134,6 +2318,16 @@ def generate_candidate(kind, utilization, m, H_ms, seed, config=None, mesg_size=
     # WCET.
     # --------------------------------------------------------
 
+    # ★ utilization 支持 数字 / (lo,hi) / None(=任意)：解析成**具体 u**（夹进可行域）。
+    #   就地覆盖形参 → 后面的求解、tolerance 校验、metadata（进而文件名里的 uXX）全部用实得值。
+    utilization = _resolve_utilization(
+        utilization,
+        T,
+        m,
+        cfg["solver"],
+        seed + 7000001,
+    )
+
     C_ms, makespan = (
         _solve_C_for_candidate(
             sk,
@@ -2172,11 +2366,11 @@ def generate_candidate(kind, utilization, m, H_ms, seed, config=None, mesg_size=
 
     buckets = _build_buckets(
         H_ms,
-        cfg["workload"][
+        cfg["workload"].get(
             "makespan_bin_width_ms"
-        ],
+        ),
         cfg["workload"][
-            "makespan_max_ms"
+            "makespan"
         ],
     )
 
@@ -2211,7 +2405,11 @@ def generate_candidate(kind, utilization, m, H_ms, seed, config=None, mesg_size=
             "m": m,
             "H_ms": H_ms,
             "makespan_ms": makespan,
-            "makespan_bucket": bucket,
+            "makespan_bucket": {
+                **bucket,
+                "lo": _ms_json(bucket["lo"]),
+                "hi": _ms_json(bucket["hi"]),
+            },
             "seed": seed,
             "mesg_size": mesg_size,
         },
@@ -2226,9 +2424,16 @@ def generate_candidate(kind, utilization, m, H_ms, seed, config=None, mesg_size=
 # ============================================================
 
 def _bucket_key(kind, utilization, m, bucket_id):
+    """候选去重键。utilization 可能是**具体数字**，也可能是区间/None（任意 u，由
+    `_resolve_utilization` 在候选内解析）—— 后者不是 float，用 repr 做键。"""
+    u_key = (
+        repr(utilization)
+        if utilization is None or isinstance(utilization, (tuple, list, str))
+        else float(utilization)
+    )
     return (
         kind,
-        float(utilization),
+        u_key,
         int(m),
         int(bucket_id),
     )
@@ -2282,9 +2487,9 @@ def _generate_candidates(kind, utilization, m, config, attempts, seed_start, buc
         )
 
         limit = (
-                config["workload"]["n_per"]
+                config["search"]["n_per"]
                 *
-                config["workload"][
+                config["search"][
                     "candidate_factor"
                 ]
         )
@@ -2339,8 +2544,8 @@ def _sample_final(candidates, kind, utilization, m, buckets, n_per, rng, ):
         if len(pool) < n_per:
             missing.append({
                 "bucket_id": bucket["id"],
-                "lo_ms": bucket["lo"],
-                "hi_ms": bucket["hi"],
+                "lo_ms": _ms_json(bucket["lo"]),
+                "hi_ms": _ms_json(bucket["hi"]),
                 "available": len(pool),
                 "required": n_per,
             })
@@ -2431,28 +2636,32 @@ def generate_configuration(kind, utilization, m, config=None, mesg_size=None):
         "workload"
     ]
 
+    search = cfg[
+        "search"
+    ]
+
     H_ms = workload[
         "H_ms"
     ]
 
-    n_per = workload[
+    n_per = search[
         "n_per"
     ]
 
     buckets = _build_buckets(
         H_ms,
-        workload[
+        workload.get(
             "makespan_bin_width_ms"
-        ],
+        ),
         workload[
-            "makespan_max_ms"
+            "makespan"
         ],
     )
 
     candidates = {}
 
     seed_base = (
-            workload[
+            search[
                 "seed_base"
             ]
             +
@@ -2481,7 +2690,7 @@ def generate_configuration(kind, utilization, m, config=None, mesg_size=None):
         f"utilization={utilization} "
         f"m={m} "
         f"attempts="
-        f"{workload['initial_attempts']}"
+        f"{search['initial_attempts']}"
     )
 
     generated = _generate_candidates(
@@ -2489,7 +2698,7 @@ def generate_configuration(kind, utilization, m, config=None, mesg_size=None):
         utilization,
         m,
         cfg,
-        workload[
+        search[
             "initial_attempts"
         ],
         seed_base,
@@ -2515,7 +2724,7 @@ def generate_configuration(kind, utilization, m, config=None, mesg_size=None):
     )
 
     for refill_round in range(
-            workload[
+            search[
                 "max_refill_rounds"
             ] + 1
     ):
@@ -2546,7 +2755,7 @@ def generate_configuration(kind, utilization, m, config=None, mesg_size=None):
 
         if (
                 refill_round
-                >= workload[
+                >= search[
             "max_refill_rounds"
         ]
         ):
@@ -2588,7 +2797,7 @@ def generate_configuration(kind, utilization, m, config=None, mesg_size=None):
             utilization,
             m,
             cfg,
-            workload[
+            search[
                 "refill_attempts"
             ],
             seed_base
@@ -2801,7 +3010,7 @@ def inspect_file(path):
     """打印一份生成的 pipeline JSON 的可读摘要。
 
     schema = **裸节点数组**（_make_pipeline 产物），逐节点只含：
-      id / name / version / outputs / wcet / parameters
+      id / name / version / configs / outputs
       + 可选 period（时间触发）、inputs、hist（窗口读）、event（事件触发 + 抽稀倍数）。
 
     最终执行周期 T 与 trig 分类**不落 JSON**：运行时由 C++ 按支配规则现算（显式 period /
