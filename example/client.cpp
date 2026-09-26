@@ -66,6 +66,15 @@ int main(int argc, char **argv) {
   //   ⚠ 必须在这里（任何组件 start 之前）绑，否则组件线程已经建出来、继承不到。
   fins::rt::bind_core(control_core);
 
+  // ── 停止信号：SIGINT/SIGTERM → 只置原子停止位（async-signal-safe；不调 cv.notify_all——
+  //    condition_variable 非 async-signal-safe，信号上下文调 stdlib 是 UB）。
+  //    各线程的等待都带超时兜底（worker/计时线程 10ms、主循环 100ms），超时后自行看到 stopped 退出；
+  //    正常收尾走下方 teardown 的 stopped=true + notify_all 立即唤醒。──
+  //    ★ 必须在**任何线程/组件启动之前**装好：晚装的话，启动阶段来的 SIGTERM 走默认动作 → 进程
+  //    直接死、stdout 缓冲不 flush（实测 client.log 全空），且没有任何收尾。
+  std::signal(SIGINT,  [](int) { graph_g.stopped = true; });
+  std::signal(SIGTERM, [](int) { graph_g.stopped = true; });
+
   // ── 装配 wcet_updater：FINS_WCET_METHOD 方法（PQUANTILE = 99% 分位 + 20% 裕度）。
   wcet_updater = fins::sched::make_wcet_updater(FINS_WCET_METHOD);
   // ── 装配 makespan_updater：FINS_MAKESPAN_METHOD 方法（MPB）。
@@ -194,12 +203,6 @@ int main(int argc, char **argv) {
   });
   ThreadPool::instance().start(num_workers);
 
-  // ── 停止信号：SIGINT/SIGTERM → 只置原子停止位（async-signal-safe；不调 cv.notify_all——
-  //    condition_variable 非 async-signal-safe，信号上下文调 stdlib 是 UB）。
-  //    各线程的等待都带超时兜底（worker/计时线程 10ms、主循环 100ms），超时后自行看到 stopped 退出；
-  //    正常收尾走下方 teardown 的 stopped=true + notify_all 立即唤醒。──
-  std::signal(SIGINT,  [](int) { graph_g.stopped = true; });
-  std::signal(SIGTERM, [](int) { graph_g.stopped = true; });
   FINS_LOG_INFO("[agent] listening on :{} plugin_dir={}", rpc_port, plugin_dir);
 
   // ── 计时线程：与 worker 完全对称——grab tp 延迟时间点 → 锁外执行其 sleep job → 回锁置 Finished

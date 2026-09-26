@@ -89,9 +89,43 @@ CPU 1  Active  66.16%  Overhead   0.25%  Idle  33.59%
 对本文口径的影响：Overhead 只统计 `fins_worker*` 片段，控制线程的占用落在 **Idle** 里；控制核
 （m+1）不在 `cpus()` 导出范围内，因此不参与逐核/AVG 统计（否则会拉低 AVG）。
 
-## 7. 相关
+## 7. 环境前提：内核域要 lttng 内核模块
+
+preempt.csv 来自 **`sched_switch`（lttng 内核域 `-k`）**，而内核域需要按内核版本编译的
+lttng 内核模块。**内核升级后若没重建（机器上没装 `lttng-modules-dkms`），`-k` 直接不可用**：
+
+```
+$ lttng list --kernel
+Error: Unable to list kernel events: Kernel tracer not available      # rc=1
+$ modinfo lttng-probe-sched
+modinfo: ERROR: Module lttng-probe-sched not found                    # ← 当前内核没编
+$ ls /lib/modules/$(uname -r)/updates                                # 空/不存在
+```
+
+**UST 域（`-u`）不需要内核模块，照旧正常** —— 所以 `algo:*`/`fins:*` 事件都在、时间线能画，
+只有 preempt.csv（以及依赖它的 Gantt/overhead/释放抖动分析）会空掉，容易事后才发现。
+`tool/_test.py` 的 `check_kernel_tracer()` 会在跑前喊一次（批实验中只喊一次）。
+
+修：`sudo apt install lttng-modules-dkms`（DKMS 自动给当前及以后的内核编）→ 重跑；
+急用可先重启到有模块的那个内核（`ls /lib/modules/*/updates/probes/lttng-probe-sched.ko` 看哪些内核有）。
+
+## 8. 相关
 
 - 导出：`tool/_lttng2csv.py`（`run_export` / `cpus(cpu_start, num_workers)`）
 - 时序图：`tool/_csv2timeline.py`（见 `docs/timeline_gantt.md`）
 - 实验驱动：`tool/_test.py`（`cores_range = <offset>-<offset+m>`：worker 核 1..m + 控制核 m+1，
-  与 `cpus(cpu_start=1, m)` 的 worker 范围一致；跑前守卫 `ensure_port_free` 清残留 client）
+  与 `cpus(cpu_start=1, m)` 的 worker 范围一致；跑前守卫 `ensure_port_free` 清残留 client；
+  `SKIP_DONE=True` 断点续跑——结果目录 `<test_name>_<HHMMSS>` 里同时有 `pipeline applied`、
+  `bye` 与非空 `trace/` 才算完成，缺一个就重测，故中断后重跑不会重复已有数据）
+- ⚠ **`ps` 里见到 `fins_main` 先看 `STAT`**：`Z`/`Zs` 是**僵尸**——client 已退出，只是父进程没
+  `wait()` 回收。僵尸**杀不掉**（信号对僵尸无效，`kill -9` 也一样），但它不占端口、不占内存、
+  不在 trace 里 → 不是残留、不该拦实验；守卫已把它与"活着的残留"分开报告。
+- **僵尸的根因（2026-09-25 已从源头修掉）**：裸跑模式下 client 是 `run_once` 所在进程的直接子进程
+  （从 notebook 跑时父进程 = 常驻的 Jupyter kernel），而回收只在函数尾部的 `cl_proc.wait()`；
+  **中途异常 / Ctrl-C（`run_time` 是几十秒的 sleep，最常见）会跳过尾部** → client 继续跑，等它后来
+  退出就没人收 → 僵尸挂到 kernel 退出。两处修复：
+  ① `run_once` 的 `Popen` 之后全包 `try/finally`，finally 调 `_stop_client()`：
+  `poll()`（顺手回收已退出的子进程）→ SIGTERM(进程组) → 宽限 3s → SIGKILL → `wait()`；
+  ② `example/client.cpp` 的 `std::signal(SIGINT/SIGTERM, …)` 挪到 **main 最开头**——晚装的话启动
+  阶段的 SIGTERM 走默认动作，进程直接死、stdout 不 flush（实测 `client.log` 全空、无收尾日志）。
+  notebook 里要手工清僵尸用 `_test.reap_fins_zombies()`（只对**本进程名下**的子进程有效）。
